@@ -1,0 +1,4 @@
+state.json
+trade_journal.txt
+__pycache__/
+*.pyc

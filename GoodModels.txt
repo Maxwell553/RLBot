@@ -1,0 +1,5 @@
+Best performance, no leakage: 20M_4_16_26_d
+Best performance with leakage: 20M_4_15_26_b
+Decent model: 15M_4_15_26_h
+Best performance with shorts: 25M_4_16_26_e (Now 18M_4_16_26)
+Overall best model: 120M_4_19_26 (48M steps)

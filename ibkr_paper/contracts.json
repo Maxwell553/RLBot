@@ -1,0 +1,73 @@
+{
+  "comment": "Logical training tickers (see paper_trade/paper_trade.py) -> tradeable IB contracts. Features still use yfinance; execution uses these proxies (EWJ/ EW U/CPER for Japan/ UK/copper).",
+  "legs": [
+    {
+      "logical": "SP500",
+      "kind": "STK",
+      "symbol": "SPY",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "GOLD",
+      "kind": "STK",
+      "symbol": "GLD",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "OIL",
+      "kind": "STK",
+      "symbol": "USO",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "EURUSD",
+      "kind": "CASH",
+      "base": "EUR",
+      "quote": "USD"
+    },
+    {
+      "logical": "USDJPY",
+      "kind": "CASH",
+      "base": "USD",
+      "quote": "JPY"
+    },
+    {
+      "logical": "NIKKEI",
+      "kind": "STK",
+      "symbol": "EWJ",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "FTSE",
+      "kind": "STK",
+      "symbol": "EWU",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "BOND10Y",
+      "kind": "STK",
+      "symbol": "IEF",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "COPPER",
+      "kind": "STK",
+      "symbol": "CPER",
+      "exchange": "SMART",
+      "currency": "USD"
+    },
+    {
+      "logical": "EM",
+      "kind": "STK",
+      "symbol": "EEM",
+      "exchange": "SMART",
+      "currency": "USD"
+    }
+  ]
+}
