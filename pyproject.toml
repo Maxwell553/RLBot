@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market_trainer"
+version = "1.0.0"
+description = "RecurrentPPO multi-asset portfolio deep reinforcement learning framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "RLBot" }]
+dependencies = [
+    "gymnasium>=0.29.0",
+    "stable-baselines3>=2.2.0",
+    "sb3-contrib>=2.2.0",
+    "torch>=2.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "tensorboard>=2.14.0",
+    "yfinance>=0.2.30",
+    "PyYAML>=6.0.0",
+    "tqdm>=4.65.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+market-trainer-train = "train:main"
+market-trainer-backtest = "backtest:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+
+[tool.setuptools]
+py-modules = [
+    "train",
+    "backtest",
+    "backtest_sweep",
+    "data_utils",
+    "trading_env",
+    "rl_config",
+    "vecnorm_utils",
+    "visualize",
+    "run_artifacts",
+]
+
+[tool.setuptools.data-files]
+"" = ["config.yaml"]

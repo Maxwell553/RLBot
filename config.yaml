@@ -1,0 +1,108 @@
+# RLBot centralized configuration — version control this file with training runs.
+# CLI flags in train.py override run-specific dates/run-id; hyperparameters default here.
+
+environment:
+  initial_cash: 100000.0
+  max_episode_steps: 63
+  lookback: 20
+  obs_lag_default: 1
+  min_obs_lag: 0
+  max_obs_lag: 2
+  max_single_asset_weight: 0.50
+  fee_scale_default: 1.0
+  stop_loss_fraction: 0.45
+  domain_randomize_fee_dr_min: 0.75
+  domain_randomize_fee_dr_max: 1.3
+  domain_randomize_fee_beta_a: 5.0
+  domain_randomize_fee_beta_b: 5.0
+
+reward:
+  reward_scale: 2000.0
+  max_step_log_return: 0.03
+  risk_window: 21
+  risk_bonus_scale: 25.0
+  # Cap-weighted passive benchmark for Sortino differential (order: SP500..EM in TICKERS)
+  benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
+  churn_lambda: 0.05
+  drawdown_penalty_scale: 10.0
+  inactivity_penalty_over_50: 5.0
+  inactivity_penalty_over_90: 0.1
+  eval_inactivity_penalty_scale: 0.15
+  participation_bonus: 0.1
+
+# Per-asset costs (order: SP500, GOLD, OIL, EURUSD, USDJPY, NIKKEI, FTSE, BOND10Y, COPPER, EM)
+transaction_costs:
+  slippage: [0.0001, 0.0002, 0.0003, 0.0001, 0.0001, 0.0005, 0.0005, 0.0001, 0.0008, 0.0002]
+  tx_fee: [0.0001, 0.0002, 0.0002, 0.00005, 0.00005, 0.0010, 0.0010, 0.0001, 0.0005, 0.0002]
+  annual_holding_cost: [0.0009, 0.0040, 0.0083, 0.0, 0.0, 0.0010, 0.0010, 0.0015, 0.0060, 0.0067]
+  trading_days_per_year: 252
+
+hyperparameters:
+  learning_rate: 3.0e-4
+  learning_rate_floor: 1.0e-6
+  batch_size: 16384
+  n_steps: 32768
+  n_epochs: 3
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_finetune: 0.1
+  ent_coef_initial: 0.10
+  ent_coef_finetune: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  weight_decay: 1.0e-3
+
+policy:
+  lstm_hidden_size: 64
+  n_lstm_layers: 2
+  net_arch_pi: [128, 128]
+  net_arch_vf: [128, 128]
+
+training:
+  timesteps: 65000000
+  n_envs: 8
+  obs_noise: 0.02
+  seed: 0
+  block_size: 126
+  eval_stride: 4
+  eval_n_episodes: 75
+  holdout_days: 365
+  viz_freq: 20000
+  curriculum_update_freq: 50000
+  checkpoint_save_freq_steps: 1000000
+
+vec_normalize:
+  norm_obs: true
+  norm_reward_train: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+
+entropy_schedule:
+  explore_ent: 0.10
+  final_ent: 0.005
+  early_floor: 0.01
+  early_floor_high: 0.02
+  warmup_improvements: 5  # logged only (eval NAV); does not gate decay
+  decay_start_fraction: 0.45  # cosine decay begins here through end of run
+  dr_lock_fraction: 0.23076923076923078  # early exploration floor until ~15M (65M anchor)
+  early_floor_fraction: 0.12307692307692308  # 8M / 18M style
+
+curriculum:
+  budget_short: 65000000
+  budget_long: 120000000
+  # ≤ budget_short: fraction-of-run schedule
+  fee_free_fraction: 0.08
+  fee_ramp_fraction: 0.35
+  churn_start_fraction: 0.15
+  dr_widen_span_fraction: 0.50
+  # Long-run anchors (≥ budget_long)
+  fee_free_long: 13300000
+  fee_ramp_end_long: 40000000
+  churn_start_long: 60000000
+  dr_widen_span_long: 30000000
+
+data:
+  since: "2005-01-01"
+  fracdiff_d: 0.4
+  feature_purge_warmup: 25  # neutralize first N bars at each joined train/eval segment

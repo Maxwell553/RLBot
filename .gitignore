@@ -28,14 +28,5 @@ logs/
 plots/
 
 # Paper / IB local state
-paper_trade/state.json
-paper_trade/trade_journal.txt
-ibkr_paper/state.json
-ibkr_paper/trade_journal.txt
-paper_trade_*/state.json
-paper_trade_*/trade_journal.txt
-
-# Old experiment tree (local zips, logs, TB); keep README only
-paper_trade_2/**
-!paper_trade_2/
-!paper_trade_2/README.txt
+ibkr_paper/
+paper_trade/

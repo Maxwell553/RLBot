@@ -70,7 +70,7 @@ def plot_training_progress(
     episode_timesteps: Sequence[int],
     episode_rewards: Sequence[float],
     eval_timesteps: Optional[np.ndarray] = None,
-    eval_means: Optional[np.ndarray] = None,
+    eval_ending_navs: Optional[np.ndarray] = None,
     episode_navs: Optional[Sequence[float]] = None,
     episode_nav_ts: Optional[Sequence[int]] = None,
     episode_lengths: Optional[Sequence[int]] = None,
@@ -78,10 +78,10 @@ def plot_training_progress(
     title: str = "RL portfolio training",
     save_path: str | Path = "plots/training.png",
 ) -> Path:
-    """Episode rewards + eval mean + episode-end NAV (portfolio value in $).
+    """Episode rewards + eval mean ending NAV + training episode-end NAV ($).
 
-    Both reward panels show **per-step average reward** so that training
-    (longer episodes) and eval (shorter episodes) are on comparable scales.
+    Top panel: per-step training reward. Middle: mean ending portfolio NAV on the
+    in-training eval split (from ``eval_nav_history.npz``). Bottom: training NAV.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,17 +118,26 @@ def plot_training_progress(
     ax0.set_title("Training episodes — per-step avg reward")
     ax0.grid(True, alpha=0.25)
 
-    # ── Panel 1: Eval per-step reward ────────────────────────────────
+    # ── Panel 1: Eval mean ending NAV ($) ─────────────────────────────
     ax1 = axes[1]
-    if eval_timesteps is not None and eval_means is not None and len(eval_means) > 0:
-        ax1.plot(eval_timesteps, eval_means, marker="o", ms=3, color="#2ca02c", label="eval per-step reward")
-        ax1.set_ylabel("reward / step")
+    if eval_timesteps is not None and eval_ending_navs is not None and len(eval_ending_navs) > 0:
+        ax1.plot(
+            eval_timesteps,
+            eval_ending_navs,
+            marker="o",
+            ms=3,
+            color="#2ca02c",
+            label="mean ending NAV",
+        )
+        ax1.axhline(100_000, color="gray", ls="--", lw=0.8, alpha=0.6, label="$100k start")
+        ax1.set_ylabel("Portfolio Value ($)")
+        ax1.yaxis.set_major_formatter(_dollar_formatter())
         ax1.legend(loc="upper right", fontsize=8)
     else:
         ax1.text(0.5, 0.5, "No eval checkpoints yet", ha="center", va="center", transform=ax1.transAxes)
     ax1.set_xlabel("timesteps")
     ax1.xaxis.set_major_formatter(_timestep_formatter())
-    ax1.set_title("Periodic evaluation — per-step avg reward")
+    ax1.set_title("Periodic evaluation — Validation Ending NAV")
     ax1.grid(True, alpha=0.25)
 
     # ── Panel 2: Episode-end NAV in dollars ──────────────────────────
@@ -167,24 +176,113 @@ def plot_training_progress(
     return save_path
 
 
+def _normalized_equity(nav: np.ndarray) -> np.ndarray:
+    nav = np.asarray(nav, dtype=np.float64)
+    return nav / max(nav[0], 1e-12)
+
+
+def _drawdown_fraction(eq: np.ndarray) -> np.ndarray:
+    peak = np.maximum.accumulate(eq)
+    return (eq - peak) / np.maximum(peak, 1e-12)
+
+
+def _period_label(t: Sequence) -> str:
+    t0, t1 = t[0], t[-1]
+    if hasattr(t0, "date"):
+        return f"{t0.date()} → {t1.date()}"
+    return f"{t0} → {t1}"
+
+
+def _plot_equity_drawdown_benchmarks(
+    axes: Sequence,
+    t: Sequence,
+    *,
+    nav_model: np.ndarray,
+    nav_spy: np.ndarray | None,
+    nav_equal_weight: np.ndarray | None,
+    model_label: str,
+) -> None:
+    """Fill top two axes: normalized equity and drawdown for model + passive benchmarks."""
+    ax_eq, ax_dd = axes[0], axes[1]
+    # Bright primaries: blue model, red SPY, green equal-weight (high contrast on white).
+    COLOR_MODEL = "#0066FF"
+    COLOR_SPY = "#FF1744"
+    COLOR_EW = "#00E676"
+
+    bench_series: list[tuple[np.ndarray, str, str, str, float]] = []
+    if nav_spy is not None:
+        bench_series.append((nav_spy, "SPY buy & hold", COLOR_SPY, "-", 1.6))
+    if nav_equal_weight is not None:
+        bench_series.append((nav_equal_weight, "Equal-weight buy & hold", COLOR_EW, "-", 2.0))
+
+    eq_lines: list[tuple[np.ndarray, str, str, str, float]] = []
+    z = 2
+    for nav, label, color, ls, lw in bench_series:
+        eq = _normalized_equity(nav)
+        ret_pct = float(eq[-1] - 1.0) * 100.0
+        leg = f"{label} ({ret_pct:+.1f}%)"
+        ax_eq.plot(t, eq, color=color, lw=lw, ls=ls, label=leg, zorder=z)
+        eq_lines.append((eq, leg, color, ls, lw))
+        z += 1
+
+    eq_m = _normalized_equity(nav_model)
+    ret_m_pct = float(eq_m[-1] - 1.0) * 100.0
+    leg_m = f"{model_label} ({ret_m_pct:+.1f}%)"
+    ax_eq.plot(
+        t, eq_m, color=COLOR_MODEL, lw=2.6, ls="-", label=leg_m, zorder=z + 1,
+    )
+    eq_lines.append((eq_m, leg_m, COLOR_MODEL, "-", 2.6))
+
+    ax_eq.axhline(1.0, color="gray", ls="--", lw=0.8, alpha=0.6)
+    ax_eq.set_ylabel("NAV / start")
+    ax_eq.legend(loc="upper left", fontsize=9)
+    ax_eq.grid(True, alpha=0.25)
+
+    ret_m = float(_normalized_equity(nav_model)[-1] - 1.0)
+    excess_spy = (
+        (ret_m - float(_normalized_equity(nav_spy)[-1] - 1.0)) * 100.0
+        if nav_spy is not None
+        else float("nan")
+    )
+    period = _period_label(t)
+    if nav_spy is not None and not np.isnan(excess_spy):
+        ax_eq.set_title(f"Equity curve — {period}  |  excess vs SPY {excess_spy:+.1f} pp")
+    else:
+        ax_eq.set_title(f"Equity curve — {period}")
+
+    for i, (eq, leg, color, ls, lw) in enumerate(eq_lines):
+        dd = _drawdown_fraction(eq) * 100.0
+        z = 2 + i
+        ax_dd.fill_between(t, dd, 0.0, color=color, alpha=0.14, zorder=z)
+        ax_dd.plot(t, dd, color=color, lw=lw, ls=ls, label=leg, zorder=z + 1)
+    ax_dd.set_ylabel("drawdown %")
+    ax_dd.legend(loc="lower left", fontsize=8)
+    ax_dd.grid(True, alpha=0.25)
+    ax_dd.set_title("Drawdown")
+
+
 def plot_backtest_dashboard(
     timestamps: Sequence,
     nav: np.ndarray,
+    *,
+    nav_spy: np.ndarray | None = None,
+    nav_equal_weight: np.ndarray | None = None,
     weights: Optional[np.ndarray] = None,
     weight_timestamps: Optional[Sequence] = None,
     asset_labels: Optional[Sequence[str]] = None,
-    title: str = "Backtest",
+    model_label: str = "Model",
+    title: str = "OOS backtest vs benchmarks",
     save_path: str | Path = "plots/backtest.png",
 ) -> Path:
     """
-    Equity (normalized), drawdown, and optional target-weight stack.
+    Three-row OOS dashboard: model vs benchmarks (equity + drawdown), then target weights.
 
     Parameters
     ----------
-    timestamps : length len(nav), timezone-aware or naive datetimes
-    nav : portfolio values
+    timestamps : length len(nav)
+    nav : model portfolio NAV
+    nav_spy, nav_equal_weight : passive benchmark NAV paths (same length as ``nav``)
     weights : shape (n_steps, n_weights)
-    weight_timestamps : x-axis for weights; defaults to first len(weights) entries of `timestamps`
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -193,26 +291,22 @@ def plot_backtest_dashboard(
     t = np.asarray(timestamps)
     if len(t) != len(nav):
         raise ValueError("timestamps must match nav length")
+    if nav_spy is not None and len(nav_spy) != len(nav):
+        raise ValueError("nav_spy must match nav length")
+    if nav_equal_weight is not None and len(nav_equal_weight) != len(nav):
+        raise ValueError("nav_equal_weight must match nav length")
 
-    peak = np.maximum.accumulate(nav)
-    dd = (nav - peak) / np.maximum(peak, 1e-12)
-    eq_norm = nav / max(nav[0], 1e-12)
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True, constrained_layout=True)
     fig.suptitle(title, fontsize=13)
 
-    axes[0].plot(t, eq_norm, color="#1f77b4", lw=1.4, label="equity (normalized)")
-    axes[0].axhline(1.0, color="gray", ls="--", lw=0.8, alpha=0.6)
-    axes[0].set_ylabel("NAV / start")
-    axes[0].legend(loc="upper left", fontsize=8)
-    axes[0].grid(True, alpha=0.25)
-    axes[0].set_title("Equity curve")
-
-    axes[1].fill_between(t, dd * 100.0, 0.0, color="#d62728", alpha=0.35)
-    axes[1].plot(t, dd * 100.0, color="#d62728", lw=1.0)
-    axes[1].set_ylabel("drawdown %")
-    axes[1].grid(True, alpha=0.25)
-    axes[1].set_title("Drawdown")
+    _plot_equity_drawdown_benchmarks(
+        axes,
+        t,
+        nav_model=nav,
+        nav_spy=nav_spy,
+        nav_equal_weight=nav_equal_weight,
+        model_label=model_label,
+    )
 
     if weights is not None and weights.size > 0:
         w = np.asarray(weights, dtype=np.float64)
@@ -246,75 +340,47 @@ def plot_backtest_dashboard(
     return save_path
 
 
-def load_eval_npz(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def load_eval_nav_npz(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    SB3 EvalCallback saves ``eval_logs/evaluations.npz`` with ``timesteps``,
-    ``results`` (episode rewards), and ``ep_lengths`` (episode lengths).
+    Load ``eval_nav_history.npz`` written by ``EvalNAVTrackerCallback`` in train.py.
 
-    Returns per-step average reward (total reward / episode length) so that
-    the eval graph is directly comparable to the training per-step graph
-    regardless of episode length differences.
+    Returns ``(timesteps, mean_ending_nav)`` as dollar portfolio values at episode end
+    (averaged across eval episodes at each checkpoint). No per-step division.
     """
     path = Path(path)
     if not path.is_file():
         return None, None
-    z = np.load(path, allow_pickle=True)
-    ts = z.get("timesteps")
-    raw = z.get("results")
-    raw_lens = z.get("ep_lengths")
-    if ts is None or raw is None:
+    try:
+        z = np.load(path, allow_pickle=False)
+        ts = z.get("timesteps")
+        nav = z.get("mean_ending_nav")
+        if ts is None or nav is None:
+            return None, None
+        return np.asarray(ts, dtype=np.int64).reshape(-1), np.asarray(nav, dtype=np.float64).reshape(-1)
+    except (OSError, ValueError, KeyError):
         return None, None
-    ts = np.asarray(ts, dtype=np.int64).reshape(-1)
-
-    def _per_step_mean(rewards, lengths):
-        """Average per-step reward across episodes at one eval point."""
-        r = np.asarray(rewards, dtype=np.float64).ravel()
-        if lengths is not None:
-            l = np.maximum(np.asarray(lengths, dtype=np.float64).ravel(), 1.0)
-            if len(l) == len(r):
-                return float(np.mean(r / l))
-        return float(np.mean(r))
-
-    if raw.dtype == object:
-        if raw_lens is not None and raw_lens.dtype == object:
-            means = np.array([_per_step_mean(r, l) for r, l in zip(raw, raw_lens)], dtype=np.float64)
-        else:
-            means = np.array([_per_step_mean(r, None) for r in raw], dtype=np.float64)
-    else:
-        arr = np.asarray(raw, dtype=np.float64)
-        if raw_lens is not None:
-            larr = np.maximum(np.asarray(raw_lens, dtype=np.float64), 1.0)
-            if arr.shape == larr.shape:
-                means = (arr / larr).mean(axis=-1) if arr.ndim > 1 else arr / larr
-            else:
-                means = arr.mean(axis=-1) if arr.ndim > 1 else arr
-        else:
-            means = arr.mean(axis=-1) if arr.ndim > 1 else arr
-    return ts, means
 
 
 class TrainingVizCallback(BaseCallback):
     """
     Collect Monitor episode stats during PPO rollouts and refresh a PNG on a fixed step cadence.
-    Optionally overlays EvalCallback curves if `evaluations.npz` exists.
-    Also tracks episode-end portfolio NAV for the dollar-value panel.
+    Middle panel reads ``eval_nav_history.npz`` (mean ending NAV on the eval split).
+    Also tracks episode-end portfolio NAV for the bottom training panel.
 
     Episode series are persisted next to the PNG (``training_episodes.npz``) so the training
-    and NAV panels still show the **full** run after restarts or ``--resume``. Eval metrics
-    already come from ``evaluations.npz``; without this file, only in-RAM episodes since
-    process start would be plotted (often a short tail on the x-axis).
+    and NAV panels still show the **full** run after restarts or ``--resume``.
     """
 
     def __init__(
         self,
         plot_path: str | Path,
-        eval_npz_path: str | Path,
+        eval_nav_npz_path: str | Path,
         plot_freq: int = 10_000,
         smooth_window: int = 15,
     ):
         super().__init__()
         self.plot_path = Path(plot_path)
-        self.eval_npz_path = Path(eval_npz_path)
+        self.eval_nav_npz_path = Path(eval_nav_npz_path)
         self.plot_freq = int(plot_freq)
         self.smooth_window = int(smooth_window)
         self._history_path = self.plot_path.with_name(self.plot_path.stem + "_episodes.npz")
@@ -390,12 +456,12 @@ class TrainingVizCallback(BaseCallback):
         self._render()
 
     def _render(self) -> None:
-        ev_t, ev_r = load_eval_npz(self.eval_npz_path)
+        ev_t, ev_nav = load_eval_nav_npz(self.eval_nav_npz_path)
         plot_training_progress(
             self._episode_ts,
             self._episode_rewards,
             eval_timesteps=ev_t,
-            eval_means=ev_r,
+            eval_ending_navs=ev_nav,
             episode_navs=self._episode_navs if self._episode_navs else None,
             episode_nav_ts=self._episode_nav_ts if self._episode_nav_ts else None,
             episode_lengths=self._episode_lengths if self._episode_lengths else None,

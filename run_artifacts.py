@@ -89,6 +89,10 @@ class RunPaths:
         return self.eval_log_dir / "evaluations.npz"
 
     @property
+    def eval_nav_history(self) -> Path:
+        return self.eval_log_dir / "eval_nav_history.npz"
+
+    @property
     def final_model(self) -> Path:
         return self.models_dir / "ppo_portfolio_final.zip"
 

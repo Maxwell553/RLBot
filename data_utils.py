@@ -7,7 +7,8 @@ Daily data via yfinance for 10 global assets:
   Emerging Markets (EEM).
 
 Macro context features (observation-only, not tradeable):
-  DXY (Dollar Index), 10-Year Treasury Yield (^TNX).
+  DXY (Dollar Index), 10-Year Treasury Yield (^TNX), VIX (^VIX),
+  ICE BofA US High Yield OAS (FRED BAMLH0A0HYM2).
 
 Assets trade on different exchanges/schedules; daily bars are aligned via
 outer-join and short forward-fill for holiday gaps. **Pre-listing rows are
@@ -38,12 +39,27 @@ YF_SYMBOLS: Dict[str, str] = {
 
 TICKERS: List[str] = list(YF_SYMBOLS.keys())
 
+# Buy-and-hold benchmark column in ``ohlcv`` (SPY proxy); must match ``TICKERS`` order.
+BENCHMARK_TICKER = "SP500"
+
+
+def benchmark_ohlcv_index() -> int:
+    """OHLCV asset axis index for the SPY/SP500 benchmark (not the policy action index)."""
+    if BENCHMARK_TICKER not in TICKERS:
+        raise KeyError(f"Benchmark {BENCHMARK_TICKER!r} missing from TICKERS: {TICKERS}")
+    return TICKERS.index(BENCHMARK_TICKER)
+
+
 # Macro context features — not tradeable, observation-only
 MACRO_SYMBOLS: Dict[str, str] = {
     "DXY": "DX-Y.NYB",
     "TNX": "^TNX",
+    "VIX": "^VIX",
 }
-MACRO_TICKERS: List[str] = list(MACRO_SYMBOLS.keys())
+# ICE BofA US HY OAS (FRED); full history via HYG/IEF proxy + FRED calibration
+HY_OAS_FRED_ID = "BAMLH0A0HYM2"
+HY_OAS_PROXY_YF = "HYG"  # high-yield ETF vs IEF (BOND10Y) for pre-FRED panel
+MACRO_TICKERS: List[str] = list(MACRO_SYMBOLS.keys()) + ["HY_OAS"]
 N_MACRO = len(MACRO_TICKERS)
 
 TIMEFRAME = "1d"
@@ -69,18 +85,13 @@ def fracdiff_weights(d: float, weight_eps: float = 1e-14) -> np.ndarray:
 
 
 def fracdiff_series_1d(x: np.ndarray, d: float) -> np.ndarray:
-    """Apply fractional differentiation to a 1D series (e.g. log prices)."""
-    w = fracdiff_weights(d)
-    K = len(w)
+    """Causal fractional differentiation via 1D convolution (same as nested loops)."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
     n = len(x)
-    out = np.zeros(n, dtype=np.float64)
-    for t in range(n):
-        acc = 0.0
-        up = min(t + 1, K)
-        for k in range(up):
-            acc += w[k] * x[t - k]
-        out[t] = acc
-    return out
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    w = fracdiff_weights(d)
+    return np.convolve(x, w, mode="full")[:n]
 
 
 def compute_fracdiff_panel(
@@ -123,26 +134,102 @@ def _macd_line(close: pd.Series, fast: int = 12, slow: int = 26) -> pd.Series:
     return ema_fast - ema_slow
 
 
-def _indicators_from_merged(
+def fetch_fred_daily_series(
+    series_id: str,
+    since: str,
+    until: Optional[str] = None,
+) -> pd.DataFrame:
+    """Fetch a FRED daily series as ``date`` + ``value`` (graph CSV; recent window only)."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=45) as resp:
+            raw = resp.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise RuntimeError(f"FRED fetch failed for {series_id}: {e}") from e
+
+    df = pd.read_csv(io.StringIO(raw))
+    if df.shape[1] < 2:
+        raise RuntimeError(f"Unexpected FRED CSV for {series_id}")
+    date_col, val_col = df.columns[0], df.columns[1]
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    if dates.dt.tz is not None:
+        dates = dates.dt.tz_localize(None)
+    dates = dates.dt.normalize()
+    vals = pd.to_numeric(df[val_col], errors="coerce")
+    out = pd.DataFrame({"date": dates, "value": vals})
+    out = out.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+    out = out[out["date"].dt.dayofweek < 5].reset_index(drop=True)
+
+    since_ts = pd.to_datetime(since).normalize()
+    out = out[out["date"] >= since_ts]
+    if until is not None:
+        until_ts = pd.to_datetime(until).normalize()
+        out = out[out["date"] <= until_ts]
+    return out.reset_index(drop=True)
+
+
+def _hy_oas_proxy_pct(hyg: np.ndarray, ief: np.ndarray) -> np.ndarray:
+    """HY credit stress proxy in % from HYG vs IEF (IG) relative performance."""
+    ratio = np.maximum(hyg, 1e-8) / np.maximum(ief, 1e-8)
+    return np.clip(3.5 - 12.0 * np.log(ratio), 2.0, 15.0)
+
+
+def _attach_hy_oas_column(
     merged: pd.DataFrame,
-    fracdiff_d: float = DEFAULT_FRACDIFF_D,
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    hyg_close: pd.Series,
+    since: str,
+    until: Optional[str],
+) -> pd.DataFrame:
+    """HY OAS in %: FRED where available, HYG/IEF proxy back-filled and overlap-calibrated."""
+    col = "HY_OAS_close"
+    ief = merged["BOND10Y_close"].astype(np.float64)
+    proxy = pd.Series(
+        _hy_oas_proxy_pct(hyg_close.to_numpy(dtype=np.float64), ief.to_numpy(dtype=np.float64)),
+        index=merged.index,
+    )
+
+    print(f"  Fetching HY_OAS (FRED {HY_OAS_FRED_ID})...")
+    fred_vals = pd.Series(np.nan, index=merged.index, dtype=np.float64)
+    try:
+        fred = fetch_fred_daily_series(HY_OAS_FRED_ID, since=since, until=until)
+        if not fred.empty:
+            fred = fred.rename(columns={"value": col})
+            tmp = merged[["date"]].merge(fred, on="date", how="left")
+            fred_vals = tmp[col].astype(np.float64)
+            print(f"    → {int(fred_vals.notna().sum())} FRED bars on panel")
+        else:
+            print("    → 0 FRED bars (using proxy only)")
+    except RuntimeError as e:
+        print(f"    → FRED failed ({e}); proxy only")
+
+    overlap = fred_vals.notna() & proxy.notna()
+    if int(overlap.sum()) >= 30:
+        a, b = np.polyfit(proxy[overlap].to_numpy(), fred_vals[overlap].to_numpy(), 1)
+        proxy_cal = a * proxy + b
+        print(f"    → calibrated proxy to FRED (n={int(overlap.sum())}, a={a:.3f}, b={b:.3f})")
+    else:
+        proxy_cal = proxy
+
+    merged[col] = fred_vals.where(fred_vals.notna(), proxy_cal)
+    merged[col] = merged[col].ffill().bfill().fillna(0.0)
+    return merged
+
+
+def _ohlcv_macro_from_merged(merged: pd.DataFrame) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    """Extract aligned OHLCV + macro panels from a merged daily DataFrame."""
     merged = merged.sort_values("date").reset_index(drop=True)
     idx = pd.DatetimeIndex(merged["date"])
     ohlcv = np.zeros((len(merged), len(TICKERS), 5), dtype=np.float64)
-    rsi = np.zeros((len(merged), len(TICKERS)), dtype=np.float64)
-    macd = np.zeros((len(merged), len(TICKERS)), dtype=np.float64)
     for j, ticker in enumerate(TICKERS):
         ohlcv[:, j, 0] = merged[f"{ticker}_open"].to_numpy()
         ohlcv[:, j, 1] = merged[f"{ticker}_high"].to_numpy()
         ohlcv[:, j, 2] = merged[f"{ticker}_low"].to_numpy()
         ohlcv[:, j, 3] = merged[f"{ticker}_close"].to_numpy()
         ohlcv[:, j, 4] = merged[f"{ticker}_volume"].to_numpy()
-        close_s = merged[f"{ticker}_close"]
-        # No bfill: undefined RSI at series start uses neutral 50 (not a future RSI).
-        rsi[:, j] = _rsi(close_s).fillna(50.0).to_numpy()
-        macd_line = _macd_line(close_s)
-        macd[:, j] = (macd_line / (close_s.abs() + 1e-12)).fillna(0.0).to_numpy()
     ohlcv = np.nan_to_num(ohlcv, nan=0.0, posinf=0.0, neginf=0.0)
     ohlcv[:, :, :4] = np.maximum(ohlcv[:, :, :4], 1e-8)
 
@@ -152,15 +239,125 @@ def _indicators_from_merged(
         if col in merged.columns:
             macro[:, j] = np.nan_to_num(merged[col].to_numpy(dtype=np.float64), nan=0.0)
             macro[:, j] = np.maximum(macro[:, j], 1e-8)
+    return idx, ohlcv, macro
 
+
+def compute_trend_signals(ohlcv: np.ndarray) -> np.ndarray:
+    """Dual-EMA distance per asset: (EMA20 - EMA100) / EMA100 (stationary trend memory)."""
+    t = ohlcv.shape[0]
+    trend_signals = np.zeros((t, len(TICKERS)), dtype=np.float64)
+    for j in range(len(TICKERS)):
+        close_s = pd.Series(ohlcv[:, j, 3])
+        ema_fast = close_s.ewm(span=20, adjust=False).mean()
+        ema_slow = close_s.ewm(span=100, adjust=False).mean()
+        trend_signals[:, j] = ((ema_fast - ema_slow) / (ema_slow + 1e-12)).to_numpy()
+    return trend_signals
+
+
+def compute_feature_panel(
+    ohlcv: np.ndarray,
+    macro: np.ndarray,
+    fracdiff_d: float = DEFAULT_FRACDIFF_D,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """RSI, MACD, trend EMA profile, and fracdiff on a **contiguous** OHLCV slice."""
+    t = ohlcv.shape[0]
+    rsi = np.zeros((t, len(TICKERS)), dtype=np.float64)
+    macd = np.zeros((t, len(TICKERS)), dtype=np.float64)
+    for j in range(len(TICKERS)):
+        close_s = pd.Series(ohlcv[:, j, 3])
+        rsi[:, j] = _rsi(close_s).fillna(50.0).to_numpy()
+        macd_line = _macd_line(close_s)
+        macd[:, j] = (macd_line / (close_s.abs() + 1e-12)).fillna(0.0).to_numpy()
+    trend_signals = compute_trend_signals(ohlcv)
     fracdiff, fracdiff_macro = compute_fracdiff_panel(ohlcv, macro, d=fracdiff_d)
-    return idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro
+    return rsi, macd, fracdiff, fracdiff_macro, trend_signals
+
+
+def _neutralize_feature_warmup(
+    rsi: np.ndarray,
+    macd: np.ndarray,
+    fracdiff: np.ndarray,
+    fracdiff_macro: np.ndarray,
+    purge_bars: int,
+    trend: np.ndarray | None = None,
+) -> None:
+    """Embargo first ``purge_bars`` of a joined segment (in-place)."""
+    if purge_bars <= 0:
+        return
+    n = min(purge_bars, rsi.shape[0])
+    rsi[:n] = 50.0
+    macd[:n] = 0.0
+    fracdiff[:n] = 0.0
+    fracdiff_macro[:n] = 0.0
+    if trend is not None:
+        trend[:n] = 0.0
+
+
+def _indicators_from_merged(
+    merged: pd.DataFrame,
+    fracdiff_d: float = DEFAULT_FRACDIFF_D,
+) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Full-timeline features (OK for contiguous OOS backtest / cache)."""
+    idx, ohlcv, macro = _ohlcv_macro_from_merged(merged)
+    rsi, macd, fracdiff, fracdiff_macro, trend = compute_feature_panel(
+        ohlcv, macro, fracdiff_d=fracdiff_d
+    )
+    return idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend
+
+
+def _yfinance_daily_history(
+    tkr,
+    since: str,
+    until: Optional[str],
+) -> pd.DataFrame:
+    """
+    yfinance often returns an empty frame for ``start=``/``end=`` (rate limits, Yahoo
+    hiccups). Retries and a longer ``period=`` pull + date filter are more reliable.
+    """
+    import time
+
+    def _h_start_end() -> pd.DataFrame:
+        return tkr.history(start=since, end=until, interval="1d", auto_adjust=False)
+
+    def _h_period(period: str) -> pd.DataFrame:
+        return tkr.history(period=period, interval="1d", auto_adjust=False)
+
+    df0 = _h_start_end()
+    for attempt in range(3):
+        if not df0.empty:
+            return df0
+        time.sleep(0.35 * (2**attempt))
+        df0 = _h_start_end()
+    if not df0.empty:
+        return df0
+
+    since_ts = pd.to_datetime(since).normalize()
+    until_ts = pd.to_datetime(until).normalize() if until else None
+    for period in ("1y", "2y", "5y", "10y", "max"):
+        df0 = _h_period(period)
+        if df0.empty:
+            time.sleep(0.2)
+            continue
+        tmp = df0.reset_index()
+        tcol = tmp.columns[0]
+        dates = pd.to_datetime(tmp[tcol])
+        if dates.dt.tz is not None:
+            dates = dates.dt.tz_localize(None)
+        dates = dates.dt.normalize()
+        m = dates >= since_ts
+        if until_ts is not None:
+            m &= dates <= until_ts
+        tmpf = tmp.loc[m]
+        if not tmpf.empty:
+            return tmpf.set_index(tcol)
+
+    return pd.DataFrame()
 
 
 def fetch_aligned_daily(
     since: str = "2014-09-01",
     until: Optional[str] = None,
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Daily OHLCV from yfinance for all 10 global assets + macro context.
 
@@ -182,7 +379,7 @@ def fetch_aligned_daily(
     def _fetch_one(ticker: str, yf_sym: str, required: bool = True) -> None:
         print(f"  Fetching {ticker} ({yf_sym})...")
         obj = yf.Ticker(yf_sym)
-        df = obj.history(start=since, end=until, interval="1d", auto_adjust=False)
+        df = _yfinance_daily_history(obj, since, until)
         if df.empty:
             if required:
                 raise RuntimeError(f"yfinance returned no rows for {yf_sym} ({ticker})")
@@ -213,12 +410,13 @@ def fetch_aligned_daily(
 
     for ticker, yf_sym in MACRO_SYMBOLS.items():
         _fetch_one(ticker, yf_sym, required=False)
+    _fetch_one(HY_OAS_PROXY_YF, HY_OAS_PROXY_YF, required=False)
 
     merged = per_ticker[TICKERS[0]]
     for t in TICKERS[1:]:
         merged = merged.merge(per_ticker[t], on="date", how="outer")
 
-    for t in MACRO_TICKERS:
+    for t in MACRO_SYMBOLS:
         if t in per_ticker:
             macro_cols = per_ticker[t][["date", f"{t}_close"]]
             merged = merged.merge(macro_cols, on="date", how="left")
@@ -235,11 +433,23 @@ def fetch_aligned_daily(
         vol_col = f"{ticker}_volume"
         merged[vol_col] = merged[vol_col].fillna(0.0)
 
-    for ticker in MACRO_TICKERS:
+    for ticker in MACRO_SYMBOLS:
         col = f"{ticker}_close"
         if col in merged.columns:
             # Forward-fill only; leading NaNs → 0 (macro obs uses log; env clamps)
             merged[col] = merged[col].ffill().fillna(0.0)
+
+    # HY OAS: FRED + HYG/IEF proxy (full history for walk-forward from 2006)
+    if HY_OAS_PROXY_YF in per_ticker and "BOND10Y_close" in merged.columns:
+        hyg_df = per_ticker[HY_OAS_PROXY_YF][["date", f"{HY_OAS_PROXY_YF}_close"]].rename(
+            columns={f"{HY_OAS_PROXY_YF}_close": "_hyg_tmp"}
+        )
+        merged = merged.merge(hyg_df, on="date", how="left")
+        merged["_hyg_tmp"] = merged["_hyg_tmp"].ffill()
+        merged = _attach_hy_oas_column(merged, merged["_hyg_tmp"], since=since, until=until)
+        merged = merged.drop(columns=["_hyg_tmp"])
+    else:
+        print("  WARNING: HY_OAS skipped (missing HYG or BOND10Y on panel)")
 
     asset_cols = []
     for ticker in TICKERS:
@@ -274,40 +484,91 @@ def train_test_split_last_days(
     return (train_idx, *(a[train_mask] for a in arrays)), (test_idx, *(a[test_mask] for a in arrays))
 
 
+def clip_index_until(
+    index: pd.DatetimeIndex,
+    *arrays: np.ndarray,
+    until: str | pd.Timestamp,
+) -> Tuple[pd.DatetimeIndex, Tuple[np.ndarray, ...]]:
+    """Keep rows with ``date <= until`` (inclusive, calendar day)."""
+    if len(index) == 0:
+        raise ValueError("Empty dataset")
+    end = pd.Timestamp(until).normalize()
+    mask = index.normalize() <= end
+    if not np.any(mask):
+        raise ValueError(f"No rows on or before until={end.date()}; extend history or relax --until.")
+    clipped = (index[mask], *(a[mask] for a in arrays))
+    return clipped[0], clipped[1:]
+
+
 def reserve_chronological_holdout(
     index: pd.DatetimeIndex,
     *arrays: np.ndarray,
     holdout_days: int = 365,
+    train_end: str | pd.Timestamp | None = None,
+    holdout_start: str | pd.Timestamp | None = None,
+    holdout_end: str | pd.Timestamp | None = None,
 ) -> Tuple[Tuple, Tuple]:
-    """Reserve the last ``holdout_days`` *calendar* rows for backtest-only OOS evaluation.
+    """Reserve OOS bars for backtest-only evaluation.
 
-    Training and in-training eval must use only the **left** segment; the **right**
-    segment must never be passed to ``train_test_split_alternating`` or the policy
-    will have seen those bars.
+    **Calendar tail (default):** last ``holdout_days`` calendar days → trainable is
+    ``date <= last_date - holdout_days``; holdout is the remainder.
+
+    **Explicit dates:** pass ``train_end`` and ``holdout_start`` (and optional
+    ``holdout_end``). Trainable is ``date <= train_end``; holdout is
+    ``holdout_start <= date <= holdout_end`` (default ``holdout_end`` = last bar).
+    Any gap between ``train_end`` and ``holdout_start`` is excluded from both.
+
+    Training and in-training eval must use only the trainable segment; holdout must
+    never be passed to ``train_test_split_alternating``.
 
     Returns
     -------
     trainable : (index, *arrays sliced)
-        All bars with ``date <= (last_date - holdout_days)``.
     holdout : (index, *arrays sliced)
-        The trailing calendar window used exclusively by ``backtest.py``.
     """
-    if holdout_days <= 0:
-        raise ValueError("holdout_days must be positive (use train_test_split_last_days for ad-hoc slices).")
     if len(index) == 0:
         raise ValueError("Empty dataset")
-    cutoff = index[-1] - pd.Timedelta(days=holdout_days)
-    before_mask = index <= cutoff
-    hold_mask = ~before_mask
+
+    use_dates = train_end is not None or holdout_start is not None
+    if use_dates:
+        if train_end is None or holdout_start is None:
+            raise ValueError(
+                "Date-based holdout requires both train_end and holdout_start "
+                "(e.g. --train-end 2020-12-31 --holdout-start 2021-01-01)."
+            )
+        t_end = pd.Timestamp(train_end).normalize()
+        h_start = pd.Timestamp(holdout_start).normalize()
+        h_end = (
+            pd.Timestamp(holdout_end).normalize()
+            if holdout_end is not None
+            else index[-1].normalize()
+        )
+        if t_end >= h_start:
+            raise ValueError(
+                f"train_end ({t_end.date()}) must be strictly before "
+                f"holdout_start ({h_start.date()})."
+            )
+        idx_norm = index.normalize()
+        before_mask = idx_norm <= t_end
+        hold_mask = (idx_norm >= h_start) & (idx_norm <= h_end)
+    else:
+        if holdout_days <= 0:
+            raise ValueError(
+                "holdout_days must be positive (use train_test_split_last_days for ad-hoc slices)."
+            )
+        cutoff = index[-1] - pd.Timedelta(days=holdout_days)
+        before_mask = index <= cutoff
+        hold_mask = ~before_mask
+
     if not np.any(hold_mask):
         raise ValueError(
-            f"No rows in holdout window (holdout_days={holdout_days}); "
-            "reduce holdout_days or extend data."
+            "No rows in holdout window; extend data, relax dates, or reduce holdout_days."
         )
     if not np.any(before_mask):
         raise ValueError(
-            "Holdout consumes all data; reduce holdout_days or extend history."
+            "No trainable rows before holdout; extend history or relax holdout settings."
         )
+
     train_idx = index[before_mask]
     hold_idx = index[hold_mask]
     train_arrays = tuple(a[before_mask] for a in arrays)
@@ -318,13 +579,11 @@ def reserve_chronological_holdout(
 def train_test_split_alternating(
     index: pd.DatetimeIndex,
     ohlcv: np.ndarray,
-    rsi: np.ndarray,
-    macd: np.ndarray,
     macro: np.ndarray,
-    fracdiff: np.ndarray,
-    fracdiff_macro: np.ndarray,
     block_size: int = 126,
     eval_stride: int = 4,
+    fracdiff_d: float = DEFAULT_FRACDIFF_D,
+    feature_purge_warmup: int = 25,
 ) -> Tuple[Tuple, Tuple]:
     """Walk-forward alternating split for representative train/eval regimes.
 
@@ -333,15 +592,18 @@ def train_test_split_alternating(
     to train.  Both sets therefore span the full history and contain a mix of
     bull, bear, high-vol, and low-vol periods.
 
-    Contiguous same-label blocks are merged into *segments*.  When an eval
-    block is removed from the train stream (or vice versa), a discontinuity
-    exists at the join.  ``block_boundaries`` lists these join indices so the
-    environment can prevent episodes from spanning them.
+    **Features are computed per block on raw OHLCV only**, so RSI/MACD/fracdiff
+    on an eval block never inherit EWM or fracdiff memory from adjacent train
+    blocks.  At each join inside a concatenated stream, the first
+    ``feature_purge_warmup`` bars are neutralized (RSI=50, MACD/fracdiff=0).
+
+    Contiguous same-label blocks are merged into *segments*.  ``block_boundaries``
+    lists join indices so the environment can prevent episodes from spanning them.
 
     Returns
     -------
-    train_tuple : (index, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, block_boundaries)
-    eval_tuple  : (index, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, block_boundaries)
+    train_tuple : (index, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, block_boundaries)
+    eval_tuple  : (index, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, block_boundaries)
     """
     n = len(index)
     if n == 0:
@@ -362,7 +624,17 @@ def train_test_split_alternating(
 
     def _concat_ranges(
         ranges: List[Tuple[int, int]],
-    ) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[int]]:
+    ) -> Tuple[
+        pd.DatetimeIndex,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[int],
+    ]:
         idx_parts: List[pd.DatetimeIndex] = []
         ohlcv_parts: List[np.ndarray] = []
         rsi_parts: List[np.ndarray] = []
@@ -370,23 +642,38 @@ def train_test_split_alternating(
         macro_parts: List[np.ndarray] = []
         fd_parts: List[np.ndarray] = []
         fdm_parts: List[np.ndarray] = []
+        trend_parts: List[np.ndarray] = []
         boundaries: List[int] = []
         offset = 0
         prev_orig_end: Optional[int] = None
+        segment_idx = 0
 
         for orig_start, orig_end in ranges:
             if prev_orig_end is not None and orig_start != prev_orig_end:
                 boundaries.append(offset)
+
+            ohlcv_chunk = ohlcv[orig_start:orig_end]
+            macro_chunk = macro[orig_start:orig_end]
+            rsi_c, macd_c, fd_c, fdm_c, trend_c = compute_feature_panel(
+                ohlcv_chunk, macro_chunk, fracdiff_d=fracdiff_d
+            )
+            if segment_idx > 0:
+                _neutralize_feature_warmup(
+                    rsi_c, macd_c, fd_c, fdm_c, feature_purge_warmup, trend_c
+                )
+
             chunk_len = orig_end - orig_start
             idx_parts.append(index[orig_start:orig_end])
-            ohlcv_parts.append(ohlcv[orig_start:orig_end])
-            rsi_parts.append(rsi[orig_start:orig_end])
-            macd_parts.append(macd[orig_start:orig_end])
-            macro_parts.append(macro[orig_start:orig_end])
-            fd_parts.append(fracdiff[orig_start:orig_end])
-            fdm_parts.append(fracdiff_macro[orig_start:orig_end])
+            ohlcv_parts.append(ohlcv_chunk)
+            rsi_parts.append(rsi_c)
+            macd_parts.append(macd_c)
+            macro_parts.append(macro_chunk)
+            fd_parts.append(fd_c)
+            fdm_parts.append(fdm_c)
+            trend_parts.append(trend_c)
             offset += chunk_len
             prev_orig_end = orig_end
+            segment_idx += 1
 
         cat_idx = idx_parts[0].append(idx_parts[1:]) if len(idx_parts) > 1 else idx_parts[0]
         cat_ohlcv = np.concatenate(ohlcv_parts, axis=0)
@@ -395,14 +682,19 @@ def train_test_split_alternating(
         cat_macro = np.concatenate(macro_parts, axis=0)
         cat_fd = np.concatenate(fd_parts, axis=0)
         cat_fdm = np.concatenate(fdm_parts, axis=0)
-        return cat_idx, cat_ohlcv, cat_rsi, cat_macd, cat_macro, cat_fd, cat_fdm, boundaries
+        cat_trend = np.concatenate(trend_parts, axis=0)
+        return cat_idx, cat_ohlcv, cat_rsi, cat_macd, cat_macro, cat_fd, cat_fdm, cat_trend, boundaries
 
-    tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_bounds = _concat_ranges(train_ranges)
-    ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_bounds = _concat_ranges(eval_ranges)
+    tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_trend, tr_bounds = _concat_ranges(
+        train_ranges
+    )
+    ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_trend, ev_bounds = _concat_ranges(
+        eval_ranges
+    )
 
     return (
-        (tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_bounds),
-        (ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_bounds),
+        (tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_trend, tr_bounds),
+        (ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_trend, ev_bounds),
     )
 
 
@@ -415,6 +707,7 @@ def save_cache(
     macro: np.ndarray,
     fracdiff: np.ndarray,
     fracdiff_macro: np.ndarray,
+    trend: np.ndarray,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
 ) -> None:
     idx = index
@@ -429,25 +722,45 @@ def save_cache(
         macro=macro,
         fracdiff=fracdiff,
         fracdiff_macro=fracdiff_macro,
+        trend=trend,
         fracdiff_d=np.array([fracdiff_d], dtype=np.float64),
     )
 
 
 def load_cache(
     path: str,
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    pd.DatetimeIndex,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     z = np.load(path, allow_pickle=False)
     idx = pd.DatetimeIndex(z["index"])
+    ohlcv = z["ohlcv"]
     if "macro" in z:
         macro = z["macro"]
     else:
         macro = np.zeros((len(idx), N_MACRO), dtype=np.float64)
-    ohlcv = z["ohlcv"]
+    if macro.shape[1] != N_MACRO:
+        raise ValueError(
+            f"Cache macro has {macro.shape[1]} series but code expects {N_MACRO} "
+            f"({MACRO_TICKERS}). Rebuild: python train.py --refresh-data"
+        )
+    d = float(z["fracdiff_d"][0]) if "fracdiff_d" in z else DEFAULT_FRACDIFF_D
     if "fracdiff" in z and "fracdiff_macro" in z:
         fd = z["fracdiff"]
         fdm = z["fracdiff_macro"]
-        d = float(z["fracdiff_d"][0]) if "fracdiff_d" in z else DEFAULT_FRACDIFF_D
+        if fdm.shape[1] != N_MACRO:
+            fd, fdm = compute_fracdiff_panel(ohlcv, macro, d=d)
     else:
-        d = DEFAULT_FRACDIFF_D
         fd, fdm = compute_fracdiff_panel(ohlcv, macro, d=d)
-    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm
+    if "trend" in z.files:
+        trend = z["trend"]
+    else:
+        trend = compute_trend_signals(ohlcv)
+    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend
