@@ -3,11 +3,10 @@
 Run the same saved policy on multiple time slices, with **explicit** leakage
 labels so you do not confuse in-sample path checks with OOS.
 
-Universe: fixed 10 yfinance underlyings + 4 macro series (see data_utils / trading_env).
-You **cannot** swap in different tickers without retraining — observation shape and
-VecNormalize stats are tied to this run.
+Universe must match the training run (manifest ``universe.tickers``) and VecNormalize stats.
+You **cannot** swap tickers without retraining — observation shape is tied to the saved model.
 
-- **HOLDOUT_OOS**: the trailing calendar holdout (same as train.py / backtest.py).
+- **HOLDOUT_OOS**: the trailing calendar holdout (same as scripts/train.py / scripts/backtest.py).
 - **YEAR_IN_SAMPLE** / **FULL_TRAIN_IN_SAMPLE**: the policy and VecNormalize were fit
   on the trainable timeline, so these are not prospective OOS for the learned weights.
   Use them for stress / regime behavior, not to claim new generalization.
@@ -18,6 +17,15 @@ from the run (not refit per slice), matching how you would deploy the saved mode
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path as _Path
+
+_bootstrap_path = _Path(__file__).resolve().parent / "_bootstrap.py"
+_bootstrap_spec = importlib.util.spec_from_file_location("_rlbot_repo_bootstrap", _bootstrap_path)
+assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
+_bootstrap_mod = importlib.util.module_from_spec(_bootstrap_spec)
+_bootstrap_spec.loader.exec_module(_bootstrap_mod)
+
 import argparse
 import csv
 from pathlib import Path
@@ -26,7 +34,7 @@ import numpy as np
 import pandas as pd
 from sb3_contrib import RecurrentPPO
 
-from backtest import (
+from scripts.backtest import (
     DATA_CACHE,
     _find_vec_normalize,
     _max_drawdown,
@@ -34,13 +42,15 @@ from backtest import (
     _resolve_model_path,
     rollout_policy_on_slice,
 )
-from data_utils import TICKERS, benchmark_ohlcv_index, load_cache, reserve_chronological_holdout
-from run_artifacts import read_latest_run_id, read_run_manifest
+from rlbot.data_utils import (
+    benchmark_ohlcv_index,
+    load_cache,
+    resolve_panel_tickers,
+    reserve_chronological_holdout,
+)
+from rlbot.run_artifacts import read_latest_run_id, read_run_manifest
 
-# Weights: [Cash, SP500, GOLD, OIL, EURUSD, USDJPY, NIKKEI, ...]
-I_CASH, I_SP, I_NIK, I_EM = 0, 1, 6, 10
-
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parent.parent
 _PLOTS = _ROOT / "plots"
 
 
@@ -55,13 +65,24 @@ def _holdout_days(manifest: dict | None) -> int:
     return 365
 
 
+def _weight_index(tickers: list[str], name: str) -> int | None:
+    return tickers.index(name) if name in tickers else None
+
+
+def _mean_weight(wmean: np.ndarray, idx: int | None) -> str | float:
+    if idx is None or wmean.size <= idx:
+        return ""
+    return round(float(wmean[idx]), 3)
+
+
 def _spy_metrics(
     ohlcv: np.ndarray,
     start_bar: int,
     nav0: float,
     navs_len: int,
+    tickers: list[str],
 ) -> tuple[float, float, float]:
-    close = ohlcv[:, benchmark_ohlcv_index(), 3]
+    close = ohlcv[:, benchmark_ohlcv_index(tickers), 3]
     i0 = int(start_bar)
     i1 = int(start_bar + navs_len - 1)
     s0 = max(float(close[i0]), 1e-12)
@@ -84,6 +105,7 @@ def _one_row(
     start_bar: int,
     navs: np.ndarray,
     wmean: np.ndarray,
+    tickers: list[str],
 ) -> dict:
     log_rets = np.diff(np.log(np.maximum(navs, 1e-12)))
     n_steps = int(len(navs) - 1)
@@ -91,7 +113,10 @@ def _one_row(
     tot = float(navs[-1] / max(navs[0], 1e-12) - 1.0)
     sh = _sharpe_ann_from_log_rets(log_rets) if log_rets.size else float("nan")
     mdd = _max_drawdown(navs) * 100.0
-    spy_t, spy_sh, _ = _spy_metrics(ohlcv, start_bar, float(navs[0]), len(navs))
+    spy_t, spy_sh, _ = _spy_metrics(ohlcv, start_bar, float(navs[0]), len(navs), tickers)
+    i_sp = _weight_index(tickers, "SP500")
+    i_nik = _weight_index(tickers, "NIKKEI")
+    i_em = _weight_index(tickers, "EM")
     return {
         "kind": kind,
         "label": label,
@@ -104,10 +129,10 @@ def _one_row(
         "max_dd_pct": round(mdd, 2),
         "spy_ret_pct": round(spy_t * 100, 2),
         "spy_sharpe": round(spy_sh, 2) if not np.isnan(spy_sh) else "",
-        "w_cash": round(float(wmean[I_CASH]), 3),
-        "w_SPY": round(float(wmean[I_SP]), 3) if wmean.size > I_SP else "",
-        "w_N225": round(float(wmean[I_NIK]), 3) if wmean.size > I_NIK else "",
-        "w_EEM": round(float(wmean[I_EM]), 3) if wmean.size > I_EM else "",
+        "w_cash": _mean_weight(wmean, 0),
+        "w_SPY": _mean_weight(wmean, (i_sp + 1) if i_sp is not None else None),
+        "w_N225": _mean_weight(wmean, (i_nik + 1) if i_nik is not None else None),
+        "w_EEM": _mean_weight(wmean, (i_em + 1) if i_em is not None else None),
     }
 
 
@@ -158,19 +183,31 @@ def main() -> None:
         Path(args.csv).expanduser() if args.csv.strip() else _PLOTS / str(args.run_id) / "sweep_regimes.csv"
     )
 
+    (
+        idx,
+        ohlcv,
+        rsi,
+        macd,
+        macro,
+        fracdiff,
+        fracdiff_macro,
+        trend,
+        cache_tickers,
+    ) = load_cache(str(DATA_CACHE))
+    panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
+    n_actions = len(panel_tickers) + 1
+
     print(
         f"""
 === Regime / calendar sweep  (run: {args.run_id})  holdout_days={hd}  ===
-Universe (fixed, same 10+macro as training; not swappable for this .zip / vecnorm):
-{", ".join(TICKERS)}
+Universe (must match training manifest / cache; not swappable for this .zip / vecnorm):
+{", ".join(panel_tickers)}
 
 HOLDOUT_OOS  =  strict future block excluded from PPO (only honest OOS for this .zip)
 YEAR_* / FULL_TRAIN_*  =  in-sample path checks; NOT new evidence of generalization
 """.strip()
         + "\n"
     )
-
-    idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend = load_cache(str(DATA_CACHE))
     (
         (t_idx, t_oh, t_rsi, t_macd, t_m, t_fd, t_fdm, t_trend),
         (h_idx, h_oh, h_rsi, h_macd, h_m, h_fd, h_fdm, h_trend),
@@ -216,8 +253,12 @@ YEAR_* / FULL_TRAIN_*  =  in-sample path checks; NOT new evidence of generalizat
             use_vec_norm=True,
             collect_weights=True,
         )
-        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(11, dtype=np.float64)
-        rows.append(_one_row("YEAR_IN_SAMPLE", f"year_{y}", sidx[0], sidx[-1], t_oh[m, ...], sb, nav, wm))
+        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(n_actions, dtype=np.float64)
+        rows.append(
+            _one_row(
+                "YEAR_IN_SAMPLE", f"year_{y}", sidx[0], sidx[-1], t_oh[m, ...], sb, nav, wm, panel_tickers
+            )
+        )
 
     if args.include_full_train and len(t_idx) >= int(args.min_bars):
         nav, sb, _nr, wopt = rollout_policy_on_slice(
@@ -235,10 +276,20 @@ YEAR_* / FULL_TRAIN_*  =  in-sample path checks; NOT new evidence of generalizat
             use_vec_norm=True,
             collect_weights=True,
         )
-        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(11, dtype=np.float64)
+        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(n_actions, dtype=np.float64)
         t_end = str(t_idx[-1].date()) if hasattr(t_idx[-1], "date") else str(t_idx[-1])
         rows.append(
-            _one_row("FULL_TRAIN_IN_SAMPLE", f"full_train_..{t_end}", t_idx[0], t_idx[-1], t_oh, sb, nav, wm)
+            _one_row(
+                "FULL_TRAIN_IN_SAMPLE",
+                f"full_train_..{t_end}",
+                t_idx[0],
+                t_idx[-1],
+                t_oh,
+                sb,
+                nav,
+                wm,
+                panel_tickers,
+            )
         )
 
     if len(h_idx) >= 10:
@@ -257,8 +308,12 @@ YEAR_* / FULL_TRAIN_*  =  in-sample path checks; NOT new evidence of generalizat
             use_vec_norm=True,
             collect_weights=True,
         )
-        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(11, dtype=np.float64)
-        rows.append(_one_row("HOLDOUT_OOS", "official_holdout", h_idx[0], h_idx[-1], h_oh, sb, nav, wm))
+        wm = wopt.mean(axis=0) if wopt is not None and wopt.size else np.zeros(n_actions, dtype=np.float64)
+        rows.append(
+            _one_row(
+                "HOLDOUT_OOS", "official_holdout", h_idx[0], h_idx[-1], h_oh, sb, nav, wm, panel_tickers
+            )
+        )
 
     _k = {"YEAR_IN_SAMPLE": 0, "FULL_TRAIN_IN_SAMPLE": 1, "HOLDOUT_OOS": 2}
     rows.sort(key=lambda r: (_k.get(r["kind"], 9), r["t0"]))

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Train shared RecurrentPPO (LSTM) policy on synchronized multi-asset daily data.
+Train shared RecurrentPPO (LSTM) on synchronized multi-asset daily data.
 
-10 global assets: S&P 500 (SPY), Gold (GLD), Crude Oil WTI (USO),
-EUR/USD, USD/JPY, Nikkei 225, FTSE 100, 10-Year Treasury (IEF),
-Copper (HG=F), Emerging Markets (EEM).
+Universe size and symbols: ``config/config.yaml`` → ``universe.assets`` (5–55);
+optional CLI ``--n-assets`` slices the first N keys.
 
-Artifacts for inference (backtest / paper_trade): ``models/<run_id>/vec_normalize.pkl``
+Artifacts for inference (backtest): ``models/<run_id>/vec_normalize.pkl``
 (same stats copied to ``models/<run_id>/best/`` next to ``best_model.zip``).
 
 Anti-overfitting measures:
@@ -20,12 +19,33 @@ Anti-overfitting measures:
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path as _Path
+
+_bootstrap_path = _Path(__file__).resolve().parent / "_bootstrap.py"
+_bootstrap_spec = importlib.util.spec_from_file_location("_rlbot_repo_bootstrap", _bootstrap_path)
+assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
+_bootstrap_mod = importlib.util.module_from_spec(_bootstrap_spec)
+_bootstrap_spec.loader.exec_module(_bootstrap_mod)
+
 import argparse
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _startup_log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+_startup_log("[train] Starting (loading dependencies)...")
+
 import numpy as np
+
+_startup_log(
+    "[train] Loading PyTorch and Stable-Baselines3 "
+    "(first run in a new shell may take 1–5 minutes)..."
+)
 import torch as th
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import (
@@ -37,32 +57,43 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
-from data_utils import (
+from rlbot.data_utils import (
     clip_index_until,
     fetch_aligned_daily,
     load_cache,
     reserve_chronological_holdout,
     save_cache,
+    select_tradeable_columns,
     train_test_split_alternating,
 )
-from rl_config import apply_deterministic_seeds, get_config, load_config, set_config
-from run_artifacts import (
+from rlbot.rl_config import (
+    UNIVERSE_MAX_ASSETS,
+    UNIVERSE_MIN_ASSETS,
+    apply_deterministic_seeds,
+    get_config,
+    load_config,
+    observation_dim_for_universe,
+    set_config,
+    slice_config_to_n_assets,
+    validate_config_for_universe,
+    write_config_snapshot,
+)
+from rlbot.run_artifacts import (
+    DEFAULT_DATA_CACHE,
     RunPaths,
     new_run_id,
+    resolve_data_cache,
     snapshot_data_cache,
     write_latest_pointer,
     write_manifest,
 )
-from trading_env import (
-    MAX_OBS_LAG,
-    MIN_OBS_LAG,
-    EpisodeEndNavRecorder,
-    MultiAssetPortfolioEnv,
-)
-from visualize import TrainingVizCallback, open_plot_file
+from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
+from rlbot.visualize import TrainingVizCallback, open_plot_file
 
-ROOT = Path(__file__).resolve().parent
-DATA_CACHE = ROOT / "data_cache.npz"
+_startup_log("[train] Dependencies loaded.")
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_CACHE = DEFAULT_DATA_CACHE
 
 
 def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path]:
@@ -308,7 +339,7 @@ def trade_curriculum_milestones(learn_budget: int) -> tuple[int, int, int]:
     """Return ``(fee_free_until, fee_ramp_end, churn_start_step)`` in environment steps.
 
     - **Frictionless** until ``fee_free_until``; **fee ramp** until ``fee_ramp_end``; then DR.
-    - **Churn** penalty scale is 0 before ``churn_start_step``, then 1.
+    - **Churn** penalty scale is 0 before ``churn_start_step``, then ramps linearly to 1.
 
     At ≤65M budget: fraction-of-run schedule (8% / 35% / 15%) to avoid a mid-run cliff.
     Between 65M and 120M: interpolate toward long-run anchors; ≥120M uses fixed long milestones.
@@ -381,8 +412,10 @@ class TradingCurriculumCallback(BaseCallback):
     - Steps ``[fee_free_until, fee_ramp_end)``: linear ramp to ``fee_scale = 1.0``.
     - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds.
     - Steps ``>= dr_widen_end``: full DR (fee in config DR range, lag in {0, 1, 2}).
-    - Churn: ``churn_scale = 0`` before ``churn_start_step``, then ``1``.
+    - Churn: ``churn_scale = 0`` before ``churn_start_step``, then linear ramp to ``1`` over 10M steps.
     """
+
+    CHURN_RAMP_DURATION = 10_000_000
 
     def __init__(
         self,
@@ -409,23 +442,32 @@ class TradingCurriculumCallback(BaseCallback):
         return None
 
     def _churn_scale(self, t: int) -> float:
-        return 0.0 if t < self.churn_start_step else 1.0
+        """Progressively anneal churn penalty to avoid curriculum shock."""
+        if t < self.churn_start_step:
+            return 0.0
+        ramp_end = self.churn_start_step + self.CHURN_RAMP_DURATION
+        if t >= ramp_end:
+            return 1.0
+        progress = float(t - self.churn_start_step) / float(self.CHURN_RAMP_DURATION)
+        return progress
 
     def _dr_bounds(self, t: int) -> tuple[float, float, int, int]:
         """Progressive fee/lag bounds after fee curriculum releases DR."""
         dr_min = get_config().environment.domain_randomize_fee_dr_min
         dr_max = get_config().environment.domain_randomize_fee_dr_max
+        env_cfg = get_config().environment
+        lag_lo, lag_hi = env_cfg.min_obs_lag, env_cfg.max_obs_lag
         if t < self.fee_ramp_end:
-            return dr_min, dr_max, MIN_OBS_LAG, MAX_OBS_LAG
+            return dr_min, dr_max, lag_lo, lag_hi
         if t >= self.dr_widen_end:
-            return dr_min, dr_max, MIN_OBS_LAG, MAX_OBS_LAG
+            return dr_min, dr_max, lag_lo, lag_hi
         progress = (t - self.fee_ramp_end) / max(self.dr_widen_end - self.fee_ramp_end, 1)
         fee_min = 1.0 - (1.0 - dr_min) * progress
         fee_max = 1.0 + (dr_max - 1.0) * progress
         lag_min = int(round(1.0 - progress))
         lag_max = int(round(1.0 + progress))
-        lag_min = max(MIN_OBS_LAG, min(lag_min, MAX_OBS_LAG))
-        lag_max = max(lag_min, min(lag_max, MAX_OBS_LAG))
+        lag_min = max(lag_lo, min(lag_min, lag_hi))
+        lag_max = max(lag_min, min(lag_max, lag_hi))
         return fee_min, fee_max, lag_min, lag_max
 
     def _apply(self) -> None:
@@ -459,7 +501,7 @@ class TradingCurriculumCallback(BaseCallback):
 
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default=str(ROOT / "config.yaml"))
+    pre.add_argument("--config", type=str, default=str(ROOT / "config" / "config.yaml"))
     pre_args, _ = pre.parse_known_args()
     set_config(load_config(pre_args.config))
 
@@ -513,17 +555,12 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=tr_cfg.seed)
     parser.add_argument(
-        "--test-days", type=int, default=365,
-        help="Deprecated alias for --holdout-days (backtest OOS window); prefer --holdout-days",
-    )
-    parser.add_argument(
         "--holdout-days",
         type=int,
-        default=None,
+        default=tr_cfg.holdout_days,
         help=(
             "Reserve the last N calendar days for backtest only; training/eval never see these bars. "
-            "Ignored when --train-end and --holdout-start are set. "
-            "Default: same as --test-days (365) for backward compatibility."
+            "Ignored when --train-end and --holdout-start are set."
         ),
     )
     parser.add_argument(
@@ -555,6 +592,17 @@ def main() -> None:
     parser.add_argument("--show-viz", action="store_true")
     parser.add_argument("--run-id", default="", metavar="ID")
     parser.add_argument(
+        "--n-assets",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"Use the first N keys from universe.assets in config.yaml "
+            f"({UNIVERSE_MIN_ASSETS}–{UNIVERSE_MAX_ASSETS}); slices cap weights and costs. "
+            "Cannot exceed the number of assets defined in the config file."
+        ),
+    )
+    parser.add_argument(
         "--resume", default="", metavar="PATH",
         help="Resume from a RecurrentPPO checkpoint .zip (loads weights + VecNormalize stats). Old MLP/PPO checkpoints are incompatible.",
     )
@@ -563,28 +611,79 @@ def main() -> None:
         set_config(load_config(args.config))
         cfg = get_config()
 
-    if args.holdout_days is None:
-        args.holdout_days = args.test_days
+    if args.n_assets is not None:
+        cfg = slice_config_to_n_assets(get_config(), args.n_assets)
+        set_config(cfg)
+        _startup_log(
+            f"[train] --n-assets {args.n_assets}: "
+            f"{', '.join(cfg.universe.tickers)}"
+        )
 
     apply_deterministic_seeds(args.seed)
 
     run_id = args.run_id.strip() or new_run_id(timesteps=args.timesteps)
     paths = RunPaths(run_id=run_id)
     paths.mkdirs()
-    shutil.copy2(cfg.path, paths.run_meta_dir / "config.yaml")
+    if args.n_assets is not None:
+        write_config_snapshot(cfg, paths.run_meta_dir / "config.yaml")
+    else:
+        shutil.copy2(cfg.path, paths.run_meta_dir / "config.yaml")
+
+    _startup_log(f"[train] Run id={run_id!r}; loading market data...")
 
     # ── data ─────────────────────────────────────────────────────────────
-    if args.refresh_data or not DATA_CACHE.is_file():
+    data_cache = resolve_data_cache()
+    if args.refresh_data or not data_cache.is_file():
+        _startup_log("[train] Fetching OHLCV from yfinance (may take several minutes)...")
         idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend = fetch_aligned_daily(
-            since=args.since, until=args.until,
+            symbols_dict=cfg.universe.assets,
+            since=args.since,
+            until=args.until,
+            fracdiff_d=cfg.data.fracdiff_d,
         )
         save_cache(
-            str(DATA_CACHE), idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend
+            str(data_cache),
+            idx,
+            ohlcv,
+            rsi,
+            macd,
+            macro,
+            fracdiff,
+            fracdiff_macro,
+            trend,
+            fracdiff_d=cfg.data.fracdiff_d,
+            tickers=cfg.universe.tickers,
         )
+        panel_tickers = list(cfg.universe.tickers)
     else:
-        idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend = load_cache(
-            str(DATA_CACHE)
+        (
+            idx,
+            ohlcv,
+            rsi,
+            macd,
+            macro,
+            fracdiff,
+            fracdiff_macro,
+            trend,
+            panel_tickers,
+        ) = load_cache(str(data_cache))
+
+    if list(panel_tickers) != cfg.universe.tickers:
+        ohlcv, rsi, macd, fracdiff, trend, panel_tickers = select_tradeable_columns(
+            ohlcv,
+            rsi,
+            macd,
+            fracdiff,
+            trend,
+            panel_tickers,
+            cfg.universe.tickers,
         )
+
+    validate_config_for_universe(cfg, int(ohlcv.shape[1]))
+    n_assets = int(ohlcv.shape[1])
+    n_actions = n_assets + 1
+    obs_dim = observation_dim_for_universe(n_assets)
+    _startup_log(f"[train] Data panel: {len(idx)} bars, N={n_assets} assets.")
 
     if args.until:
         idx, (ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend) = clip_index_until(
@@ -599,7 +698,7 @@ def main() -> None:
             until=args.until,
         )
 
-    snapshot_data_cache(DATA_CACHE, paths.data_snapshot)
+    snapshot_data_cache(data_cache, paths.data_snapshot)
 
     (idx_fit, ohlcv_fit, macro_fit), (idx_hold, ohlcv_hold, macro_hold) = (
         reserve_chronological_holdout(
@@ -612,6 +711,10 @@ def main() -> None:
     )
 
     purge = cfg.data.feature_purge_warmup
+    _startup_log(
+        f"[train] Walk-forward feature panels "
+        f"(block={args.block_size}, stride={args.eval_stride}; may take 1–3 minutes)..."
+    )
     (
         train_idx,
         train_ohlcv,
@@ -651,12 +754,21 @@ def main() -> None:
             "Not enough training rows after split; widen the date range or reduce --holdout-days."
         )
 
+    universe_meta = {
+        "benchmark": cfg.universe.benchmark,
+        "tickers": list(panel_tickers),
+        "n_assets": n_assets,
+        "n_actions": n_actions,
+        "obs_dim": obs_dim,
+    }
+
     write_manifest(
         paths.manifest_path,
         {
             "run_id": run_id,
             "config_path": str(cfg.path),
             "args": vars(args),
+            "universe": universe_meta,
             "n_index": int(len(idx)),
             "n_trainable_bars": int(len(idx_fit)),
             "chronological_holdout": {
@@ -676,30 +788,43 @@ def main() -> None:
     )
 
     print(f"Run id: {run_id}")
+    print(
+        f"  universe: N={n_assets} tradeable assets "
+        f"({', '.join(panel_tickers[:5])}{'...' if n_assets > 5 else ''}) "
+        f"[config universe.assets; CLI --n-assets overrides count]"
+    )
     print(f"  plots:   {paths.plots_dir}/")
     print(f"  models:  {paths.models_dir}/")
     print(f"  logs:    {paths.logs_dir}/")
     print(f"  tb_logs: {paths.tb_dir}/")
     print(f"  meta:    {paths.run_meta_dir}/")
-    print(f"  network: RecurrentPPO MlpLstmPolicy — LSTM 2×64 + MLP heads [128,128] (pi+vf), AdamW weight_decay=1e-3, gae=0.95, gamma=0.99")
+    print(
+        f"  network: RecurrentPPO MlpLstmPolicy — obs_dim={obs_dim}, "
+        f"n_actions={n_actions} (cash+{n_assets} assets), LSTM 2×64 + MLP [128,128]"
+    )
     print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
     print(f"  trade bundle on exit: {paths.models_dir.name}/vec_normalize.pkl + copy → best/ (pair with best_model.zip)")
     print(f"  n_envs={args.n_envs}, n_steps={args.n_steps}, batch={args.batch_size}")
-    print(f"  max_ep_steps={args.max_ep_steps} (daily bars), clip=0.20, epochs=3, eval=deterministic_cycle (75 eps)")
+    print(f"  max_ep_steps={args.max_ep_steps} (daily bars, train only; eval spans full segment)")
     print(f"  obs_noise={args.obs_noise}, reseed_on_reset=True (training)")
     print(f"  obs_lag: train Uniform{{0,1,2}} per episode; eval fixed at {args.obs_lag}")
     print(f"  execution=open[t+1] (realistic: decide after close[t-1], fill at next open)")
     print(
         f"  reward: return*{cfg.reward.reward_scale:g} + Sortino*{cfg.reward.risk_bonus_scale:g} "
-        f"+ participation*{cfg.reward.participation_bonus:g} - inactivity - churn "
-        f"- quadratic_dd*({cfg.reward.drawdown_penalty_scale:g}*10)"
+        f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
+        f"- inactivity - churn*{cfg.reward.churn_penalty_scale:g} "
+        f"- quadratic_dd*({cfg.reward.drawdown_penalty_scale:g}*{cfg.reward.drawdown_quadratic_multiplier:g})"
     )
     print(
         f"  eval inactivity scale: {cfg.reward.eval_inactivity_penalty_scale} "
         f"(train=1.0; eval rewards less punitive for defensive cash)"
     )
     print(f"  eval plot: mean ending NAV → runs/<id>/eval_logs/eval_nav_history.npz")
-    print(f"  action: softmax(cash+10 assets), long-only risky weights, soft cap per asset (config)")
+    print(
+        f"  action: softmax(cash+{n_assets} assets), long-only risky weights, "
+        f"soft cap per asset (config)"
+    )
+    print(f"  universe: {', '.join(panel_tickers)}")
     _dre = dr_widen_end_milestone(args.timesteps)
     print(
         f"  domain_randomization: fee_scale~Beta(5,5) on widening bounds, "
@@ -741,6 +866,10 @@ def main() -> None:
 
     # ── envs ─────────────────────────────────────────────────────────────
     n_envs = args.n_envs
+    _startup_log(
+        f"[train] Spawning {n_envs} parallel training envs "
+        f"(first launch may take 1–3 minutes)..."
+    )
 
     train_env = SubprocVecEnv([
         _make_env_factory(
@@ -790,6 +919,7 @@ def main() -> None:
         gamma=hp.gamma,
         training=False,
     )
+    _startup_log("[train] Environments ready; building RecurrentPPO policy...")
 
     # ── model ────────────────────────────────────────────────────────────
     policy_kwargs = dict(
@@ -866,6 +996,15 @@ def main() -> None:
 
     # ── callbacks ────────────────────────────────────────────────────────
     eval_freq = max(5_000 // n_envs, args.n_steps)
+    validation_segments = eval_env.env_method("get_segments")[0]
+    n_validation_blocks = (
+        len(validation_segments) if validation_segments else tr_cfg.eval_n_episodes
+    )
+    n_validation_blocks = max(1, int(n_validation_blocks))
+    print(
+        f"  eval: {n_validation_blocks} episode(s) = one full rollout per eval segment "
+        f"(config eval_n_episodes={tr_cfg.eval_n_episodes} is fallback only)"
+    )
     # No StopTrainingOnNoModelImprovement: train for full --timesteps (eval still logs best_model)
     eval_callback = EvalNavBestModelCallback(
         eval_env,
@@ -873,7 +1012,7 @@ def main() -> None:
         best_model_save_path=str(paths.best_model_dir),
         log_path=str(paths.eval_log_dir),
         eval_freq=eval_freq,
-        n_eval_episodes=tr_cfg.eval_n_episodes,
+        n_eval_episodes=n_validation_blocks,
         deterministic=True,
         render=False,
     )
@@ -917,6 +1056,7 @@ def main() -> None:
         )
 
     # ── train ────────────────────────────────────────────────────────────
+    _startup_log(f"[train] Starting PPO learning ({args.timesteps:,} timesteps)...")
     learn_error: BaseException | None = None
     try:
         model.learn(
@@ -946,6 +1086,7 @@ def main() -> None:
             "run_id": run_id,
             "config_path": str(cfg.path),
             "args": vars(args),
+            "universe": universe_meta,
             "n_index": int(len(idx)),
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),

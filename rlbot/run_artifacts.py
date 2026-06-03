@@ -11,7 +11,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = PROJECT_ROOT / ".cache"
+DEFAULT_DATA_CACHE = CACHE_DIR / "data_cache.npz"
+_LEGACY_DATA_CACHE = PROJECT_ROOT / "data_cache.npz"
+
+
+def resolve_data_cache() -> Path:
+    """Return the canonical panel cache path, migrating a legacy root ``data_cache.npz`` once."""
+    if not DEFAULT_DATA_CACHE.is_file() and _LEGACY_DATA_CACHE.is_file():
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_LEGACY_DATA_CACHE), str(DEFAULT_DATA_CACHE))
+    return DEFAULT_DATA_CACHE
 RUNS_ROOT = PROJECT_ROOT / "runs"
 LATEST_RUN_FILE = RUNS_ROOT / "LATEST.txt"
 

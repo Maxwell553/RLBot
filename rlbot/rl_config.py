@@ -15,10 +15,12 @@ import numpy as np
 import torch as th
 import yaml
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = ROOT / "config.yaml"
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = ROOT / "config" / "config.yaml"
 
-N_ASSETS_EXPECTED = 10
+# Supported tradeable universe size (count of ``universe.assets`` keys).
+UNIVERSE_MIN_ASSETS = 5
+UNIVERSE_MAX_ASSETS = 55
 
 
 def _req(d: dict[str, Any], key: str, section: str) -> Any:
@@ -27,10 +29,15 @@ def _req(d: dict[str, Any], key: str, section: str) -> Any:
     return d[key]
 
 
-def _float_list(xs: list, name: str, n: int = N_ASSETS_EXPECTED) -> list[float]:
-    if len(xs) != n:
-        raise ValueError(f"{name} must have {n} entries, got {len(xs)}")
+def _float_list(xs: list, name: str, expected_n: int | None = None) -> list[float]:
+    if expected_n is not None and len(xs) != expected_n:
+        raise ValueError(f"{name} must have {expected_n} entries, got {len(xs)}")
     return [float(x) for x in xs]
+
+
+def observation_dim_for_universe(n_assets: int, n_macro: int = 4) -> int:
+    """Market + portfolio + meta observation size (macro count fixed at 4 by default)."""
+    return 9 * n_assets + 8 + 5 * n_macro
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,9 @@ class RewardConfig:
     inactivity_penalty_over_90: float
     eval_inactivity_penalty_scale: float
     participation_bonus: float
+    participation_reward_scale: float
+    churn_penalty_scale: float
+    drawdown_quadratic_multiplier: float
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -174,8 +184,20 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class UniverseConfig:
+    benchmark: str
+    assets: dict[str, str]
+    tickers: list[str]
+
+    @property
+    def n_assets(self) -> int:
+        return len(self.tickers)
+
+
+@dataclass(frozen=True)
 class RLConfig:
     path: Path
+    universe: UniverseConfig
     environment: EnvironmentConfig
     reward: RewardConfig
     transaction_costs: TransactionCostsConfig
@@ -192,7 +214,91 @@ class RLConfig:
         return copy.deepcopy(self.raw)
 
 
+def validate_universe_asset_count(n_assets: int) -> None:
+    """Enforce supported panel width (``universe.assets`` key count)."""
+    if n_assets < UNIVERSE_MIN_ASSETS or n_assets > UNIVERSE_MAX_ASSETS:
+        raise ValueError(
+            f"universe must have between {UNIVERSE_MIN_ASSETS} and {UNIVERSE_MAX_ASSETS} "
+            f"tradeable assets, got {n_assets}"
+        )
+
+
+def _parse_universe(uni: dict[str, Any]) -> UniverseConfig:
+    benchmark = str(_req(uni, "benchmark", "universe"))
+    raw_assets = _req(uni, "assets", "universe")
+    if not isinstance(raw_assets, dict) or not raw_assets:
+        raise ValueError("universe.assets must be a non-empty mapping of label → yfinance symbol")
+    assets = {str(k): str(v) for k, v in raw_assets.items()}
+    tickers = list(assets.keys())
+    validate_universe_asset_count(len(tickers))
+    if benchmark not in assets:
+        raise ValueError(
+            f"universe.benchmark {benchmark!r} must be a key in universe.assets, got {tickers}"
+        )
+    return UniverseConfig(benchmark=benchmark, assets=assets, tickers=tickers)
+
+
+def slice_config_to_n_assets(cfg: RLConfig, n_assets: int) -> RLConfig:
+    """Truncate ``universe.assets`` and per-asset lists to the first *n_assets* YAML keys.
+
+    Use for CLI ``--n-assets`` without editing ``config.yaml``. The file must define at
+    least *n_assets* keys; ``universe.benchmark`` must remain among the kept keys.
+    ``benchmark_cap_weights`` are renormalized after slicing.
+    """
+    validate_universe_asset_count(n_assets)
+    full = cfg.universe.n_assets
+    if n_assets == full:
+        return cfg
+    if n_assets > full:
+        raise ValueError(
+            f"Requested N={n_assets} assets but config defines only {full} under "
+            f"universe.assets; add symbols to config.yaml (supported up to {UNIVERSE_MAX_ASSETS})."
+        )
+    data = copy.deepcopy(cfg.raw)
+    keys = list(data["universe"]["assets"].keys())[:n_assets]
+    data["universe"]["assets"] = {k: data["universe"]["assets"][k] for k in keys}
+    benchmark = str(data["universe"]["benchmark"])
+    if benchmark not in data["universe"]["assets"]:
+        raise ValueError(
+            f"universe.benchmark {benchmark!r} is not among the first {n_assets} assets "
+            f"({keys}); put the benchmark key earlier in universe.assets or lower --n-assets"
+        )
+    weights = [float(x) for x in data["reward"]["benchmark_cap_weights"][:n_assets]]
+    wsum = sum(weights)
+    if wsum <= 0.0:
+        raise ValueError("benchmark_cap_weights slice must sum to a positive value")
+    data["reward"]["benchmark_cap_weights"] = [w / wsum for w in weights]
+    tc = data["transaction_costs"]
+    for name in ("slippage", "tx_fee", "annual_holding_cost"):
+        tc[name] = list(tc[name])[:n_assets]
+    return _parse_config(data, cfg.path)
+
+
+def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
+    """Ensure per-asset config lists match the loaded OHLCV panel width."""
+    validate_universe_asset_count(n_assets)
+    u = cfg.universe
+    if u.n_assets != n_assets:
+        raise ValueError(
+            f"universe.assets has {u.n_assets} entries but data panel has {n_assets} assets; "
+            "align config.yaml universe with --refresh-data"
+        )
+    if u.benchmark not in u.assets:
+        raise ValueError(f"universe.benchmark {u.benchmark!r} missing from universe.assets")
+
+    def _check(xs: list[float], name: str) -> None:
+        if len(xs) != n_assets:
+            raise ValueError(f"{name} must have {n_assets} entries, got {len(xs)}")
+
+    _check(cfg.reward.benchmark_cap_weights, "reward.benchmark_cap_weights")
+    tc = cfg.transaction_costs
+    _check(tc.slippage, "transaction_costs.slippage")
+    _check(tc.tx_fee, "transaction_costs.tx_fee")
+    _check(tc.annual_holding_cost, "transaction_costs.annual_holding_cost")
+
+
 def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
+    universe = _parse_universe(_req(data, "universe", "root"))
     env = _req(data, "environment", "root")
     rew = _req(data, "reward", "root")
     tc = _req(data, "transaction_costs", "root")
@@ -206,6 +312,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
 
     return RLConfig(
         path=path.resolve(),
+        universe=universe,
         environment=EnvironmentConfig(
             initial_cash=float(_req(env, "initial_cash", "environment")),
             max_episode_steps=int(_req(env, "max_episode_steps", "environment")),
@@ -229,6 +336,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             benchmark_cap_weights=_float_list(
                 _req(rew, "benchmark_cap_weights", "reward"),
                 "benchmark_cap_weights",
+                expected_n=None,
             ),
             churn_lambda=float(_req(rew, "churn_lambda", "reward")),
             drawdown_penalty_scale=float(_req(rew, "drawdown_penalty_scale", "reward")),
@@ -238,12 +346,25 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
                 _req(rew, "eval_inactivity_penalty_scale", "reward")
             ),
             participation_bonus=float(_req(rew, "participation_bonus", "reward")),
+            participation_reward_scale=float(
+                _req(rew, "participation_reward_scale", "reward")
+            ),
+            churn_penalty_scale=float(_req(rew, "churn_penalty_scale", "reward")),
+            drawdown_quadratic_multiplier=float(
+                _req(rew, "drawdown_quadratic_multiplier", "reward")
+            ),
         ),
         transaction_costs=TransactionCostsConfig(
-            slippage=_float_list(_req(tc, "slippage", "transaction_costs"), "slippage"),
-            tx_fee=_float_list(_req(tc, "tx_fee", "transaction_costs"), "tx_fee"),
+            slippage=_float_list(
+                _req(tc, "slippage", "transaction_costs"), "slippage", expected_n=None
+            ),
+            tx_fee=_float_list(
+                _req(tc, "tx_fee", "transaction_costs"), "tx_fee", expected_n=None
+            ),
             annual_holding_cost=_float_list(
-                _req(tc, "annual_holding_cost", "transaction_costs"), "annual_holding_cost"
+                _req(tc, "annual_holding_cost", "transaction_costs"),
+                "annual_holding_cost",
+                expected_n=None,
             ),
             trading_days_per_year=int(_req(tc, "trading_days_per_year", "transaction_costs")),
         ),
@@ -344,36 +465,16 @@ def get_config() -> RLConfig:
 
 
 def set_config(cfg: RLConfig) -> None:
-    """Install active config (e.g. after ``--config`` override)."""
+    """Install active config (e.g. after ``--config`` or ``--n-assets``)."""
     global _CONFIG
     _CONFIG = cfg
-    sync_trading_env_aliases(cfg)
 
 
-def sync_trading_env_aliases(cfg: RLConfig | None = None) -> None:
-    """Keep ``trading_env`` module-level names in sync for legacy imports."""
-    import trading_env as te
-
-    c = cfg or get_config()
-    e, r = c.environment, c.reward
-    te.LOOKBACK = e.lookback
-    te.MIN_OBS_LAG = e.min_obs_lag
-    te.MAX_OBS_LAG = e.max_obs_lag
-    te.MAX_SINGLE_ASSET_WEIGHT = e.max_single_asset_weight
-    te.REWARD_SCALE = r.reward_scale
-    te.MAX_STEP_LOG_RETURN = r.max_step_log_return
-    te.CHURN_LAMBDA = r.churn_lambda
-    te.RISK_WINDOW = r.risk_window
-    te.RISK_BONUS_SCALE = r.risk_bonus_scale
-    te.INACTIVITY_PENALTY_OVER_50 = r.inactivity_penalty_over_50
-    te.INACTIVITY_PENALTY_OVER_90 = r.inactivity_penalty_over_90
-    te.EVAL_INACTIVITY_PENALTY_SCALE = r.eval_inactivity_penalty_scale
-    te.PARTICIPATION_BONUS = r.participation_bonus
-    te.STOP_LOSS_FRACTION = e.stop_loss_fraction
-    te.ASSET_SLIPPAGE = c.transaction_costs.slippage_array()
-    te.ASSET_TX_FEE = c.transaction_costs.tx_fee_array()
-    te.ANNUAL_HOLDING_COST = np.asarray(c.transaction_costs.annual_holding_cost, dtype=np.float64)
-    te.DAILY_HOLDING_COST = c.transaction_costs.daily_holding_cost_array()
+def write_config_snapshot(cfg: RLConfig, path: Path | str) -> None:
+    """Write the effective config (e.g. after ``--n-assets`` slice) to a run directory."""
+    p = Path(path)
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg.to_dict(), f, sort_keys=False, default_flow_style=None)
 
 
 def apply_deterministic_seeds(seed: int) -> None:

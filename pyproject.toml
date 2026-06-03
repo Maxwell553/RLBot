@@ -26,24 +26,15 @@ dependencies = [
 ]
 
 [project.scripts]
-market-trainer-train = "train:main"
-market-trainer-backtest = "backtest:main"
+market-trainer-train = "scripts.train:main"
+market-trainer-backtest = "scripts.backtest:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
 
-[tool.setuptools]
-py-modules = [
-    "train",
-    "backtest",
-    "backtest_sweep",
-    "data_utils",
-    "trading_env",
-    "rl_config",
-    "vecnorm_utils",
-    "visualize",
-    "run_artifacts",
-]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rlbot*", "scripts*"]
 
 [tool.setuptools.data-files]
-"" = ["config.yaml"]
+"" = ["config/config.yaml"]

@@ -14,6 +14,6 @@ if str(ROOT) not in sys.path:
 
 @pytest.fixture(scope="session", autouse=True)
 def _load_rl_config() -> None:
-    from rl_config import load_config, set_config
+    from rlbot.rl_config import load_config, set_config
 
-    set_config(load_config(ROOT / "config.yaml"))
+    set_config(load_config(ROOT / "config" / "config.yaml"))

@@ -200,20 +200,28 @@ def _plot_equity_drawdown_benchmarks(
     nav_model: np.ndarray,
     nav_spy: np.ndarray | None,
     nav_equal_weight: np.ndarray | None,
+    nav_balanced_6040: np.ndarray | None = None,
+    nav_risk_parity: np.ndarray | None = None,
+    nav_stochastic_ensemble: np.ndarray | None = None,
     model_label: str,
 ) -> None:
     """Fill top two axes: normalized equity and drawdown for model + passive benchmarks."""
     ax_eq, ax_dd = axes[0], axes[1]
-    # Bright primaries: blue model, red SPY, green equal-weight (high contrast on white).
     COLOR_MODEL = "#0066FF"
     COLOR_SPY = "#FF1744"
     COLOR_EW = "#00E676"
+    COLOR_6040 = "#9C27B0"
+    COLOR_RP = "#FF9100"
 
     bench_series: list[tuple[np.ndarray, str, str, str, float]] = []
     if nav_spy is not None:
         bench_series.append((nav_spy, "SPY buy & hold", COLOR_SPY, "-", 1.6))
+    if nav_balanced_6040 is not None:
+        bench_series.append((nav_balanced_6040, "60/40 SPY / IEF", COLOR_6040, "-", 1.5))
+    if nav_risk_parity is not None:
+        bench_series.append((nav_risk_parity, "Naive risk parity", COLOR_RP, "-", 1.5))
     if nav_equal_weight is not None:
-        bench_series.append((nav_equal_weight, "Equal-weight buy & hold", COLOR_EW, "-", 2.0))
+        bench_series.append((nav_equal_weight, "Equal-weight buy & hold", COLOR_EW, "-", 1.4))
 
     eq_lines: list[tuple[np.ndarray, str, str, str, float]] = []
     z = 2
@@ -225,9 +233,36 @@ def _plot_equity_drawdown_benchmarks(
         eq_lines.append((eq, leg, color, ls, lw))
         z += 1
 
+    if nav_stochastic_ensemble is not None and nav_stochastic_ensemble.ndim == 2:
+        ens = np.asarray(nav_stochastic_ensemble, dtype=np.float64)
+        if ens.shape[1] == len(nav_model):
+            eq_paths = ens / np.maximum(ens[:, :1], 1e-12)
+            p5 = np.percentile(eq_paths, 5, axis=0)
+            p50 = np.percentile(eq_paths, 50, axis=0)
+            p95 = np.percentile(eq_paths, 95, axis=0)
+            ax_eq.fill_between(
+                t,
+                p5,
+                p95,
+                color=COLOR_MODEL,
+                alpha=0.22,
+                label=f"Stochastic paths (n={ens.shape[0]}, 5–95%)",
+                zorder=z,
+            )
+            ax_eq.plot(
+                t,
+                p50,
+                color=COLOR_MODEL,
+                lw=1.2,
+                ls=":",
+                alpha=0.85,
+                zorder=z + 1,
+            )
+            z += 2
+
     eq_m = _normalized_equity(nav_model)
     ret_m_pct = float(eq_m[-1] - 1.0) * 100.0
-    leg_m = f"{model_label} ({ret_m_pct:+.1f}%)"
+    leg_m = f"{model_label} deterministic ({ret_m_pct:+.1f}%)"
     ax_eq.plot(
         t, eq_m, color=COLOR_MODEL, lw=2.6, ls="-", label=leg_m, zorder=z + 1,
     )
@@ -267,6 +302,9 @@ def plot_backtest_dashboard(
     *,
     nav_spy: np.ndarray | None = None,
     nav_equal_weight: np.ndarray | None = None,
+    nav_balanced_6040: np.ndarray | None = None,
+    nav_risk_parity: np.ndarray | None = None,
+    nav_stochastic_ensemble: np.ndarray | None = None,
     weights: Optional[np.ndarray] = None,
     weight_timestamps: Optional[Sequence] = None,
     asset_labels: Optional[Sequence[str]] = None,
@@ -281,7 +319,7 @@ def plot_backtest_dashboard(
     ----------
     timestamps : length len(nav)
     nav : model portfolio NAV
-    nav_spy, nav_equal_weight : passive benchmark NAV paths (same length as ``nav``)
+    nav_spy, nav_equal_weight, nav_balanced_6040, nav_risk_parity : passive benchmarks (same len as ``nav``)
     weights : shape (n_steps, n_weights)
     """
     save_path = Path(save_path)
@@ -291,10 +329,14 @@ def plot_backtest_dashboard(
     t = np.asarray(timestamps)
     if len(t) != len(nav):
         raise ValueError("timestamps must match nav length")
-    if nav_spy is not None and len(nav_spy) != len(nav):
-        raise ValueError("nav_spy must match nav length")
-    if nav_equal_weight is not None and len(nav_equal_weight) != len(nav):
-        raise ValueError("nav_equal_weight must match nav length")
+    for name, bench in (
+        ("nav_spy", nav_spy),
+        ("nav_equal_weight", nav_equal_weight),
+        ("nav_balanced_6040", nav_balanced_6040),
+        ("nav_risk_parity", nav_risk_parity),
+    ):
+        if bench is not None and len(bench) != len(nav):
+            raise ValueError(f"{name} must match nav length")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True, constrained_layout=True)
     fig.suptitle(title, fontsize=13)
@@ -305,6 +347,9 @@ def plot_backtest_dashboard(
         nav_model=nav,
         nav_spy=nav_spy,
         nav_equal_weight=nav_equal_weight,
+        nav_balanced_6040=nav_balanced_6040,
+        nav_risk_parity=nav_risk_parity,
+        nav_stochastic_ensemble=nav_stochastic_ensemble,
         model_label=model_label,
     )
 
@@ -319,14 +364,39 @@ def plot_backtest_dashboard(
             tw = t[:n] if len(t) >= n else t
         if len(tw) != n:
             tw = t[:n]
+
+        plot_w = w.T
+        plot_labels = list(asset_labels)
+        if w.shape[1] > 15:
+            # Cash (col 0) + top-8 risky sleeves; remainder → "Other Assets"
+            cash = w[:, 0]
+            risky = w[:, 1:]
+            n_risky = risky.shape[1]
+            top_k = min(8, n_risky)
+            mean_risky = risky.mean(axis=0)
+            top_idx = np.argsort(-mean_risky)[:top_k]
+            stacks = [cash]
+            labels = [plot_labels[0] if plot_labels else "Cash"]
+            for j in top_idx:
+                stacks.append(risky[:, j])
+                labels.append(plot_labels[j + 1] if j + 1 < len(plot_labels) else f"Asset{j}")
+            other_mask = np.ones(n_risky, dtype=bool)
+            other_mask[top_idx] = False
+            if np.any(other_mask):
+                stacks.append(risky[:, other_mask].sum(axis=1))
+                labels.append("Other Assets")
+            plot_w = np.vstack(stacks)
+            plot_labels = labels
+
         axes[2].stackplot(
             tw,
-            w.T,
-            labels=list(asset_labels),
+            plot_w,
+            labels=plot_labels,
             alpha=0.9,
         )
         axes[2].set_ylim(0.0, 1.0)
-        axes[2].legend(loc="upper left", fontsize=7, ncol=4, framealpha=0.9)
+        ncol = min(4, max(1, len(plot_labels)))
+        axes[2].legend(loc="upper left", fontsize=7, ncol=ncol, framealpha=0.9)
         axes[2].set_title("Target portfolio weights (softmax of actions)")
     else:
         axes[2].text(0.5, 0.5, "No weight history", ha="center", va="center", transform=axes[2].transAxes)

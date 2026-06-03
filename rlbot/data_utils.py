@@ -1,53 +1,98 @@
 """
-Historical OHLCV fetch + alignment for multi-asset global portfolio RL.
+Historical OHLCV fetch and alignment for multi-asset portfolio RL.
 
-Daily data via yfinance for 10 global assets:
-  S&P 500 (SPY), Gold (GLD), Crude Oil WTI (USO), EUR/USD, USD/JPY,
-  Nikkei 225, FTSE 100, 10-Year Treasury (IEF), Copper (HG=F),
-  Emerging Markets (EEM).
+Tradeable symbols come from ``config.yaml`` → ``universe.assets`` (via
+``get_active_symbols()``). Macro context (DXY, TNX, VIX, HY OAS) is
+observation-only.
 
-Macro context features (observation-only, not tradeable):
-  DXY (Dollar Index), 10-Year Treasury Yield (^TNX), VIX (^VIX),
-  ICE BofA US High Yield OAS (FRED BAMLH0A0HYM2).
-
-Assets trade on different exchanges/schedules; daily bars are aligned via
-outer-join and short forward-fill for holiday gaps. **Pre-listing rows are
-dropped** (no backward-fill of future IPO prices). The panel starts when all
-assets have real quotes. Weekends are excluded.
+Daily bars are outer-joined across assets with short forward-fill for
+holiday gaps. Pre-listing rows are dropped. The panel starts when all
+configured assets have real quotes.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Readable ticker labels → yfinance symbols
-YF_SYMBOLS: Dict[str, str] = {
-    "SP500":   "SPY",
-    "GOLD":    "GLD",
-    "OIL":     "USO",
-    "EURUSD":  "EURUSD=X",
-    "USDJPY":  "USDJPY=X",
-    "NIKKEI":  "^N225",
-    "FTSE":    "^FTSE",
-    "BOND10Y": "IEF",
-    "COPPER":  "HG=F",
-    "EM":      "EEM",
-}
+def get_active_symbols() -> Dict[str, str]:
+    """Tradeable universe label → yfinance symbol from loaded config."""
+    from rlbot.rl_config import get_config
 
-TICKERS: List[str] = list(YF_SYMBOLS.keys())
-
-# Buy-and-hold benchmark column in ``ohlcv`` (SPY proxy); must match ``TICKERS`` order.
-BENCHMARK_TICKER = "SP500"
+    return dict(get_config().universe.assets)
 
 
-def benchmark_ohlcv_index() -> int:
-    """OHLCV asset axis index for the SPY/SP500 benchmark (not the policy action index)."""
-    if BENCHMARK_TICKER not in TICKERS:
-        raise KeyError(f"Benchmark {BENCHMARK_TICKER!r} missing from TICKERS: {TICKERS}")
-    return TICKERS.index(BENCHMARK_TICKER)
+def resolve_tickers(tickers: Sequence[str] | None = None) -> List[str]:
+    """Active ticker order: explicit list or config universe."""
+    if tickers is not None:
+        return list(tickers)
+    from rlbot.rl_config import get_config
+
+    return list(get_config().universe.tickers)
+
+
+def resolve_panel_tickers(
+    manifest: dict | None = None,
+    cache_tickers: Sequence[str] | None = None,
+) -> List[str]:
+    """Ticker order for backtest: training manifest, cache array, then config."""
+    if manifest:
+        uni = manifest.get("universe")
+        if isinstance(uni, dict) and uni.get("tickers"):
+            return [str(t) for t in uni["tickers"]]
+    if cache_tickers is not None:
+        return list(cache_tickers)
+    return resolve_tickers()
+
+
+def select_tradeable_columns(
+    ohlcv: np.ndarray,
+    rsi: np.ndarray,
+    macd: np.ndarray,
+    fracdiff: np.ndarray,
+    trend: np.ndarray,
+    panel_tickers: Sequence[str],
+    universe_tickers: Sequence[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """Restrict asset-axis arrays to ``universe_tickers`` (subset of ``panel_tickers``, same order)."""
+    panel = list(panel_tickers)
+    want = list(universe_tickers)
+    if panel == want:
+        return ohlcv, rsi, macd, fracdiff, trend, want
+    try:
+        indices = [panel.index(t) for t in want]
+    except ValueError as e:
+        missing = [t for t in want if t not in panel]
+        raise ValueError(
+            f"Data cache is missing universe ticker(s) {missing}; "
+            f"cache has {panel}. Run with --refresh-data after changing the universe."
+        ) from e
+    return (
+        ohlcv[:, indices],
+        rsi[:, indices],
+        macd[:, indices],
+        fracdiff[:, indices],
+        trend[:, indices],
+        want,
+    )
+
+
+def _benchmark_ticker_label() -> str:
+    from rlbot.rl_config import get_config
+
+    return get_config().universe.benchmark
+
+
+def benchmark_ohlcv_index(tickers: Sequence[str] | None = None) -> int:
+    """OHLCV asset axis index for the benchmark sleeve (not the policy action index)."""
+    active = resolve_tickers(tickers)
+    benchmark = _benchmark_ticker_label()
+    if benchmark not in active:
+        raise KeyError(f"Benchmark {benchmark!r} missing from tickers: {active}")
+    return active.index(benchmark)
 
 
 # Macro context features — not tradeable, observation-only
@@ -61,6 +106,7 @@ HY_OAS_FRED_ID = "BAMLH0A0HYM2"
 HY_OAS_PROXY_YF = "HYG"  # high-yield ETF vs IEF (BOND10Y) for pre-FRED panel
 MACRO_TICKERS: List[str] = list(MACRO_SYMBOLS.keys()) + ["HY_OAS"]
 N_MACRO = len(MACRO_TICKERS)
+MACRO_VIX_INDEX = MACRO_TICKERS.index("VIX")  # DXY=0, TNX=1, VIX=2, HY_OAS=3
 
 TIMEFRAME = "1d"
 FFILL_LIMIT = 5  # forward-fill up to 5 business days for holiday gaps
@@ -219,12 +265,15 @@ def _attach_hy_oas_column(
     return merged
 
 
-def _ohlcv_macro_from_merged(merged: pd.DataFrame) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+def _ohlcv_macro_from_merged(
+    merged: pd.DataFrame,
+    active_tickers: List[str],
+) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
     """Extract aligned OHLCV + macro panels from a merged daily DataFrame."""
     merged = merged.sort_values("date").reset_index(drop=True)
     idx = pd.DatetimeIndex(merged["date"])
-    ohlcv = np.zeros((len(merged), len(TICKERS), 5), dtype=np.float64)
-    for j, ticker in enumerate(TICKERS):
+    ohlcv = np.zeros((len(merged), len(active_tickers), 5), dtype=np.float64)
+    for j, ticker in enumerate(active_tickers):
         ohlcv[:, j, 0] = merged[f"{ticker}_open"].to_numpy()
         ohlcv[:, j, 1] = merged[f"{ticker}_high"].to_numpy()
         ohlcv[:, j, 2] = merged[f"{ticker}_low"].to_numpy()
@@ -244,9 +293,9 @@ def _ohlcv_macro_from_merged(merged: pd.DataFrame) -> Tuple[pd.DatetimeIndex, np
 
 def compute_trend_signals(ohlcv: np.ndarray) -> np.ndarray:
     """Dual-EMA distance per asset: (EMA20 - EMA100) / EMA100 (stationary trend memory)."""
-    t = ohlcv.shape[0]
-    trend_signals = np.zeros((t, len(TICKERS)), dtype=np.float64)
-    for j in range(len(TICKERS)):
+    t, n_assets = ohlcv.shape[0], ohlcv.shape[1]
+    trend_signals = np.zeros((t, n_assets), dtype=np.float64)
+    for j in range(n_assets):
         close_s = pd.Series(ohlcv[:, j, 3])
         ema_fast = close_s.ewm(span=20, adjust=False).mean()
         ema_slow = close_s.ewm(span=100, adjust=False).mean()
@@ -260,10 +309,10 @@ def compute_feature_panel(
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """RSI, MACD, trend EMA profile, and fracdiff on a **contiguous** OHLCV slice."""
-    t = ohlcv.shape[0]
-    rsi = np.zeros((t, len(TICKERS)), dtype=np.float64)
-    macd = np.zeros((t, len(TICKERS)), dtype=np.float64)
-    for j in range(len(TICKERS)):
+    t, n_assets = ohlcv.shape[0], ohlcv.shape[1]
+    rsi = np.zeros((t, n_assets), dtype=np.float64)
+    macd = np.zeros((t, n_assets), dtype=np.float64)
+    for j in range(n_assets):
         close_s = pd.Series(ohlcv[:, j, 3])
         rsi[:, j] = _rsi(close_s).fillna(50.0).to_numpy()
         macd_line = _macd_line(close_s)
@@ -295,10 +344,11 @@ def _neutralize_feature_warmup(
 
 def _indicators_from_merged(
     merged: pd.DataFrame,
+    active_tickers: List[str],
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
 ) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Full-timeline features (OK for contiguous OOS backtest / cache)."""
-    idx, ohlcv, macro = _ohlcv_macro_from_merged(merged)
+    idx, ohlcv, macro = _ohlcv_macro_from_merged(merged, active_tickers)
     rsi, macd, fracdiff, fracdiff_macro, trend = compute_feature_panel(
         ohlcv, macro, fracdiff_d=fracdiff_d
     )
@@ -355,11 +405,13 @@ def _yfinance_daily_history(
 
 
 def fetch_aligned_daily(
+    symbols_dict: Dict[str, str] | None = None,
     since: str = "2014-09-01",
     until: Optional[str] = None,
+    fracdiff_d: float = DEFAULT_FRACDIFF_D,
 ) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Daily OHLCV from yfinance for all 10 global assets + macro context.
+    Daily OHLCV from yfinance for configured tradeable assets + macro context.
 
     Each asset is fetched independently, then outer-joined on date. Short
     forward-fill bridges exchange holidays (``FFILL_LIMIT``). **Backward-fill
@@ -373,6 +425,9 @@ def fetch_aligned_daily(
     to rebuild ``data_cache.npz``.
     """
     import yfinance as yf
+
+    symbols = symbols_dict if symbols_dict is not None else get_active_symbols()
+    active_tickers = list(symbols.keys())
 
     per_ticker: Dict[str, pd.DataFrame] = {}
 
@@ -405,15 +460,15 @@ def fetch_aligned_daily(
         per_ticker[ticker] = asset_df
         print(f"    → {len(asset_df)} daily bars")
 
-    for ticker, yf_sym in YF_SYMBOLS.items():
+    for ticker, yf_sym in symbols.items():
         _fetch_one(ticker, yf_sym, required=True)
 
     for ticker, yf_sym in MACRO_SYMBOLS.items():
         _fetch_one(ticker, yf_sym, required=False)
     _fetch_one(HY_OAS_PROXY_YF, HY_OAS_PROXY_YF, required=False)
 
-    merged = per_ticker[TICKERS[0]]
-    for t in TICKERS[1:]:
+    merged = per_ticker[active_tickers[0]]
+    for t in active_tickers[1:]:
         merged = merged.merge(per_ticker[t], on="date", how="outer")
 
     for t in MACRO_SYMBOLS:
@@ -423,13 +478,13 @@ def fetch_aligned_daily(
 
     merged = merged.sort_values("date").reset_index(drop=True)
 
-    for ticker in TICKERS:
+    for ticker in active_tickers:
         cols = [f"{ticker}_{c}" for c in ("open", "high", "low", "close", "volume")]
         merged[cols] = merged[cols].ffill(limit=FFILL_LIMIT)
 
     # Volume unknown before first print → 0 (no position); do NOT bfill prices
     # from the future IPO — those rows are dropped below.
-    for ticker in TICKERS:
+    for ticker in active_tickers:
         vol_col = f"{ticker}_volume"
         merged[vol_col] = merged[vol_col].fillna(0.0)
 
@@ -452,7 +507,7 @@ def fetch_aligned_daily(
         print("  WARNING: HY_OAS skipped (missing HYG or BOND10Y on panel)")
 
     asset_cols = []
-    for ticker in TICKERS:
+    for ticker in active_tickers:
         asset_cols.extend([f"{ticker}_{c}" for c in ("open", "high", "low", "close")])
     merged = merged.dropna(subset=asset_cols).reset_index(drop=True)
 
@@ -462,26 +517,11 @@ def fetch_aligned_daily(
         )
 
     print(
-        f"  Aligned: {len(merged)} daily bars (all assets live; no pre-IPO bfill) "
-        f"+ {N_MACRO} macro — {merged['date'].iloc[0].date()} .. {merged['date'].iloc[-1].date()}"
+        f"  Aligned: {len(merged)} daily bars, {len(active_tickers)} assets "
+        f"(all live; no pre-IPO bfill) + {N_MACRO} macro — "
+        f"{merged['date'].iloc[0].date()} .. {merged['date'].iloc[-1].date()}"
     )
-    return _indicators_from_merged(merged, fracdiff_d=DEFAULT_FRACDIFF_D)
-
-
-def train_test_split_last_days(
-    index: pd.DatetimeIndex,
-    *arrays: np.ndarray,
-    test_days: int = 60,
-) -> Tuple[Tuple, Tuple]:
-    """Hold out the last `test_days` calendar days."""
-    if len(index) == 0:
-        raise ValueError("Empty dataset")
-    cutoff = index[-1] - pd.Timedelta(days=test_days)
-    train_mask = index <= cutoff
-    test_mask = ~train_mask
-    train_idx = index[train_mask]
-    test_idx = index[test_mask]
-    return (train_idx, *(a[train_mask] for a in arrays)), (test_idx, *(a[test_mask] for a in arrays))
+    return _indicators_from_merged(merged, active_tickers, fracdiff_d=fracdiff_d)
 
 
 def clip_index_until(
@@ -553,9 +593,7 @@ def reserve_chronological_holdout(
         hold_mask = (idx_norm >= h_start) & (idx_norm <= h_end)
     else:
         if holdout_days <= 0:
-            raise ValueError(
-                "holdout_days must be positive (use train_test_split_last_days for ad-hoc slices)."
-            )
+            raise ValueError("holdout_days must be positive")
         cutoff = index[-1] - pd.Timedelta(days=holdout_days)
         before_mask = index <= cutoff
         hold_mask = ~before_mask
@@ -709,12 +747,16 @@ def save_cache(
     fracdiff_macro: np.ndarray,
     trend: np.ndarray,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
+    tickers: Sequence[str] | None = None,
 ) -> None:
+    cache_path = Path(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     idx = index
     if idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
+    active_tickers = np.asarray(resolve_tickers(tickers), dtype=object)
     np.savez_compressed(
-        path,
+        str(cache_path),
         index=idx.to_numpy(dtype="datetime64[ns]"),
         ohlcv=ohlcv,
         rsi=rsi,
@@ -724,6 +766,7 @@ def save_cache(
         fracdiff_macro=fracdiff_macro,
         trend=trend,
         fracdiff_d=np.array([fracdiff_d], dtype=np.float64),
+        tickers=active_tickers,
     )
 
 
@@ -738,10 +781,20 @@ def load_cache(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    List[str],
 ]:
-    z = np.load(path, allow_pickle=False)
+    z = np.load(path, allow_pickle=True)
     idx = pd.DatetimeIndex(z["index"])
     ohlcv = z["ohlcv"]
+    if "tickers" in z.files:
+        tickers = [str(x) for x in z["tickers"].tolist()]
+    else:
+        tickers = resolve_tickers()
+        if ohlcv.shape[1] != len(tickers):
+            raise ValueError(
+                f"Cache has {ohlcv.shape[1]} assets but no tickers array; "
+                "rebuild with: python scripts/train.py --refresh-data"
+            )
     if "macro" in z:
         macro = z["macro"]
     else:
@@ -749,7 +802,8 @@ def load_cache(
     if macro.shape[1] != N_MACRO:
         raise ValueError(
             f"Cache macro has {macro.shape[1]} series but code expects {N_MACRO} "
-            f"({MACRO_TICKERS}). Rebuild: python train.py --refresh-data"
+            f"({MACRO_TICKERS}). Rebuild: python scripts/train.py --refresh-data "
+            "(writes .cache/data_cache.npz)"
         )
     d = float(z["fracdiff_d"][0]) if "fracdiff_d" in z else DEFAULT_FRACDIFF_D
     if "fracdiff" in z and "fracdiff_macro" in z:
@@ -763,4 +817,8 @@ def load_cache(
         trend = z["trend"]
     else:
         trend = compute_trend_signals(ohlcv)
-    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend
+    if ohlcv.shape[1] != len(tickers):
+        raise ValueError(
+            f"Cache ohlcv has {ohlcv.shape[1]} assets but tickers lists {len(tickers)}: {tickers}"
+        )
+    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend, tickers
