@@ -30,7 +30,7 @@ def _assert_valid_weights(w: np.ndarray, n_actions: int = _N_ACTIONS) -> None:
 
 
 def test_config_cap_is_half() -> None:
-    assert _max_cap() == pytest.approx(0.50)
+    assert _max_cap() == pytest.approx(0.35)
 
 
 def test_simplex_uniform_logits() -> None:

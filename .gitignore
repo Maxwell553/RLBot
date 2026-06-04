@@ -25,12 +25,17 @@ build/
 # Regenerable caches and large training artifacts (repo stays source-focused)
 .cache/
 data_cache.npz
+Runs/
+# legacy artifact roots (pre-Runs/ layout; safe to delete after migrate_runs_layout.py)
 models/
 runs/
 tb_logs/
 logs/
 plots/
 archive/
+
+# Local broker automation (not part of research training; removed from repo)
+ibkr_paper/
 
 # Broker credentials and local execution state (keep execution/README.md tracked)
 execution/**

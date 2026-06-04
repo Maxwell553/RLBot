@@ -5,8 +5,8 @@ Train shared RecurrentPPO (LSTM) on synchronized multi-asset daily data.
 Universe size and symbols: ``config/config.yaml`` → ``universe.assets`` (5–55);
 optional CLI ``--n-assets`` slices the first N keys.
 
-Artifacts for inference (backtest): ``models/<run_id>/vec_normalize.pkl``
-(same stats copied to ``models/<run_id>/best/`` next to ``best_model.zip``).
+Artifacts for inference (backtest): ``Runs/<run_id>/models/vec_normalize.pkl``
+(same stats copied to ``Runs/<run_id>/models/best/`` next to ``best_model.zip``).
 
 Anti-overfitting measures:
   - Fractionally differentiated price features (stationary + memory)
@@ -99,8 +99,8 @@ DATA_CACHE = DEFAULT_DATA_CACHE
 def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path]:
     """Save VecNormalize stats + final weights so inference matches training input scaling.
 
-    Writes ``models/<id>/vec_normalize.pkl`` and a duplicate
-    ``models/<id>/best/vec_normalize.pkl`` (same file as best_model.zip).
+    Writes ``Runs/<id>/models/vec_normalize.pkl`` and a duplicate
+    ``Runs/<id>/models/best/vec_normalize.pkl`` (same file as best_model.zip).
     """
     root_vn = paths.models_dir / "vec_normalize.pkl"
     train_env.save(str(root_vn))
@@ -592,6 +592,16 @@ def main() -> None:
     parser.add_argument("--show-viz", action="store_true")
     parser.add_argument("--run-id", default="", metavar="ID")
     parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Walk-forward window (1–6). When --run-id is omitted, auto id is "
+            "W{N}_<month><day> (e.g. W1_604); duplicates get _a, _b, …"
+        ),
+    )
+    parser.add_argument(
         "--n-assets",
         type=int,
         default=None,
@@ -621,7 +631,14 @@ def main() -> None:
 
     apply_deterministic_seeds(args.seed)
 
-    run_id = args.run_id.strip() or new_run_id(timesteps=args.timesteps)
+    if args.run_id.strip():
+        run_id = args.run_id.strip()
+    elif args.window is not None:
+        run_id = new_run_id(args.window)
+    else:
+        raise SystemExit(
+            "Provide --run-id or --window (auto id: W{window}_<month><day>, e.g. W1_604)."
+        )
     paths = RunPaths(run_id=run_id)
     paths.mkdirs()
     if args.n_assets is not None:
@@ -819,7 +836,7 @@ def main() -> None:
         f"  eval inactivity scale: {cfg.reward.eval_inactivity_penalty_scale} "
         f"(train=1.0; eval rewards less punitive for defensive cash)"
     )
-    print(f"  eval plot: mean ending NAV → runs/<id>/eval_logs/eval_nav_history.npz")
+    print(f"  eval plot: mean ending NAV → Runs/<id>/eval_logs/eval_nav_history.npz")
     print(
         f"  action: softmax(cash+{n_assets} assets), long-only risky weights, "
         f"soft cap per asset (config)"

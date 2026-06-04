@@ -3,8 +3,8 @@
 Evaluate a trained RecurrentPPO (LSTM) policy on data reserved for OOS backtest only.
 
 Uses the same **chronological holdout** as training (``reserve_chronological_holdout``),
-which **must not** appear in ``scripts/train.py``. Dates default from
-``runs/<run-id>/manifest.json`` when ``--run-id`` is set.
+which **must not** appear in ``scripts/train.py``. Requires ``--run-id``; holdout
+dates and universe come from ``Runs/<run-id>/manifest.json`` (PyTorch loads lazily).
 
 Tradeable universe: ``config/config.yaml`` → ``universe.assets`` (5–55). See docs/TRAINING.md.
 """
@@ -24,13 +24,18 @@ import argparse
 import copy
 import json
 import re
+import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+
+def _bt_log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 import numpy as np
 import pandas as pd
-from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from rlbot.data_utils import (
     clip_index_until,
@@ -40,8 +45,9 @@ from rlbot.data_utils import (
 )
 from rlbot.run_artifacts import (
     PROJECT_ROOT,
+    RUNS_ROOT,
     RunPaths,
-    read_latest_run_id,
+    discover_run_ids_with_models,
     read_run_manifest,
     resolve_data_cache,
 )
@@ -53,15 +59,122 @@ from rlbot.baselines import (
     naive_risk_parity_nav,
     portfolio_step_nav,
 )
+from rlbot.inference_load import load_recurrent_ppo_inference, swap_recurrent_ppo_weights
 from rlbot.rl_config import observation_dim_for_universe
-from rlbot.trading_env import MultiAssetPortfolioEnv, portfolio_weights_from_action
-from rlbot.vecnorm_utils import freeze_vec_normalize_for_inference
-from rlbot.visualize import open_plot_file, plot_backtest_dashboard
 
+# Lazy-loaded in ensure_backtest_dependencies() (once per process).
+th = None
+RecurrentPPO = None
+DummyVecEnv = None
+VecNormalize = None
+MultiAssetPortfolioEnv = None
+portfolio_weights_from_action = None
+freeze_vec_normalize_for_inference = None
+_DEPS_LOADED = False
+_PANEL_CACHE: tuple | None = None
+_INFERENCE_POLICY: object | None = None  # RecurrentPPO shell reused across checkpoints in batch
+_INFERENCE_POLICY_KEY: str | None = None
+# EMA on raw actions during OOS rollout only (training uses config action_smoothing_alpha: 0)
+_BACKTEST_ACTION_SMOOTHING_ALPHA = 0.15
 ROOT = PROJECT_ROOT
 DATA_CACHE = resolve_data_cache()
-PLOTS_DIR = ROOT / "plots"
-MODELS_DIR = ROOT / "models"
+
+
+def ensure_backtest_dependencies() -> None:
+    """Import PyTorch/SB3/env once per Python process."""
+    global _DEPS_LOADED, th, RecurrentPPO, DummyVecEnv, VecNormalize
+    global MultiAssetPortfolioEnv, portfolio_weights_from_action
+    global freeze_vec_normalize_for_inference
+    if _DEPS_LOADED:
+        return
+    t0 = time.perf_counter()
+    _bt_log("[backtest] Loading dependencies (once per process)...")
+    t1 = time.perf_counter()
+    import torch as _th
+
+    th = _th
+    _bt_log(f"[backtest]   torch ({time.perf_counter() - t1:.1f}s)")
+    t1 = time.perf_counter()
+    from sb3_contrib import RecurrentPPO as _RecurrentPPO
+    from stable_baselines3.common.vec_env import DummyVecEnv as _DummyVecEnv, VecNormalize as _VN
+
+    RecurrentPPO = _RecurrentPPO
+    DummyVecEnv = _DummyVecEnv
+    VecNormalize = _VN
+    _bt_log(f"[backtest]   stable-baselines3 ({time.perf_counter() - t1:.1f}s)")
+    t1 = time.perf_counter()
+    from rlbot.trading_env import MultiAssetPortfolioEnv as _Env, portfolio_weights_from_action as _pwf
+    from rlbot.vecnorm_utils import freeze_vec_normalize_for_inference as _freeze
+    _bt_log(f"[backtest]   trading env ({time.perf_counter() - t1:.1f}s)")
+
+    MultiAssetPortfolioEnv = _Env
+    portfolio_weights_from_action = _pwf
+    freeze_vec_normalize_for_inference = _freeze
+    _DEPS_LOADED = True
+    _bt_log(f"[backtest] Dependencies ready ({time.perf_counter() - t0:.1f}s).")
+
+
+def _get_shared_panel() -> tuple:
+    global _PANEL_CACHE
+    if _PANEL_CACHE is None:
+        _bt_log("[backtest] Loading market cache (once per process)...")
+        t0 = time.perf_counter()
+        _PANEL_CACHE = load_cache(str(DATA_CACHE))
+        _bt_log(f"[backtest] Cache loaded ({time.perf_counter() - t0:.1f}s).")
+    return _PANEL_CACHE
+
+
+def _clear_inference_policy_cache() -> None:
+    global _INFERENCE_POLICY, _INFERENCE_POLICY_KEY
+    _INFERENCE_POLICY = None
+    _INFERENCE_POLICY_KEY = None
+
+
+def _load_inference_policy(
+    model_path: Path,
+    *,
+    device: str = "cpu",
+    full_reload: bool = False,
+) -> object:
+    """
+    Load policy for rollout. First call builds the LSTM policy only (no AdamW).
+    Later calls in the same process swap weights via ``set_parameters``.
+    """
+    global _INFERENCE_POLICY, _INFERENCE_POLICY_KEY
+    ensure_backtest_dependencies()
+    path_key = str(model_path.resolve())
+    if full_reload:
+        _clear_inference_policy_cache()
+    if _INFERENCE_POLICY is not None:
+        if _INFERENCE_POLICY_KEY == path_key:
+            return _INFERENCE_POLICY
+        t0 = time.perf_counter()
+        swap_recurrent_ppo_weights(_INFERENCE_POLICY, path_key, device=device)
+        _INFERENCE_POLICY_KEY = path_key
+        _bt_log(f"[backtest] Swapped policy weights ({time.perf_counter() - t0:.1f}s).")
+        return _INFERENCE_POLICY
+
+    t0 = time.perf_counter()
+    _bt_log(f"[backtest] Loading policy weights ({model_path.name})...")
+    _INFERENCE_POLICY = load_recurrent_ppo_inference(path_key, device=device)
+    _INFERENCE_POLICY_KEY = path_key
+    _bt_log(f"[backtest] Policy ready ({time.perf_counter() - t0:.1f}s).")
+    return _INFERENCE_POLICY
+
+
+def _latest_step_checkpoint(run_id: str) -> Path | None:
+    ckpt_dir = RunPaths(run_id).models_dir / "checkpoints"
+    if not ckpt_dir.is_dir():
+        return None
+    zips = sorted(ckpt_dir.glob("ppo_*_steps.zip"))
+    return zips[-1] if zips else None
+
+
+def _parse_run_id_list(spec: str) -> list[str]:
+    spec = spec.strip()
+    if not spec:
+        return []
+    return [x.strip() for x in spec.split(",") if x.strip()]
 
 
 def _assert_manifest_panel_compatible(
@@ -105,67 +218,6 @@ class BacktestResult:
     seed_label: str = ""
 
 
-def _infer_run_id_from_model_path(model_path: Path) -> str | None:
-    parts = model_path.resolve().parts
-    for i, name in enumerate(parts):
-        if name == "models" and i + 1 < len(parts):
-            nxt = parts[i + 1]
-            if nxt not in ("best",):
-                return nxt
-    return None
-
-
-def _resolve_model_path(args: argparse.Namespace) -> tuple[Path, str | None]:
-    """Return (model_zip, run_id hint for naming plots, or None).
-
-  Ex-ante holdout rule (default): only ``best/best_model.zip`` (max in-training
-  eval NAV). Use ``--allow-latest-checkpoint`` to permit ``ppo_portfolio_final.zip``.
-    """
-    if args.model:
-        p = Path(args.model)
-        if not p.is_file():
-            raise FileNotFoundError(f"Model not found: {p}")
-        if not getattr(args, "allow_latest_checkpoint", False):
-            name = p.name.lower()
-            if name != "best_model.zip" and "best" not in p.parts:
-                print(
-                    "WARNING: --model overrides ex-ante rule; holdout metrics are "
-                    "not pre-registered to eval-NAV-best only."
-                )
-        return p, _infer_run_id_from_model_path(p)
-
-    rid = args.run_id.strip()
-    if rid:
-        rp = RunPaths(rid)
-        best = rp.best_model_dir / "best_model.zip"
-        if getattr(args, "allow_latest_checkpoint", False):
-            for cand in (rp.final_model, best):
-                if cand.is_file():
-                    return cand, rid
-        else:
-            if best.is_file():
-                return best, rid
-        raise FileNotFoundError(
-            f"No best_model.zip under models/{rid}/ "
-            f"(ex-ante holdout rule: eval-NAV-best only; use --allow-latest-checkpoint for final weights)"
-        )
-
-    latest = read_latest_run_id()
-    if latest:
-        rp = RunPaths(latest)
-        best = rp.best_model_dir / "best_model.zip"
-        if getattr(args, "allow_latest_checkpoint", False):
-            for cand in (rp.final_model, best):
-                if cand.is_file():
-                    return cand, latest
-        elif best.is_file():
-            return best, latest
-
-    raise FileNotFoundError(
-        "No model found. Train first (writes runs/LATEST.txt), pass --run-id, or --model path/to.zip"
-    )
-
-
 def _resolve_model_path_for_run(
     run_id: str,
     *,
@@ -193,21 +245,19 @@ def _resolve_model_path_for_run(
 
 
 def discover_ensemble_run_ids(prefix: str, seeds: list[int] | None = None) -> list[str]:
-    """``models/<prefix>_seed_<n>`` directories, sorted by seed then name."""
+    """``Runs/<prefix>_seed_<n>/`` (or legacy ``models/``), sorted by seed then name."""
     if not prefix:
         return []
     found: list[tuple[int, str]] = []
     pat = re.compile(rf"^{re.escape(prefix)}_seed_(\d+)$")
-    for p in MODELS_DIR.iterdir():
-        if not p.is_dir():
-            continue
-        m = pat.match(p.name)
+    for rid in discover_run_ids_with_models():
+        m = pat.match(rid)
         if not m:
             continue
         seed = int(m.group(1))
         if seeds is not None and seed not in seeds:
             continue
-        found.append((seed, p.name))
+        found.append((seed, rid))
     found.sort(key=lambda x: x[0])
     return [name for _, name in found]
 
@@ -240,24 +290,27 @@ def resolve_oos_holdout(
     np.ndarray,
     np.ndarray,
 ]:
+    if not manifest:
+        raise ValueError(
+            "Runs/<run-id>/manifest.json is required for OOS dates; pass --run-id from a completed train run."
+        )
     holdout_days = args.holdout_days
     train_end = args.train_end
     holdout_start = args.holdout_start
     holdout_end = args.holdout_end
-    ch = (manifest or {}).get("chronological_holdout") or {}
+    ch = manifest.get("chronological_holdout") or {}
+    margs = manifest.get("args") or {}
     if train_end is None:
-        train_end = ch.get("train_end") or (manifest or {}).get("args", {}).get("train_end")
+        train_end = ch.get("train_end") or margs.get("train_end")
     if holdout_start is None:
-        holdout_start = ch.get("holdout_start") or (manifest or {}).get("args", {}).get("holdout_start")
+        holdout_start = ch.get("holdout_start") or margs.get("holdout_start")
     if holdout_end is None:
-        holdout_end = ch.get("holdout_end") or (manifest or {}).get("args", {}).get("holdout_end")
+        holdout_end = ch.get("holdout_end") or margs.get("holdout_end")
     if holdout_days is None:
-        if manifest and ch.get("holdout_days") is not None:
+        if ch.get("holdout_days") is not None:
             holdout_days = int(ch["holdout_days"])
-        elif manifest and manifest.get("args", {}).get("holdout_days") is not None:
-            holdout_days = int(manifest["args"]["holdout_days"])
-        else:
-            holdout_days = 365
+        elif margs.get("holdout_days") is not None:
+            holdout_days = int(margs["holdout_days"])
 
     if train_end and holdout_start:
         print(
@@ -266,6 +319,11 @@ def resolve_oos_holdout(
         )
     elif holdout_days is not None:
         print(f"Using holdout_days={holdout_days} (calendar tail)")
+    else:
+        raise ValueError(
+            "Manifest has no holdout dates (train_end/holdout_start or holdout_days); "
+            "re-train or pass --train-end/--holdout-start on the CLI."
+        )
 
     _, holdout = reserve_chronological_holdout(
         idx,
@@ -297,28 +355,55 @@ def resolve_oos_holdout(
 
 def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     """Single OOS deterministic rollout; optional plot via ``args``."""
+    ensure_backtest_dependencies()
+    progress = not getattr(args, "no_progress", False)
+    t_phase = time.perf_counter()
+
     run_id = args.run_id.strip()
     if not run_id:
         raise ValueError("run_id required")
     manifest = read_run_manifest(run_id)
+    if manifest is None:
+        raise FileNotFoundError(f"Missing Runs/{run_id}/manifest.json")
     model_path = _resolve_model_path_for_run(
         run_id,
         allow_latest_checkpoint=args.allow_latest_checkpoint,
         model_override=Path(args.model) if args.model.strip() else None,
     )
-    ckpt_label = "latest" if args.allow_latest_checkpoint and model_path.name != "best_model.zip" else "best"
+    tag = (getattr(args, "plot_tag", None) or "").strip()
+    if tag:
+        ckpt_label = tag
+    elif model_path.name == "best_model.zip":
+        ckpt_label = "best"
+    else:
+        ckpt_label = "latest"
+    _bt_log(f"[backtest] Checkpoint: {model_path} ({ckpt_label})")
 
-    (
-        idx,
-        ohlcv,
-        rsi,
-        macd,
-        macro,
-        fracdiff,
-        fracdiff_macro,
-        trend,
-        cache_tickers,
-    ) = load_cache(str(DATA_CACHE))
+    if getattr(args, "reuse_panel", False):
+        (
+            idx,
+            ohlcv,
+            rsi,
+            macd,
+            macro,
+            fracdiff,
+            fracdiff_macro,
+            trend,
+            cache_tickers,
+        ) = _get_shared_panel()
+    else:
+        _bt_log("[backtest] Loading market cache...")
+        (
+            idx,
+            ohlcv,
+            rsi,
+            macd,
+            macro,
+            fracdiff,
+            fracdiff_macro,
+            trend,
+            cache_tickers,
+        ) = load_cache(str(DATA_CACHE))
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     n_assets = int(ohlcv.shape[1])
     _assert_manifest_panel_compatible(manifest, panel_tickers, n_assets)
@@ -344,13 +429,23 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     if len(test_idx) < 10:
         raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
 
-    model = RecurrentPPO.load(str(model_path), device="auto")
+    _bt_log(
+        f"[backtest] OOS holdout: {test_idx[0].date()} .. {test_idx[-1].date()} "
+        f"({len(test_idx)} bars, setup {time.perf_counter() - t_phase:.1f}s)"
+    )
+
+    device = getattr(args, "device", "cpu") or "cpu"
+    full_reload = bool(getattr(args, "full_policy_load", False))
+    model = _load_inference_policy(model_path, device=device, full_reload=full_reload)
+
     explicit_vn = Path(args.vec_normalize).expanduser().resolve() if args.vec_normalize.strip() else None
     vec_norm_path = _find_vec_normalize(model_path, run_id, explicit=explicit_vn)
     use_vec_norm = vec_norm_path.is_file()
     if not use_vec_norm and args.require_vec_normalize:
         raise FileNotFoundError(f"No VecNormalize stats at {vec_norm_path}")
 
+    _bt_log("[backtest] Deterministic OOS rollout...")
+    t_roll = time.perf_counter()
     navs, start_bar, n_rew, w_opt = rollout_policy_on_slice(
         model,
         test_idx=test_idx,
@@ -366,12 +461,20 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         use_vec_norm=use_vec_norm,
         deterministic=True,
         collect_weights=not args.no_viz,
+        progress=progress,
+        progress_label="deterministic",
     )
+    _bt_log(f"[backtest] Rollout done ({time.perf_counter() - t_roll:.1f}s).")
+
     nav_ensemble: np.ndarray | None = None
     n_stoch = int(args.stochastic_paths)
     if n_stoch > 0 and not getattr(args, "_ensemble_mode", False):
-        print(f"Stochastic ensemble: {n_stoch} paths (deterministic=False, same holdout window)")
+        _bt_log(
+            f"[backtest] Stochastic ensemble: {n_stoch} paths "
+            "(deterministic=False, same holdout window)"
+        )
     if n_stoch > 0:
+        t_stoch = time.perf_counter()
         nav_ensemble = rollout_stochastic_ensemble(
             model,
             n_paths=n_stoch,
@@ -386,7 +489,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             obs_lag=args.obs_lag,
             vec_norm_path=vec_norm_path,
             use_vec_norm=use_vec_norm,
+            progress=progress,
         )
+        _bt_log(f"[backtest] Stochastic paths done ({time.perf_counter() - t_stoch:.1f}s).")
         if nav_ensemble.shape[1] != len(navs):
             m = min(nav_ensemble.shape[1], len(navs))
             navs = navs[:m]
@@ -397,7 +502,8 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     sharpe = _sharpe_ann_from_log_rets(log_rets)
 
     if not args.no_viz and not getattr(args, "_ensemble_mode", False):
-        plot_dir = PLOTS_DIR / run_id
+        _bt_log("[backtest] Building plot...")
+        plot_dir = RunPaths(run_id).plots_dir
         plot_dir.mkdir(parents=True, exist_ok=True)
         tag = args.plot_tag.strip()
         dash_name = f"backtest_{tag}.png" if tag else "backtest.png"
@@ -420,6 +526,8 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         )
         nav_rp = naive_risk_parity_nav(navs, test_ohlcv, start_bar)
         model_label = f"Model ({tag})" if tag else f"Model ({model_path.stem})"
+        from rlbot.visualize import open_plot_file, plot_backtest_dashboard
+
         plot_backtest_dashboard(
             time_nav,
             navs,
@@ -440,6 +548,10 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             open_plot_file(out)
 
     if args.detailed and not getattr(args, "_ensemble_mode", False):
+        _bt_log(
+            f"[backtest] Detailed stats (bootstrap resamples={args.bootstrap_resamples})..."
+        )
+        t_det = time.perf_counter()
         _print_detailed_stats(
             test_idx=test_idx,
             navs=navs,
@@ -449,7 +561,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_avg_block=args.bootstrap_avg_block,
             nav_ensemble=nav_ensemble,
+            bootstrap_progress=progress,
         )
+        _bt_log(f"[backtest] Detailed stats done ({time.perf_counter() - t_det:.1f}s).")
 
     prefix = getattr(args, "ensemble_prefix", "") or ""
     return BacktestResult(
@@ -494,6 +608,7 @@ def _print_ensemble_summary(prefix: str, checkpoint_label: str, results: list[Ba
 
 
 def run_ensemble_backtests(args: argparse.Namespace) -> None:
+    ensure_backtest_dependencies()
     prefix = args.ensemble_prefix.strip()
     seeds: list[int] | None = None
     if args.ensemble_seeds.strip():
@@ -501,7 +616,7 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     run_ids = discover_ensemble_run_ids(prefix, seeds)
     if not run_ids:
         raise SystemExit(
-            f"No runs found under models/ matching '{prefix}_seed_*'. "
+            f"No runs found under Runs/ (or legacy models/) matching '{prefix}_seed_*'. "
             f"Train with scripts/run_seed_ensemble.sh --cohort {prefix}"
         )
     print(f"Discovered {len(run_ids)} runs: {', '.join(run_ids)}")
@@ -535,7 +650,7 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
         _print_ensemble_summary(prefix, label, sub_results)
         summary_root["checkpoints"][label] = [asdict(r) for r in sub_results]
 
-    out_dir = PLOTS_DIR / prefix
+    out_dir = RUNS_ROOT / prefix / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / "ensemble_summary.json"
     with open(out_json, "w", encoding="utf-8") as f:
@@ -619,6 +734,8 @@ def block_bootstrap_log_rets(
     n_resamples: int = 5000,
     avg_block_size: int = 10,
     seed: int = 42,
+    *,
+    progress: bool = False,
 ) -> np.ndarray:
     """Stationary (Politis–Romano style) block bootstrap Sharpe samples.
 
@@ -634,7 +751,10 @@ def block_bootstrap_log_rets(
     p = 1.0 / max(int(avg_block_size), 1)
     rng = np.random.default_rng(seed)
 
+    log_stride = max(n_resamples // 5, 1) if progress and n_resamples >= 500 else 0
     for b in range(n_resamples):
+        if log_stride and b > 0 and b % log_stride == 0:
+            _bt_log(f"[backtest] bootstrap: {b}/{n_resamples} resamples...")
         sim_idx = np.empty(n, dtype=np.int64)
         curr_idx = int(rng.integers(0, n))
         for i in range(n):
@@ -653,10 +773,16 @@ def block_bootstrap_sharpe_percentiles(
     n_resamples: int = 5000,
     avg_block_size: int = 10,
     seed: int = 42,
+    *,
+    progress: bool = False,
 ) -> tuple[float, float, float]:
     """2.5 / 50 / 97.5 percentiles of block-bootstrap annualized Sharpe."""
     sharpes = block_bootstrap_log_rets(
-        log_rets, n_resamples=n_resamples, avg_block_size=avg_block_size, seed=seed
+        log_rets,
+        n_resamples=n_resamples,
+        avg_block_size=avg_block_size,
+        seed=seed,
+        progress=progress,
     )
     sharpes = sharpes[np.isfinite(sharpes)]
     if sharpes.size == 0:
@@ -685,6 +811,8 @@ def rollout_policy_on_slice(
     deterministic: bool = True,
     collect_weights: bool = False,
     reset_seed: int = 0,
+    progress: bool = False,
+    progress_label: str = "rollout",
 ) -> tuple[np.ndarray, int, int, np.ndarray | None]:
     """
     One full episode on a contiguous date slice. Returns
@@ -708,6 +836,7 @@ def rollout_policy_on_slice(
         obs_lag_default=obs_lag,
         fee_scale_default=1.0,
         domain_randomize=False,
+        action_smoothing_alpha=_BACKTEST_ACTION_SMOOTHING_ALPHA,
     )
     vec_env = None
     if use_vec_norm:
@@ -740,25 +869,32 @@ def rollout_policy_on_slice(
     truncated = False
     lstm_states = None
     episode_starts = np.ones((1,), dtype=bool)
+    log_every = max(n_bars // 10, 50) if progress else 0
+    step_i = 0
 
-    while not (done or truncated):
-        obs_model = obs.reshape(1, -1) if getattr(obs, "ndim", 1) == 1 else obs
-        action, lstm_states = model.predict(
-            obs_model,
-            state=lstm_states,
-            episode_start=episode_starts,
-            deterministic=deterministic,
-        )
-        episode_starts = np.zeros((1,), dtype=bool)
-        if collect_weights:
-            w_rows.append(
-                portfolio_weights_from_action(np.asarray(action).reshape(-1))
+    with th.inference_mode():
+        while not (done or truncated):
+            obs_model = obs.reshape(1, -1) if getattr(obs, "ndim", 1) == 1 else obs
+            action, lstm_states = model.predict(
+                obs_model,
+                state=lstm_states,
+                episode_start=episode_starts,
+                deterministic=deterministic,
             )
-        obs, _, done, truncated, info = raw_env.step(action)
-        if use_vec_norm and vec_env is not None:
-            obs = vec_env.normalize_obs(obs)
-        if "nav" in info:
-            navs.append(info["nav"])
+            episode_starts = np.zeros((1,), dtype=bool)
+            if collect_weights:
+                w_rows.append(
+                    portfolio_weights_from_action(np.asarray(action).reshape(-1))
+                )
+            obs, _, done, truncated, info = raw_env.step(action)
+            if use_vec_norm and vec_env is not None:
+                obs = vec_env.normalize_obs(obs)
+            if "nav" in info:
+                navs.append(info["nav"])
+            step_i += 1
+            if log_every and step_i % log_every == 0:
+                pct = min(100, int(100 * step_i / max(n_bars - 1, 1)))
+                _bt_log(f"[backtest] {progress_label}: ~{pct}% ({step_i} steps)")
 
     out = np.asarray(navs, dtype=np.float64)
     n_rew = len(navs) - 1
@@ -788,10 +924,14 @@ def rollout_stochastic_ensemble(
     vec_norm_path: Path,
     use_vec_norm: bool,
     base_seed: int = 0,
+    progress: bool = False,
 ) -> np.ndarray:
     """``n_paths`` stochastic rollouts (``deterministic=False``); shape (n_paths, len(navs))."""
     paths: list[np.ndarray] = []
-    for i in range(int(n_paths)):
+    n_paths = int(n_paths)
+    for i in range(n_paths):
+        if progress:
+            _bt_log(f"[backtest] stochastic path {i + 1}/{n_paths}...")
         navs, _, _, _ = rollout_policy_on_slice(
             model,
             test_idx=test_idx,
@@ -808,6 +948,8 @@ def rollout_stochastic_ensemble(
             deterministic=False,
             collect_weights=False,
             reset_seed=base_seed + i + 1,
+            progress=progress,
+            progress_label=f"stochastic {i + 1}/{n_paths}",
         )
         paths.append(navs)
     min_len = min(len(p) for p in paths)
@@ -827,6 +969,7 @@ def _print_detailed_stats(
     bootstrap_resamples: int = 8000,
     bootstrap_avg_block: int = 10,
     nav_ensemble: np.ndarray | None = None,
+    bootstrap_progress: bool = False,
 ) -> None:
     """Ohlcv_window is the full OOS test slice; prices align with test_idx rows."""
     n = len(test_idx)
@@ -894,6 +1037,7 @@ def _print_detailed_stats(
             n_resamples=bootstrap_resamples,
             avg_block_size=bootstrap_avg_block,
             seed=42,
+            progress=bootstrap_progress,
         )
         print(
             f"Block-bootstrap Sharpe ({bootstrap_resamples} resamples, "
@@ -924,19 +1068,109 @@ def _print_detailed_stats(
     print("--- end detailed ---")
 
 
+def _print_backtest_summary(results: list[BacktestResult]) -> None:
+    if not results:
+        print("No backtest results.")
+        return
+    print("\n=== OOS summary ===")
+    print(f"{'run_id':<16} {'ckpt':<8} {'return%':>10} {'Sharpe':>8} {'maxDD%':>10} {'bars':>6}")
+    for r in results:
+        print(
+            f"{r.run_id:<16} {r.checkpoint_label:<8} "
+            f"{r.total_return * 100:>10.2f} {r.sharpe:>8.2f} "
+            f"{r.max_drawdown * 100:>10.2f} {r.n_bars:>6}"
+        )
+
+
+def _checkpoint_modes(checkpoint: str) -> list[str]:
+    if checkpoint == "both":
+        return ["best", "latest"]
+    return [checkpoint]
+
+
+def _configure_checkpoint_subargs(sub: argparse.Namespace, run_id: str, ck: str) -> bool:
+    """Set model path / tags for best vs latest. Return False to skip (no latest ckpt)."""
+    sub.run_id = run_id
+    sub.reuse_panel = True
+    sub.model = ""
+    sub.allow_latest_checkpoint = False
+    if ck == "best":
+        sub.plot_tag = "best"
+        return True
+    latest = _latest_step_checkpoint(run_id)
+    if latest is None:
+        _bt_log(f"[backtest] {run_id} latest: no checkpoint — skip")
+        return False
+    sub.model = str(latest)
+    sub.plot_tag = "latest"
+    return True
+
+
+def run_backtest_batch(args: argparse.Namespace, run_ids: list[str]) -> list[BacktestResult]:
+    """Backtest multiple run ids in one process (one PyTorch import, one cache load)."""
+    ensure_backtest_dependencies()
+    _get_shared_panel()
+
+    checkpoints = _checkpoint_modes(args.checkpoint)
+    results: list[BacktestResult] = []
+    t_batch = time.perf_counter()
+    for run_id in run_ids:
+        if not read_run_manifest(run_id):
+            raise SystemExit(f"No manifest for run id {run_id!r} (Runs/{run_id}/manifest.json)")
+        for ck in checkpoints:
+            sub = copy.copy(args)
+            sub.full_policy_load = bool(getattr(args, "full_policy_load", False))
+            if not _configure_checkpoint_subargs(sub, run_id, ck):
+                continue
+            _bt_log(f"[backtest] === {run_id} {ck} ===")
+            results.append(run_oos_backtest(sub))
+
+    _print_backtest_summary(results)
+    _bt_log(f"[backtest] Batch finished ({len(results)} runs, {time.perf_counter() - t_batch:.1f}s).")
+    return results
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "OOS backtest for a trained run. Holdout dates and universe come from "
+            "Runs/<run-id>/manifest.json unless overridden on the CLI."
+        ),
+    )
+    parser.add_argument(
+        "--run-ids",
+        default="",
+        metavar="LIST",
+        help="Comma-separated run ids (e.g. W1,W2,W3). One process, shared cache load.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="both",
+        choices=("best", "latest", "both"),
+        help="Which weights to evaluate: eval-NAV-best, latest step checkpoint, or both.",
+    )
     parser.add_argument(
         "--model",
         type=str,
         default="",
-        help="Path to a .zip model; if omitted, uses runs/LATEST.txt → models/<id>/…",
+        help="Path to a .zip model; if omitted, uses Runs/LATEST.txt → Runs/<id>/models/…",
     )
     parser.add_argument(
         "--run-id",
         default="",
         metavar="ID",
-        help="Use models/<ID>/best_model.zip (or ppo_portfolio_final.zip); plot saved under plots/<ID>/",
+        help="Run id (required unless --run-ids or --ensemble-prefix). Dates from Runs/<ID>/manifest.json.",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=("cpu", "cuda", "auto"),
+        help="Torch device for inference (default: cpu — fastest for this model size on Apple Silicon).",
+    )
+    parser.add_argument(
+        "--full-policy-load",
+        action="store_true",
+        help="Rebuild policy from each checkpoint zip (slower; avoids reusing W1 policy shell in batch).",
     )
     parser.add_argument(
         "--holdout-days",
@@ -995,7 +1229,7 @@ def main() -> None:
         "--plot-tag",
         default="",
         metavar="TAG",
-        help="If set, save plots/backtest_TAG.png (e.g. latest, best).",
+        help="If set, save Runs/<id>/plots/backtest_TAG.png (e.g. latest, best).",
     )
     parser.add_argument(
         "--allow-latest-checkpoint",
@@ -1008,6 +1242,16 @@ def main() -> None:
         default=0,
         metavar="N",
         help="If >0, run N stochastic policy rollouts and plot equity fan (default 0).",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Faster run: stochastic-paths=0 and bootstrap-resamples=2000 (unless overridden on CLI).",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable [backtest] rollout/bootstrap progress logs.",
     )
     parser.add_argument(
         "--bootstrap-resamples",
@@ -1025,7 +1269,7 @@ def main() -> None:
         "--ensemble-prefix",
         default="",
         metavar="PREFIX",
-        help="Aggregate OOS metrics over models/<PREFIX>_seed_* runs (μ±σ table).",
+        help="Aggregate OOS metrics over Runs/<PREFIX>_seed_* runs (μ±σ table).",
     )
     parser.add_argument(
         "--ensemble-checkpoint",
@@ -1041,26 +1285,66 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.run_ids.strip():
+        run_ids = _parse_run_id_list(args.run_ids)
+        if not run_ids:
+            raise SystemExit("--run-ids is empty")
+        full_batch = args.detailed or int(args.stochastic_paths) > 0
+        if not full_batch:
+            args.no_viz = True
+            args.detailed = False
+            args.stochastic_paths = 0
+            if args.fast:
+                args.bootstrap_resamples = 500
+        elif args.no_viz:
+            _bt_log("[backtest] --no-viz set; skipping plots despite --detailed/--stochastic-paths.")
+        run_backtest_batch(args, run_ids)
+        return
+
+    if args.fast:
+        args.stochastic_paths = 0
+        if not any(
+            a == "--bootstrap-resamples" or a.startswith("--bootstrap-resamples=")
+            for a in sys.argv[1:]
+        ):
+            args.bootstrap_resamples = 2000
+        _bt_log(
+            "[backtest] --fast: stochastic-paths=0, "
+            f"bootstrap-resamples={args.bootstrap_resamples}"
+        )
+
     if args.ensemble_prefix.strip():
         run_ensemble_backtests(args)
         return
 
     if not args.run_id.strip():
-        _model_path, run_hint = _resolve_model_path(args)
-        if run_hint:
-            args.run_id = run_hint
-        elif not args.model.strip():
-            latest = read_latest_run_id()
-            if latest:
-                args.run_id = latest
+        raise SystemExit("--run-id is required (holdout dates from Runs/<id>/manifest.json)")
 
-    if not args.run_id.strip() and not args.model.strip():
-        raise SystemExit("Pass --run-id, --model, or --ensemble-prefix")
+    if not read_run_manifest(args.run_id.strip()):
+        raise SystemExit(f"No manifest for {args.run_id!r} (Runs/{args.run_id}/manifest.json)")
 
-    print(f"Model run: {args.run_id or '(from --model)'}")
-    print(f"Backtest plot folder (run tag): plots/{args.run_id}/")
+    checkpoints = _checkpoint_modes(args.checkpoint)
+    if len(checkpoints) == 1:
+        ck = checkpoints[0]
+        sub = args
+        if ck == "latest":
+            if not _configure_checkpoint_subargs(sub, args.run_id.strip(), "latest"):
+                raise SystemExit(f"No step checkpoint under Runs/{args.run_id}/models/checkpoints/")
+        else:
+            sub.model = ""
+            sub.plot_tag = sub.plot_tag or "best"
+        ensure_backtest_dependencies()
+        print(f"Model run: {args.run_id}")
+        print(f"Backtest plot folder: Runs/{args.run_id}/plots/")
+        result = run_oos_backtest(sub)
+        _print_single_result(result)
+        return
 
-    result = run_oos_backtest(args)
+    args.no_viz = True
+    run_backtest_batch(args, [args.run_id.strip()])
+
+
+def _print_single_result(result: BacktestResult) -> None:
     print(f"Model: {result.model_path}")
     if result.checkpoint_label == "best":
         print("Ex-ante checkpoint: eval-NAV-best (best_model.zip) — holdout not used to pick weights.")

@@ -1,5 +1,11 @@
 """
-Per-training-run paths: plots/, models/, logs/, tb_logs/, runs/<id>/manifest + eval npz.
+Per-training-run layout under ``Runs/<run_id>/``:
+
+  Runs/<id>/manifest.json, config.yaml, data_cache.npz, eval_logs/
+  Runs/<id>/models/, plots/, logs/, tb_logs/
+
+Legacy roots (``runs/``, ``models/``, ``plots/``, ``logs/``, ``tb_logs/``) are still
+resolved for **read** when a run has not been migrated yet.
 """
 
 from __future__ import annotations
@@ -16,6 +22,11 @@ CACHE_DIR = PROJECT_ROOT / ".cache"
 DEFAULT_DATA_CACHE = CACHE_DIR / "data_cache.npz"
 _LEGACY_DATA_CACHE = PROJECT_ROOT / "data_cache.npz"
 
+RUNS_ROOT = PROJECT_ROOT / "Runs"
+_LEGACY_RUNS_META_ROOT = PROJECT_ROOT / "runs"
+LATEST_RUN_FILE = RUNS_ROOT / "LATEST.txt"
+_LEGACY_LATEST_RUN_FILE = _LEGACY_RUNS_META_ROOT / "LATEST.txt"
+
 
 def resolve_data_cache() -> Path:
     """Return the canonical panel cache path, migrating a legacy root ``data_cache.npz`` once."""
@@ -23,42 +34,52 @@ def resolve_data_cache() -> Path:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         shutil.move(str(_LEGACY_DATA_CACHE), str(DEFAULT_DATA_CACHE))
     return DEFAULT_DATA_CACHE
-RUNS_ROOT = PROJECT_ROOT / "runs"
-LATEST_RUN_FILE = RUNS_ROOT / "LATEST.txt"
 
 
-def _human_steps(n: int) -> str:
-    if n >= 1_000_000_000:
-        v = n / 1_000_000_000
-        return f"{v:.0f}B" if v == int(v) else f"{v:.1f}B"
-    if n >= 1_000_000:
-        v = n / 1_000_000
-        return f"{v:.0f}M" if v == int(v) else f"{v:.1f}M"
-    if n >= 1_000:
-        v = n / 1_000
-        return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
-    return str(n)
+def _run_exists(run_id: str, root: Path = PROJECT_ROOT) -> bool:
+    """True if a run directory already exists (new or legacy layout)."""
+    rid = run_id.strip()
+    if not rid:
+        return False
+    return (root / "Runs" / rid).exists() or (root / "runs" / rid).exists()
 
 
-def new_run_id(timesteps: int = 0) -> str:
+def new_run_id(
+    window: int,
+    *,
+    root: Path = PROJECT_ROOT,
+    when: datetime | None = None,
+) -> str:
     """
-    Generate a run ID like '60M_4_14_26'.
-    If a folder with that name already exists, appends _a, _b, _c, ...
+    Generate ``W{window}_{month}{day:02d}`` (e.g. ``W1_604`` for window 1 on June 4).
+
+    If that id already exists, append ``_a``, ``_b``, … (e.g. ``W1_604_a``).
     """
-    now = datetime.now(timezone.utc)
-    date_part = f"{now.month}_{now.day}_{now.strftime('%y')}"
-
-    if timesteps > 0:
-        base = f"{_human_steps(timesteps)}_{date_part}"
-    else:
-        base = f"{now.strftime('%H%M')}_{date_part}"
-
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    now = when or datetime.now(timezone.utc)
+    date_part = f"{now.month}{now.day:02d}"
+    base = f"W{window}_{date_part}"
     candidate = base
     suffix = 0
-    while (PROJECT_ROOT / "runs" / candidate).exists():
+    while _run_exists(candidate, root):
         suffix += 1
-        candidate = f"{base}_{'abcdefghijklmnopqrstuvwxyz'[suffix - 1] if suffix <= 26 else suffix}"
+        letter = (
+            "abcdefghijklmnopqrstuvwxyz"[suffix - 1]
+            if suffix <= 26
+            else str(suffix)
+        )
+        candidate = f"{base}_{letter}"
     return candidate
+
+
+def _pick_existing(new_path: Path, legacy_path: Path) -> Path:
+    """Prefer ``new_path`` when it exists; else legacy; else ``new_path`` for writes."""
+    if new_path.exists():
+        return new_path
+    if legacy_path.exists():
+        return legacy_path
+    return new_path
 
 
 @dataclass(frozen=True)
@@ -67,25 +88,34 @@ class RunPaths:
     root: Path = PROJECT_ROOT
 
     @property
+    def run_dir(self) -> Path:
+        """Canonical run root (all new artifacts are written here)."""
+        return self.root / "Runs" / self.run_id
+
+    @property
     def run_meta_dir(self) -> Path:
-        """Manifest, optional data snapshot, eval npz directory root."""
-        return self.root / "runs" / self.run_id
+        """Manifest, config snapshot, eval npz, optional data snapshot."""
+        new = self.run_dir
+        legacy = self.root / "runs" / self.run_id
+        if (new / "manifest.json").is_file() or not (legacy / "manifest.json").is_file():
+            return new
+        return legacy
 
     @property
     def plots_dir(self) -> Path:
-        return self.root / "plots" / self.run_id
+        return _pick_existing(self.run_dir / "plots", self.root / "plots" / self.run_id)
 
     @property
     def models_dir(self) -> Path:
-        return self.root / "models" / self.run_id
+        return _pick_existing(self.run_dir / "models", self.root / "models" / self.run_id)
 
     @property
     def logs_dir(self) -> Path:
-        return self.root / "logs" / self.run_id
+        return _pick_existing(self.run_dir / "logs", self.root / "logs" / self.run_id)
 
     @property
     def tb_dir(self) -> Path:
-        return self.root / "tb_logs" / self.run_id
+        return _pick_existing(self.run_dir / "tb_logs", self.root / "tb_logs" / self.run_id)
 
     @property
     def eval_log_dir(self) -> Path:
@@ -120,13 +150,11 @@ class RunPaths:
         return self.run_meta_dir / "data_cache.npz"
 
     def mkdirs(self) -> None:
-        self.plots_dir.mkdir(parents=True, exist_ok=True)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.tb_dir.mkdir(parents=True, exist_ok=True)
-        self.run_meta_dir.mkdir(parents=True, exist_ok=True)
-        self.eval_log_dir.mkdir(parents=True, exist_ok=True)
-        self.best_model_dir.mkdir(parents=True, exist_ok=True)
+        """Create the unified ``Runs/<run_id>/`` tree (always new layout)."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("plots", "models", "logs", "tb_logs", "eval_logs"):
+            (self.run_dir / name).mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "models" / "best").mkdir(parents=True, exist_ok=True)
 
 
 def write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
@@ -140,18 +168,38 @@ def write_latest_pointer(run_id: str) -> None:
 
 
 def read_latest_run_id() -> str | None:
-    if not LATEST_RUN_FILE.is_file():
-        return None
-    text = LATEST_RUN_FILE.read_text(encoding="utf-8").strip()
-    return text or None
+    for path in (LATEST_RUN_FILE, _LEGACY_LATEST_RUN_FILE):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+    return None
 
 
 def read_run_manifest(run_id: str) -> dict[str, Any] | None:
-    """Load ``runs/<run_id>/manifest.json`` if present."""
+    """Load ``Runs/<run_id>/manifest.json`` (or legacy ``runs/<run_id>/``)."""
     path = RunPaths(run_id=run_id).manifest_path
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def discover_run_ids_with_models() -> list[str]:
+    """Run ids that have a ``models/`` tree (new or legacy layout)."""
+    import re
+
+    found: set[str] = set()
+    pat = re.compile(r"^(.+)_seed_(\d+)$")
+    if RUNS_ROOT.is_dir():
+        for p in RUNS_ROOT.iterdir():
+            if p.is_dir() and (p / "models").is_dir():
+                found.add(p.name)
+    legacy_models = PROJECT_ROOT / "models"
+    if legacy_models.is_dir():
+        for p in legacy_models.iterdir():
+            if p.is_dir():
+                found.add(p.name)
+    return sorted(found, key=lambda x: (0 if pat.match(x) else 1, x))
 
 
 def snapshot_data_cache(src: Path, dest: Path) -> None:

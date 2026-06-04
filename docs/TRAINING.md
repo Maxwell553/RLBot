@@ -75,10 +75,7 @@ This rebuilds `.cache/data_cache.npz` with a `tickers` array matching your confi
 Do not reuse run ids from checkpoints trained with a different **N** or `obs_dim`.
 
 ```bash
-# Example: walk-forward window 1 (dates from scripts/walkforward/window1_train.sh)
-RUN_ID=my_window1_$(date +%y%m%d) ./scripts/walkforward/window1_train.sh
-
-# Or direct CLI:
+# Walk-forward sample 1 (dates stored in manifest for backtest)
 python scripts/train.py \
   --since 2006-01-01 \
   --until 2017-12-31 \
@@ -86,14 +83,16 @@ python scripts/train.py \
   --holdout-start 2016-01-01 \
   --holdout-end 2017-12-31 \
   --timesteps 65000000 \
-  --run-id my_window1_260602
+  --window 1
 ```
+
+Omit `--run-id` and pass `--window N` to auto-name the run `W{N}_<month><day>` (e.g. `W1_604` on June 4). If that folder already exists, the next id is `W1_604_a`, then `W1_604_b`, etc. You can still set `--run-id` explicitly.
 
 Training will:
 
 1. Load config → **N** from `universe.assets`
 2. Fetch or load cache → validate `validate_config_for_universe(cfg, ohlcv.shape[1])`
-3. Write `runs/<run-id>/manifest.json` with `universe.tickers`, `n_assets`, `obs_dim`
+3. Write `Runs/<run-id>/manifest.json` with `universe.tickers`, `n_assets`, `obs_dim`
 4. Build envs with dynamic observation/action spaces
 
 ### 5. OOS backtest (after training)
@@ -108,23 +107,17 @@ Backtest reads `manifest.universe.tickers` and checks observation dimension agai
 
 ## Walk-forward windows
 
-| Script | OOS period (informal) |
-|--------|------------------------|
-| `scripts/walkforward/window1_train.sh` | 2016–2017 |
-| `scripts/walkforward/window2_train.sh` | 2018–2019 |
-| `scripts/walkforward/window3_train.sh` | 2020–H1 2021 |
-| `scripts/walkforward/window4_train.sh` | 2021 H2–2022 |
-| `scripts/walkforward/window5_train.sh` | 2023–2024 |
-| `scripts/walkforward/window6_train.sh` | 2025–latest |
+Calendar presets are documented in [RESEARCH.md](../RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`.
 
-Override run id: `RUN_ID=my_run ./scripts/walkforward/window3_train.sh`
-
-Validate bar counts only: `python scripts/walkforward/validate_split.py --window 1`
+```bash
+python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
+python scripts/backtest.py --run-id W1 --checkpoint both --detailed --stochastic-paths 30 --plot-tag best
+```
 
 ---
 
 ## What not to reuse
 
-- **Checkpoints** (`models/<run_id>/`) trained with a different **N** or `obs_dim`
+- **Checkpoints** (`Runs/<run_id>/models/`) trained with a different **N** or `obs_dim`
 - **VecNormalize** pickles from another universe size
 - **Old caches** without `tickers` in the npz — always `--refresh-data` after universe edits

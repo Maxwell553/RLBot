@@ -32,8 +32,8 @@ from rlbot.rl_config import get_config
 
 # Churn penalty scales with live ^VIX (macro panel) vs long-run calm baseline (~18).
 VIX_CHURN_BASELINE = 18.0
-VIX_CHURN_MULT_MIN = 0.5
-VIX_CHURN_MULT_MAX = 2.5
+VIX_CHURN_MULT_MIN = 0.75
+VIX_CHURN_MULT_MAX = 1.5
 
 
 def _softmax_1d(x: np.ndarray) -> np.ndarray:
@@ -157,6 +157,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         fee_scale_default: float | None = None,
         domain_randomize: bool = True,
         inactivity_penalty_scale: float = 1.0,
+        action_smoothing_alpha: float | None = None,
     ):
         super().__init__()
         cfg = get_config()
@@ -240,6 +241,13 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._market_return_buffer: list[float] = []
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
+        alpha = (
+            float(action_smoothing_alpha)
+            if action_smoothing_alpha is not None
+            else float(env_cfg.action_smoothing_alpha)
+        )
+        self._action_smoothing_alpha = float(np.clip(alpha, 0.0, 1.0))
+        self._smoothed_action: np.ndarray | None = None
 
         n_returns = len(self.RETURN_HORIZONS) * self.n_assets
         n_mkt_returns = len(self.RETURN_HORIZONS)
@@ -569,6 +577,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._market_return_buffer = []
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
+        self._smoothed_action = None
 
         if self.domain_randomize and self.random_start:
             self.obs_lag = self._sample_dr_obs_lag()
@@ -627,11 +636,22 @@ class MultiAssetPortfolioEnv(gym.Env):
         return self._build_obs(), {}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        if self._action_smoothing_alpha > 0.0:
+            if self._smoothed_action is None or self._steps == 0:
+                self._smoothed_action = action.copy()
+            else:
+                a = self._action_smoothing_alpha
+                self._smoothed_action = a * action + (1.0 - a) * self._smoothed_action
+            action_for_weights = self._smoothed_action
+        else:
+            action_for_weights = action
+
         close_t = self.ohlcv[self._t, :, 3]
         v_pre = max(self._nav(close_t), 1e-12)
 
         open_next = self.ohlcv[self._t + 1, :, 0]
-        w = portfolio_weights_from_action(action, n_actions=self.n_actions)
+        w = portfolio_weights_from_action(action_for_weights, n_actions=self.n_actions)
         rwd = self._reward_cfg
         # Scale churn with live VIX (same series as obs macro block; undifferenced close).
         current_vix = float(self.macro[self._t, MACRO_VIX_INDEX])

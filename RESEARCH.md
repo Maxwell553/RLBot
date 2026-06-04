@@ -2,7 +2,7 @@
 
 Methodology and results for walk-forward **RecurrentPPO** runs on a config-driven tradeable universe (**5–55** assets via `config/config.yaml` → `universe.assets`).
 
-Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. Published OOS metrics use **`models/<run_id>/best/best_model.zip`** (maximum mean in-training eval ending NAV), not holdout-tuned weights.
+Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. Published OOS metrics use **`Runs/<run_id>/models/best/best_model.zip`** (maximum mean in-training eval NAV), not holdout-tuned weights.
 
 **Operations:** [docs/TRAINING.md](docs/TRAINING.md) · **Implementation:** [README.md](README.md)
 
@@ -36,33 +36,31 @@ Record OOS metrics after:
 python scripts/backtest.py --run-id <RUN_ID> --detailed --stochastic-paths 30 --plot-tag best
 ```
 
-Plots: `plots/<run_id>/backtest_best.png` · Training: `plots/<run_id>/training.png`
+Plots: `Runs/<run_id>/plots/backtest_best.png` · Training: `Runs/<run_id>/plots/training.png`
 
 ### Walk-forward registry
 
 | Window | Train through | OOS holdout | `run_id` | Training | OOS backtest |
 |--------|---------------|-------------|----------|----------|--------------|
-| 1 | 2015-12-31 | 2016-01-01 … 2017-12-31 | `wf_window1_001` | In progress / artifacts under `models/wf_window1_001/` | Pending |
-| 2 | 2017-12-31 | 2018-01-01 … 2019-12-31 | `wf_window2_001` | Manifest + partial artifacts | Pending |
-| 3 | 2019-12-31 | 2020-01-01 … 2021-06-30 | — | Not started | — |
-| 4 | 2020-12-31 | 2021-07-01 … 2022-12-31 | — | Not started | — |
-| 5 | 2022-12-31 | 2023-01-01 … 2024-12-31 | — | Not started | — |
-| 6 | 2024-12-31 | 2025-01-01 … latest | — | Not started | — |
+| 1 | 2015-12-31 | 2016-01-01 … 2017-12-31 | `W1` | Not started | — |
+| 2 | 2017-12-31 | 2018-01-01 … 2019-12-31 | `W2` | Not started | — |
+| 3 | 2019-12-31 | 2020-01-01 … 2021-06-30 | `W3` | Not started | — |
+| 4 | 2020-12-31 | 2021-07-01 … 2022-12-31 | `W4` | Not started | — |
+| 5 | 2022-12-31 | 2023-01-01 … 2024-12-31 | `W5` | Not started | — |
+| 6 | 2024-12-31 | 2025-01-01 … latest | `W6` | Not started | — |
 
 ### OOS performance (fill from backtest CLI)
 
 | `run_id` | Agent total return | Agent Sharpe | Max DD | SPY B&H | Equal-weight | 60/40 | Risk parity |
 |----------|-------------------|--------------|--------|---------|--------------|-------|-------------|
-| `wf_window1_001` | — | — | — | — | — | — | — |
-| `wf_window2_001` | — | — | — | — | — | — | — |
+| `W1` | — | — | — | — | — | — | — |
+| `W2` | — | — | — | — | — | — | — |
+| `W3` | — | — | — | — | — | — | — |
+| `W4` | — | — | — | — | — | — | — |
+| `W5` | — | — | — | — | — | — | — |
+| `W6` | — | — | — | — | — | — | — |
 
 *Replace em dashes after running `scripts/backtest.py --detailed` for each completed training run.*
-
-### Manifest snapshots (completed / in-flight)
-
-**`wf_window1_001`** — 65M timesteps, seed 0, N=10, obs_dim=118, 521 OOS bars (2016-01-01 … 2017-12-29).
-
-**`wf_window2_001`** — same hyperparameters, trainable through 2017-12-31, OOS 2018-01-01 … 2019-12-31, 521 OOS bars.
 
 ---
 
@@ -85,7 +83,7 @@ Implemented in `rlbot/baselines.py`; plotted by `scripts/backtest.py`. Multi-ass
 
 **Macro only (4 series):** DXY, TNX, VIX, HY OAS — observation features, not in the action space.
 
-Ticker order: `runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/data_cache.npz`.
+Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/data_cache.npz`.
 
 ---
 
@@ -114,8 +112,9 @@ RecurrentPPO + VecNormalize + `TradingCurriculumCallback` + `EvalNavBestModelCal
 
 ```bash
 python scripts/train.py --refresh-data --timesteps 1000 --run-id _data_refresh --no-viz  # after universe edits
-RUN_ID=wf_window1_001 ./scripts/walkforward/window1_train.sh
-python scripts/backtest.py --run-id wf_window1_001 --detailed --stochastic-paths 30 --plot-tag best
+python scripts/train.py --run-id W1 --timesteps 65000000 \
+  --train-end 2015-12-31 --holdout-start 2016-01-01 --holdout-end 2017-12-31 --until 2017-12-31
+python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
 ```
 
 **Do not load** checkpoints when `manifest.universe.obs_dim` or `universe.tickers` ≠ current config/cache.
@@ -125,7 +124,8 @@ python scripts/backtest.py --run-id wf_window1_001 --detailed --stochastic-paths
 ## Seed robustness
 
 ```bash
-./scripts/run_seed_ensemble.sh --window 3 --cohort my_cohort
+./scripts/run_seed_ensemble.sh --cohort my_cohort -- --train-end 2019-12-31 \
+  --holdout-start 2020-01-01 --holdout-end 2021-06-30 --until 2021-06-30 --timesteps 65000000
 python scripts/backtest.py --ensemble-prefix my_cohort --ensemble-checkpoint best --detailed
 ```
 

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch as th
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +54,7 @@ class EnvironmentConfig:
     domain_randomize_fee_dr_max: float
     domain_randomize_fee_beta_a: float
     domain_randomize_fee_beta_b: float
+    action_smoothing_alpha: float
 
 
 @dataclass(frozen=True)
@@ -327,6 +327,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             domain_randomize_fee_dr_max=float(_req(env, "domain_randomize_fee_dr_max", "environment")),
             domain_randomize_fee_beta_a=float(_req(env, "domain_randomize_fee_beta_a", "environment")),
             domain_randomize_fee_beta_b=float(_req(env, "domain_randomize_fee_beta_b", "environment")),
+            action_smoothing_alpha=float(env.get("action_smoothing_alpha", 0.0)),
         ),
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),
@@ -479,6 +480,8 @@ def write_config_snapshot(cfg: RLConfig, path: Path | str) -> None:
 
 def apply_deterministic_seeds(seed: int) -> None:
     """Lock Python, NumPy, and PyTorch RNGs for reproducible training."""
+    import torch as th
+
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)

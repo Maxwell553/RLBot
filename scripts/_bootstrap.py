@@ -1,9 +1,14 @@
 """Ensure repo root is on ``sys.path`` when running ``python scripts/<cli>.py``."""
 from __future__ import annotations
 
+import os
 import sys
 import warnings
 from pathlib import Path
+
+# SB3 load() builds AdamW; on PyTorch 2.x that can pull torch._dynamo → sympy (minutes).
+# Inference/backtest only need policy weights — disable dynamo before any torch import.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 # PyTorch 2.x + Python 3.14: noisy JIT overload source warnings (harmless).
 warnings.filterwarnings(

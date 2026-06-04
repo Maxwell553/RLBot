@@ -9,7 +9,7 @@ Production research stack for training **RecurrentPPO** (LSTM) agents on a multi
 | Config field reference | [config/README.md](config/README.md) |
 | Methodology & run results | [RESEARCH.md](RESEARCH.md) |
 
-Each training run snapshots effective config to `runs/<run_id>/config.yaml` and metadata to `runs/<run_id>/manifest.json`.
+Each training run writes under `Runs/<run_id>/` (manifest, config snapshot, models, plots, logs, TensorBoard). See `rlbot/run_artifacts.py`.
 
 ---
 
@@ -31,16 +31,17 @@ python scripts/backtest.py --run-id my_run_001 --detailed --stochastic-paths 30 
 
 **CLI entry points** (after `pip install -e .`): `market-trainer-train`, `market-trainer-backtest`.
 
-**Walk-forward example:**
+**Walk-forward example** (explicit dates + run id; calendars live in each run manifest):
 
 ```bash
-RUN_ID=wf_window1_001 ./scripts/walkforward/window1_train.sh
-./scripts/walkforward/window1_backtest.sh wf_window1_001
+python scripts/train.py --run-id W1 --timesteps 65000000 \
+  --train-end 2015-12-31 --holdout-start 2016-01-01 --holdout-end 2017-12-31 --until 2017-12-31
+python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
 ```
 
-**Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). Override dates and `--run-id` per window; do not change core hyperparameters across walk-forward windows unless starting a new study.
+**Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). Do not change core hyperparameters across walk-forward cohorts unless starting a new study.
 
-Artifacts (gitignored): `models/`, `runs/`, `logs/`, `plots/`, `tb_logs/`, `.cache/data_cache.npz`.
+Artifacts (gitignored): `Runs/`, `.cache/data_cache.npz`. Legacy roots (`models/`, `runs/`, …) are still read until you run `python scripts/migrate_runs_layout.py`.
 
 First launch in a new terminal can take several minutes before PPO progress appears; see [docs/TRAINING.md#startup-time-first-run-in-a-session](docs/TRAINING.md#startup-time-first-run-in-a-session).
 
@@ -99,7 +100,7 @@ flowchart TB
 ### Training (`scripts/train.py`)
 
 - **RecurrentPPO** `MlpLstmPolicy` (2×64 LSTM, MLP [128,128]), 8 parallel envs, 65M default timesteps.
-- **EvalNavBestModelCallback** → `models/<run_id>/best/best_model.zip` (max mean in-training eval NAV).
+- **EvalNavBestModelCallback** → `Runs/<run_id>/models/best/best_model.zip` (max mean in-training eval NAV).
 - **TradingCurriculumCallback** — frictionless phase, fee ramp, progressive domain randomization.
 - Checkpoint selection for published OOS: **eval-NAV-best only** (holdout never used to pick weights).
 
@@ -107,8 +108,7 @@ flowchart TB
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/backtest.py` | OOS rollout, passive benchmarks, bootstrap Sharpe CI, plots |
-| `scripts/backtest_sweep.py` | Calendar/regime slices with leakage labels |
+| `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, plots |
 | `scripts/run_seed_ensemble.sh` | Multi-seed training + ensemble backtest |
 | `rlbot/baselines.py` | SPY B&H, equal-weight, 60/40, naive risk parity |
 
@@ -118,16 +118,16 @@ Passive benchmarks use **simple-return** cross-sectional aggregation, then compo
 
 ## Walk-forward windows
 
-| Window | Train through | OOS holdout | Train script |
-|--------|---------------|-------------|--------------|
-| 1 | 2015-12-31 | 2016–2017 | `scripts/walkforward/window1_train.sh` |
-| 2 | 2017-12-31 | 2018–2019 | `window2_train.sh` |
-| 3 | 2019-12-31 | 2020–H1 2021 | `window3_train.sh` |
-| 4 | 2020-12-31 | 2021 H2–2022 | `window4_train.sh` |
-| 5 | 2022-12-31 | 2023–2024 | `window5_train.sh` |
-| 6 | 2024-12-31 | 2025–latest | `window6_train.sh` |
+| Window | Train through | OOS holdout | Train |
+|--------|---------------|-------------|-------|
+| 1 | 2015-12-31 | 2016–2017 | `--run-id W1` + dates in [RESEARCH.md](RESEARCH.md) |
+| 2 | 2017-12-31 | 2018–2019 | `--run-id W2` |
+| 3 | 2019-12-31 | 2020–H1 2021 | `--run-id W3` |
+| 4 | 2021-06-30 | 2021 H2–2022 | `--run-id W4` |
+| 5 | 2022-12-31 | 2023–2024 | `--run-id W5` |
+| 6 | 2024-12-31 | 2025–latest | `--run-id W6` |
 
-Validate bar counts: `python scripts/walkforward/validate_split.py --window 1`
+OOS: `python scripts/backtest.py --run-id W1 --checkpoint both --detailed`
 
 ---
 
@@ -137,7 +137,7 @@ Validate bar counts: `python scripts/walkforward/validate_split.py --window 1`
 |------|------|
 | `config/config.yaml` | Universe, PPO, reward, costs |
 | `rlbot/` | Library: data, env, config, artifacts, visualize, baselines |
-| `scripts/` | `train.py`, `backtest.py`, `backtest_sweep.py`, walk-forward shells |
+| `scripts/` | `train.py`, `backtest.py`, `run_seed_ensemble.sh` |
 | `docs/TRAINING.md` | Operations guide |
 | `RESEARCH.md` | Methodology + completed-run results |
 | `tests/` | `pytest` |
