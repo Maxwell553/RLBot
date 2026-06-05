@@ -32,7 +32,6 @@ runs/
 tb_logs/
 logs/
 plots/
-archive/
 
 # Local broker automation (not part of research training; removed from repo)
 ibkr_paper/
