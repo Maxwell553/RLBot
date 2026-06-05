@@ -3,22 +3,14 @@
 from __future__ import annotations
 
 import contextlib
-from functools import partial
 from pathlib import Path
 from typing import Any, Iterator
 
 import torch as th
-import torch.nn as nn
-from stable_baselines3.common.distributions import (
-    BernoulliDistribution,
-    CategoricalDistribution,
-    DiagGaussianDistribution,
-    MultiCategoricalDistribution,
-    StateDependentNoiseDistribution,
-)
-from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.save_util import load_from_zip_file
-from stable_baselines3.common.type_aliases import Schedule
+from stable_baselines3.common.vec_env import VecEnv, VecNormalize
+
+from rlbot.vecnorm_utils import freeze_vec_normalize_for_inference
 
 
 class _DummyOptimizer:
@@ -40,59 +32,16 @@ class _DummyOptimizer:
         return
 
 
-def _build_policy_without_optimizer(self: ActorCriticPolicy, lr_schedule: Schedule) -> None:
-    """Mirror ``ActorCriticPolicy._build`` but skip ``optimizer_class(...)``."""
-    import numpy as np
-
-    self._build_mlp_extractor()
-
-    latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
-    if isinstance(self.action_dist, DiagGaussianDistribution):
-        self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-            latent_dim=latent_dim_pi, log_std_init=self.log_std_init
-        )
-    elif isinstance(self.action_dist, StateDependentNoiseDistribution):
-        self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-            latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
-        )
-    elif isinstance(self.action_dist, (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)):
-        self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
-    else:
-        raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
-
-    self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
-    if self.ortho_init:
-        module_gains = {
-            self.features_extractor: np.sqrt(2),
-            self.mlp_extractor: np.sqrt(2),
-            self.action_net: 0.01,
-            self.value_net: 1,
-        }
-        if not self.share_features_extractor:
-            del module_gains[self.features_extractor]
-            module_gains[self.pi_features_extractor] = np.sqrt(2)
-            module_gains[self.vf_features_extractor] = np.sqrt(2)
-
-        for module, gain in module_gains.items():
-            module.apply(partial(self.init_weights, gain=gain))
-
-    self.optimizer = None  # type: ignore[assignment]
-
-
 @contextlib.contextmanager
 def skip_training_optimizer() -> Iterator[None]:
-    """Patch SB3 policy construction so no real ``torch.optim.AdamW`` is created."""
-    original_build = ActorCriticPolicy._build
+    """Route ``torch.optim.Adam*`` to a no-op optimizer during policy construction."""
     original_adam = th.optim.Adam
     original_adamw = th.optim.AdamW
-    ActorCriticPolicy._build = _build_policy_without_optimizer  # type: ignore[method-assign]
     th.optim.Adam = _DummyOptimizer  # type: ignore[misc, assignment]
     th.optim.AdamW = _DummyOptimizer  # type: ignore[misc, assignment]
     try:
         yield
     finally:
-        ActorCriticPolicy._build = original_build  # type: ignore[method-assign]
         th.optim.Adam = original_adam  # type: ignore[misc]
         th.optim.AdamW = original_adamw  # type: ignore[misc]
 
@@ -110,10 +59,10 @@ def load_recurrent_ppo_inference(
     device: str = "cpu",
 ) -> Any:
     """
-    Load ``RecurrentPPO`` for ``predict()`` only.
+    Load ``RecurrentPPO`` policy weights for ``predict()`` only.
 
-    Uses ``policy.pth`` weights and never instantiates a real AdamW optimizer
-    (SB3's default ``load()`` does, which can stall for minutes on PyTorch 2.x).
+    Does **not** load VecNormalize statistics. For scaled observations use
+    ``load_vec_normalize_for_inference`` or ``load_recurrent_ppo_with_vecnorm``.
     """
     from sb3_contrib import RecurrentPPO
 
@@ -142,6 +91,33 @@ def load_recurrent_ppo_inference(
         model.policy.set_training_mode(False)
 
     return model
+
+
+def load_vec_normalize_for_inference(
+    stats_path: str | Path,
+    venv: VecEnv,
+) -> VecNormalize:
+    """Load frozen training observation statistics (``vec_normalize.pkl``)."""
+    vec_env = VecNormalize.load(str(Path(stats_path).resolve()), venv)
+    return freeze_vec_normalize_for_inference(vec_env)
+
+
+def load_recurrent_ppo_with_vecnorm(
+    model_path: str | Path,
+    stats_path: str | Path,
+    venv: VecEnv,
+    *,
+    device: str = "cpu",
+) -> tuple[Any, VecNormalize]:
+    """
+    Load policy weights and hydrate VecNormalize running stats for deployment.
+
+    Returns ``(model, vec_env)`` with ``model.set_env(vec_env)`` applied.
+    """
+    model = load_recurrent_ppo_inference(model_path, device=device)
+    vec_env = load_vec_normalize_for_inference(stats_path, venv)
+    model.set_env(vec_env)
+    return model, vec_env
 
 
 def swap_recurrent_ppo_weights(model: Any, path: str | Path, *, device: str = "cpu") -> None:

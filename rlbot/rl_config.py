@@ -28,6 +28,17 @@ def _req(d: dict[str, Any], key: str, section: str) -> Any:
     return d[key]
 
 
+def _reward_churn_penalty(rew: dict[str, Any]) -> float:
+    if "churn_penalty" in rew:
+        return float(rew["churn_penalty"])
+    if "churn_lambda" in rew and "churn_penalty_scale" in rew:
+        return float(rew["churn_lambda"]) * float(rew["churn_penalty_scale"])
+    raise KeyError(
+        "config.yaml reward: set 'churn_penalty' "
+        "(or legacy churn_lambda + churn_penalty_scale)"
+    )
+
+
 def _float_list(xs: list, name: str, expected_n: int | None = None) -> list[float]:
     if expected_n is not None and len(xs) != expected_n:
         raise ValueError(f"{name} must have {expected_n} entries, got {len(xs)}")
@@ -35,8 +46,8 @@ def _float_list(xs: list, name: str, expected_n: int | None = None) -> list[floa
 
 
 def observation_dim_for_universe(n_assets: int, n_macro: int = 4) -> int:
-    """Market + portfolio + meta observation size (macro count fixed at 4 by default)."""
-    return 9 * n_assets + 8 + 5 * n_macro
+    """Market + live mask + portfolio + meta observation size (macro count fixed at 4 by default)."""
+    return 10 * n_assets + 8 + 5 * n_macro
 
 
 @dataclass(frozen=True)
@@ -61,17 +72,18 @@ class EnvironmentConfig:
 class RewardConfig:
     reward_scale: float
     max_step_log_return: float
+    max_step_log_return_downside: float
     risk_window: int
+    sortino_min_steps: int
     risk_bonus_scale: float
     benchmark_cap_weights: list[float]
-    churn_lambda: float
+    churn_penalty: float
     drawdown_penalty_scale: float
     inactivity_penalty_over_50: float
     inactivity_penalty_over_90: float
     eval_inactivity_penalty_scale: float
     participation_bonus: float
     participation_reward_scale: float
-    churn_penalty_scale: float
     drawdown_quadratic_multiplier: float
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
@@ -332,14 +344,18 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),
             max_step_log_return=float(_req(rew, "max_step_log_return", "reward")),
+            max_step_log_return_downside=float(
+                rew.get("max_step_log_return_downside", -0.15)
+            ),
             risk_window=int(_req(rew, "risk_window", "reward")),
+            sortino_min_steps=int(rew.get("sortino_min_steps", 20)),
             risk_bonus_scale=float(_req(rew, "risk_bonus_scale", "reward")),
             benchmark_cap_weights=_float_list(
                 _req(rew, "benchmark_cap_weights", "reward"),
                 "benchmark_cap_weights",
                 expected_n=None,
             ),
-            churn_lambda=float(_req(rew, "churn_lambda", "reward")),
+            churn_penalty=_reward_churn_penalty(rew),
             drawdown_penalty_scale=float(_req(rew, "drawdown_penalty_scale", "reward")),
             inactivity_penalty_over_50=float(_req(rew, "inactivity_penalty_over_50", "reward")),
             inactivity_penalty_over_90=float(_req(rew, "inactivity_penalty_over_90", "reward")),
@@ -350,7 +366,6 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             participation_reward_scale=float(
                 _req(rew, "participation_reward_scale", "reward")
             ),
-            churn_penalty_scale=float(_req(rew, "churn_penalty_scale", "reward")),
             drawdown_quadratic_multiplier=float(
                 _req(rew, "drawdown_quadratic_multiplier", "reward")
             ),

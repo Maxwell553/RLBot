@@ -9,8 +9,6 @@ Consolidates:
   logs/<id>/     → Runs/<id>/logs/
   tb_logs/<id>/  → Runs/<id>/tb_logs/
 
-Also moves ``runs/LATEST.txt`` → ``Runs/LATEST.txt`` when present.
-
 Safe to re-run: skips destinations that already exist (prints a warning).
 """
 
@@ -21,10 +19,8 @@ import shutil
 from pathlib import Path
 
 from rlbot.run_artifacts import (
-    LATEST_RUN_FILE,
     PROJECT_ROOT,
     RUNS_ROOT,
-    _LEGACY_LATEST_RUN_FILE,
     _LEGACY_RUNS_META_ROOT,
     RunPaths,
 )
@@ -109,8 +105,6 @@ def main() -> None:
         return
 
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    if _LEGACY_LATEST_RUN_FILE.is_file() and not LATEST_RUN_FILE.is_file():
-        _move_file(_LEGACY_LATEST_RUN_FILE, LATEST_RUN_FILE, dry_run=args.dry_run)
 
     for rid in run_ids:
         print(f"\n=== {rid} ===")

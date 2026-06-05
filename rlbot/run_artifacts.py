@@ -24,8 +24,6 @@ _LEGACY_DATA_CACHE = PROJECT_ROOT / "data_cache.npz"
 
 RUNS_ROOT = PROJECT_ROOT / "Runs"
 _LEGACY_RUNS_META_ROOT = PROJECT_ROOT / "runs"
-LATEST_RUN_FILE = RUNS_ROOT / "LATEST.txt"
-_LEGACY_LATEST_RUN_FILE = _LEGACY_RUNS_META_ROOT / "LATEST.txt"
 
 
 def resolve_data_cache() -> Path:
@@ -160,20 +158,6 @@ class RunPaths:
 def write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(payload), indent=2, default=str), encoding="utf-8")
-
-
-def write_latest_pointer(run_id: str) -> None:
-    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    LATEST_RUN_FILE.write_text(run_id.strip() + "\n", encoding="utf-8")
-
-
-def read_latest_run_id() -> str | None:
-    for path in (LATEST_RUN_FILE, _LEGACY_LATEST_RUN_FILE):
-        if path.is_file():
-            text = path.read_text(encoding="utf-8").strip()
-            if text:
-                return text
-    return None
 
 
 def read_run_manifest(run_id: str) -> dict[str, Any] | None:

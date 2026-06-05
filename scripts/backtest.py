@@ -59,8 +59,12 @@ from rlbot.baselines import (
     naive_risk_parity_nav,
     portfolio_step_nav,
 )
-from rlbot.inference_load import load_recurrent_ppo_inference, swap_recurrent_ppo_weights
-from rlbot.rl_config import observation_dim_for_universe
+from rlbot.inference_load import (
+    load_recurrent_ppo_inference,
+    load_vec_normalize_for_inference,
+    swap_recurrent_ppo_weights,
+)
+from rlbot.rl_config import get_config, observation_dim_for_universe
 
 # Lazy-loaded in ensure_backtest_dependencies() (once per process).
 th = None
@@ -74,8 +78,6 @@ _DEPS_LOADED = False
 _PANEL_CACHE: tuple | None = None
 _INFERENCE_POLICY: object | None = None  # RecurrentPPO shell reused across checkpoints in batch
 _INFERENCE_POLICY_KEY: str | None = None
-# EMA on raw actions during OOS rollout only (training uses config action_smoothing_alpha: 0)
-_BACKTEST_ACTION_SMOOTHING_ALPHA = 0.15
 ROOT = PROJECT_ROOT
 DATA_CACHE = resolve_data_cache()
 
@@ -145,6 +147,17 @@ def _load_inference_policy(
     path_key = str(model_path.resolve())
     if full_reload:
         _clear_inference_policy_cache()
+
+    if _INFERENCE_POLICY is not None:
+        cached_obs_dim = _INFERENCE_POLICY.policy.observation_space.shape[0]
+        required_obs_dim = observation_dim_for_universe(get_config().universe.n_assets)
+        if cached_obs_dim != required_obs_dim:
+            _bt_log(
+                f"[backtest] Universe size shift detected ({cached_obs_dim}d → {required_obs_dim}d). "
+                "Clearing shell cache..."
+            )
+            _clear_inference_policy_cache()
+
     if _INFERENCE_POLICY is not None:
         if _INFERENCE_POLICY_KEY == path_key:
             return _INFERENCE_POLICY
@@ -166,8 +179,14 @@ def _latest_step_checkpoint(run_id: str) -> Path | None:
     ckpt_dir = RunPaths(run_id).models_dir / "checkpoints"
     if not ckpt_dir.is_dir():
         return None
-    zips = sorted(ckpt_dir.glob("ppo_*_steps.zip"))
-    return zips[-1] if zips else None
+    best: Path | None = None
+    best_step = -1
+    for p in ckpt_dir.glob("ppo_*_steps.zip"):
+        m = re.search(r"ppo_(\d+)_steps\.zip$", p.name)
+        if m and int(m.group(1)) > best_step:
+            best_step = int(m.group(1))
+            best = p
+    return best
 
 
 def _parse_run_id_list(spec: str) -> list[str]:
@@ -279,9 +298,15 @@ def resolve_oos_holdout(
     fracdiff: np.ndarray,
     fracdiff_macro: np.ndarray,
     trend: np.ndarray,
+    asset_vol: np.ndarray,
+    macro_vol: np.ndarray,
+    asset_live: np.ndarray,
     manifest: dict | None,
 ) -> tuple[
     pd.DatetimeIndex,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -334,6 +359,9 @@ def resolve_oos_holdout(
         fracdiff,
         fracdiff_macro,
         trend,
+        asset_vol,
+        macro_vol,
+        asset_live,
         holdout_days=holdout_days,
         train_end=train_end,
         holdout_start=holdout_start,
@@ -389,6 +417,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             fracdiff,
             fracdiff_macro,
             trend,
+            asset_vol,
+            macro_vol,
+            asset_live,
             cache_tickers,
         ) = _get_shared_panel()
     else:
@@ -402,6 +433,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             fracdiff,
             fracdiff_macro,
             trend,
+            asset_vol,
+            macro_vol,
+            asset_live,
             cache_tickers,
         ) = load_cache(str(DATA_CACHE))
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
@@ -411,20 +445,49 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     if until is None and manifest:
         until = manifest.get("args", {}).get("until")
     if until:
-        idx, (ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend) = clip_index_until(
-            idx,
-            ohlcv,
-            rsi,
-            macd,
-            macro,
-            fracdiff,
-            fracdiff_macro,
-            trend,
-            until=until,
+        idx, (ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol, asset_live) = (
+            clip_index_until(
+                idx,
+                ohlcv,
+                rsi,
+                macd,
+                macro,
+                fracdiff,
+                fracdiff_macro,
+                trend,
+                asset_vol,
+                macro_vol,
+                asset_live,
+                until=until,
+            )
         )
 
-    test_idx, test_ohlcv, test_rsi, test_macd, test_macro, test_fd, test_fdm, test_trend = (
-        resolve_oos_holdout(args, idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, manifest)
+    (
+        test_idx,
+        test_ohlcv,
+        test_rsi,
+        test_macd,
+        test_macro,
+        test_fd,
+        test_fdm,
+        test_trend,
+        test_avol,
+        test_mvol,
+        test_live,
+    ) = resolve_oos_holdout(
+        args,
+        idx,
+        ohlcv,
+        rsi,
+        macd,
+        macro,
+        fracdiff,
+        fracdiff_macro,
+        trend,
+        asset_vol,
+        macro_vol,
+        asset_live,
+        manifest,
     )
     if len(test_idx) < 10:
         raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
@@ -456,6 +519,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         test_fd=test_fd,
         test_fdm=test_fdm,
         test_trend=test_trend,
+        test_asset_vol=test_avol,
+        test_macro_vol=test_mvol,
+        test_asset_live=test_live,
         obs_lag=args.obs_lag,
         vec_norm_path=vec_norm_path,
         use_vec_norm=use_vec_norm,
@@ -486,6 +552,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             test_fd=test_fd,
             test_fdm=test_fdm,
             test_trend=test_trend,
+            test_asset_vol=test_avol,
+            test_macro_vol=test_mvol,
+            test_asset_live=test_live,
             obs_lag=args.obs_lag,
             vec_norm_path=vec_norm_path,
             use_vec_norm=use_vec_norm,
@@ -520,11 +589,20 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         nav_spy = benchmark_buyhold_nav(
             navs, test_ohlcv, start_bar, tickers=panel_tickers
         )
-        nav_ew = equal_weight_buyhold_nav(navs, test_ohlcv, start_bar)
-        nav_6040 = balanced_6040_nav(
-            navs, test_ohlcv, start_bar, test_idx, tickers=panel_tickers
+        nav_ew = equal_weight_buyhold_nav(
+            navs, test_ohlcv, start_bar, asset_live=test_live
         )
-        nav_rp = naive_risk_parity_nav(navs, test_ohlcv, start_bar)
+        nav_6040 = balanced_6040_nav(
+            navs,
+            test_ohlcv,
+            start_bar,
+            test_idx,
+            tickers=panel_tickers,
+            asset_live=test_live,
+        )
+        nav_rp = naive_risk_parity_nav(
+            navs, test_ohlcv, start_bar, asset_live=test_live
+        )
         model_label = f"Model ({tag})" if tag else f"Model ({model_path.stem})"
         from rlbot.visualize import open_plot_file, plot_backtest_dashboard
 
@@ -558,6 +636,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             log_rets=log_rets,
             ohlcv_window=test_ohlcv,
             start_bar=start_bar,
+            test_asset_live=test_live,
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_avg_block=args.bootstrap_avg_block,
             nav_ensemble=nav_ensemble,
@@ -805,6 +884,9 @@ def rollout_policy_on_slice(
     test_fd: np.ndarray,
     test_fdm: np.ndarray,
     test_trend: np.ndarray,
+    test_asset_vol: np.ndarray,
+    test_macro_vol: np.ndarray,
+    test_asset_live: np.ndarray,
     obs_lag: int,
     vec_norm_path: Path,
     use_vec_norm: bool,
@@ -826,17 +908,19 @@ def rollout_policy_on_slice(
         test_ohlcv,
         test_rsi,
         test_macd,
+        macro=test_macro,
         fracdiff=test_fd,
         fracdiff_macro=test_fdm,
         trend=test_trend,
-        macro=test_macro,
+        asset_realized_vol=test_asset_vol,
+        macro_realized_vol=test_macro_vol,
         random_start=False,
         max_episode_steps=n_bars,
         obs_lag=0,
         obs_lag_default=obs_lag,
         fee_scale_default=1.0,
         domain_randomize=False,
-        action_smoothing_alpha=_BACKTEST_ACTION_SMOOTHING_ALPHA,
+        asset_live=test_asset_live,
     )
     vec_env = None
     if use_vec_norm:
@@ -844,7 +928,7 @@ def rollout_policy_on_slice(
             raise FileNotFoundError(f"VecNormalize not found: {vec_norm_path}")
         venv = DummyVecEnv([lambda: raw_env])
         try:
-            vec_env = VecNormalize.load(str(vec_norm_path), venv)
+            vec_env = load_vec_normalize_for_inference(vec_norm_path, venv)
         except AssertionError as e:
             if "spaces must have the same shape" in str(e):
                 cur = int(venv.observation_space.shape[0])
@@ -857,7 +941,6 @@ def rollout_policy_on_slice(
                     f"universe.assets with the checkpoint manifest."
                 ) from e
             raise
-        freeze_vec_normalize_for_inference(vec_env)
 
     obs, _ = raw_env.reset(seed=int(reset_seed))
     if use_vec_norm and vec_env is not None:
@@ -883,8 +966,13 @@ def rollout_policy_on_slice(
             )
             episode_starts = np.zeros((1,), dtype=bool)
             if collect_weights:
+                live_t = raw_env.asset_live[max(raw_env._t - raw_env.obs_lag, 0)]
                 w_rows.append(
-                    portfolio_weights_from_action(np.asarray(action).reshape(-1))
+                    portfolio_weights_from_action(
+                        np.asarray(action).reshape(-1),
+                        n_actions=raw_env.n_actions,
+                        asset_live=live_t,
+                    )
                 )
             obs, _, done, truncated, info = raw_env.step(action)
             if use_vec_norm and vec_env is not None:
@@ -920,6 +1008,9 @@ def rollout_stochastic_ensemble(
     test_fd: np.ndarray,
     test_fdm: np.ndarray,
     test_trend: np.ndarray,
+    test_asset_vol: np.ndarray,
+    test_macro_vol: np.ndarray,
+    test_asset_live: np.ndarray,
     obs_lag: int,
     vec_norm_path: Path,
     use_vec_norm: bool,
@@ -942,6 +1033,9 @@ def rollout_stochastic_ensemble(
             test_fd=test_fd,
             test_fdm=test_fdm,
             test_trend=test_trend,
+            test_asset_vol=test_asset_vol,
+            test_macro_vol=test_macro_vol,
+            test_asset_live=test_asset_live,
             obs_lag=obs_lag,
             vec_norm_path=vec_norm_path,
             use_vec_norm=use_vec_norm,
@@ -965,6 +1059,7 @@ def _print_detailed_stats(
     log_rets: np.ndarray,
     ohlcv_window: np.ndarray,
     start_bar: int,
+    test_asset_live: np.ndarray | None = None,
     spy_ohlcv_col: int | None = None,
     bootstrap_resamples: int = 8000,
     bootstrap_avg_block: int = 10,
@@ -996,20 +1091,26 @@ def _print_detailed_stats(
         f"SPY 100% buy&hold (same OOS path, {len(lr_spy)} daily rets): "
         f"total {(nav_spy[-1] / nav_spy[0] - 1) * 100:.2f}%, ann. Sharpe {sh_spy:.2f}"
     )
-    nav_ew = equal_weight_buyhold_nav(navs, ohlcv_window, start_bar)
+    nav_ew = equal_weight_buyhold_nav(
+        navs, ohlcv_window, start_bar, asset_live=test_asset_live
+    )
     lr_ew = np.diff(np.log(np.maximum(nav_ew, 1e-12)))
     sh_ew = _sharpe_ann_from_log_rets(lr_ew)
     print(
         f"Equal-weight buy&hold (1/N assets, daily rebal., {len(lr_ew)} daily rets): "
         f"total {(nav_ew[-1] / nav_ew[0] - 1) * 100:.2f}%, ann. Sharpe {sh_ew:.2f}"
     )
-    nav_6040 = balanced_6040_nav(navs, ohlcv_window, start_bar, test_idx)
+    nav_6040 = balanced_6040_nav(
+        navs, ohlcv_window, start_bar, test_idx, asset_live=test_asset_live
+    )
     ret_6040, sh_6040, _ = benchmark_metrics(nav_6040)
     print(
         f"60/40 SP500/IEF (monthly rebal., {len(lr_ew)} daily rets): "
         f"total {ret_6040 * 100:.2f}%, ann. Sharpe {sh_6040:.2f}"
     )
-    nav_rp = naive_risk_parity_nav(navs, ohlcv_window, start_bar)
+    nav_rp = naive_risk_parity_nav(
+        navs, ohlcv_window, start_bar, asset_live=test_asset_live
+    )
     ret_rp, sh_rp, _ = benchmark_metrics(nav_rp)
     print(
         f"Naive risk parity (inverse 20d vol, daily rebal., {len(lr_ew)} daily rets): "
@@ -1153,7 +1254,7 @@ def main() -> None:
         "--model",
         type=str,
         default="",
-        help="Path to a .zip model; if omitted, uses Runs/LATEST.txt → Runs/<id>/models/…",
+        help="Path to a .zip model; if omitted, uses Runs/<run-id>/models/ (best or final).",
     )
     parser.add_argument(
         "--run-id",

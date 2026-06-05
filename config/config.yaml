@@ -20,7 +20,7 @@ universe:
 
 environment:
   initial_cash: 100000.0
-  max_episode_steps: 63
+  max_episode_steps: 252
   lookback: 20
   obs_lag_default: 1
   min_obs_lag: 0
@@ -30,26 +30,28 @@ environment:
   stop_loss_fraction: 0.45
   domain_randomize_fee_dr_min: 0.75
   domain_randomize_fee_dr_max: 1.1
-  action_smoothing_alpha: 0.0  # training: off; backtest passes 0.15 at rollout
+  action_smoothing_alpha: 0.15  # same train + backtest (EMA on raw policy logits)
   domain_randomize_fee_beta_a: 5.0
   domain_randomize_fee_beta_b: 5.0
 
 reward:
   reward_scale: 2000.0
-  max_step_log_return: 0.03
-  risk_window: 10
-  risk_bonus_scale: 50.0
+  max_step_log_return: 0.06
+  max_step_log_return_downside: -0.12
+  risk_window: 63
+  sortino_min_steps: 20
+  risk_bonus_scale: 25.0
   # Cap-weighted passive benchmark for Sortino differential (same order as universe.assets keys)
   benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
-  churn_lambda: 1.5
+  # turnover_frac * churn_penalty * VIX_scale * curriculum_churn_scale
+  churn_penalty: 8.5
   drawdown_penalty_scale: 25.0
-  inactivity_penalty_over_50: 0.5
-  inactivity_penalty_over_90: 0.02
+  inactivity_penalty_over_50: 10.0  # linear: cash_frac * this (no 50% step cliff)
+  inactivity_penalty_over_90: 15.0  # extra linear ramp from 90% → 100% cash
   eval_inactivity_penalty_scale: 0.05
-  participation_bonus: 2.0
+  participation_bonus: 0.05
   # Bring regularizers into the same order of magnitude as return (after reward_scale)
   participation_reward_scale: 20.0
-  churn_penalty_scale: 25.0
   drawdown_quadratic_multiplier: 12.0
 
 # Per-asset costs (one entry per universe.assets key, same order)
@@ -62,14 +64,14 @@ transaction_costs:
 hyperparameters:
   learning_rate: 3.0e-4
   learning_rate_floor: 1.0e-6
-  batch_size: 16384
-  n_steps: 32768
-  n_epochs: 5
+  batch_size: 16384  # <= n_steps * n_envs; 65536/16384 = 4 mini-batches/epoch × n_epochs 3 = 12 backprop loops/pause
+  n_steps: 4096
+  n_epochs: 3
   gamma: 0.975
   gae_lambda: 0.95
   clip_range: 0.2
   clip_range_finetune: 0.1
-  ent_coef_initial: 0.03
+  ent_coef_initial: 0.045
   ent_coef_finetune: 0.001
   vf_coef: 0.5
   max_grad_norm: 0.5
@@ -83,14 +85,14 @@ policy:
 
 training:
   timesteps: 65000000
-  n_envs: 8
+  n_envs: 16
   obs_noise: 0.02
   seed: 0
   block_size: 126
   eval_stride: 4
   eval_n_episodes: 1  # fallback if segment list empty; train.py sets n_eval = #eval blocks
   holdout_days: 365
-  viz_freq: 20000
+  viz_freq: 500000
   curriculum_update_freq: 50000
   checkpoint_save_freq_steps: 1000000
 
@@ -101,14 +103,14 @@ vec_normalize:
   clip_reward: 10.0
 
 entropy_schedule:
-  explore_ent: 0.03
+  explore_ent: 0.045
   final_ent: 0.001
   early_floor: 0.01
   early_floor_high: 0.02
   warmup_improvements: 5  # logged only (eval NAV); does not gate decay
-  decay_start_fraction: 0.12  # decay before full fee ramp (fee_ramp_fraction 0.35)
+  decay_start_fraction: 0.45  # cosine decay starts after fee_ramp_fraction (0.45)
   dr_lock_fraction: 0.10
-  early_floor_fraction: 0.12307692307692308  # 8M / 18M style
+  early_floor_fraction: 0.45  # exploration floors through fee ramp (same milestone as decay start)
 
 # Smoothed curriculum track: spread fee / churn / DR shifts across the 65M run (avoids mid-run cliffs).
 curriculum:

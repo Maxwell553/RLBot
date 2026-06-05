@@ -28,12 +28,12 @@ def _minimal_env(
         ohlcv,
         rsi,
         macd,
+        macro=macro,
         fracdiff=fd,
         fracdiff_macro=fdm,
         trend=trend,
-        macro=macro,
         random_start=random_start,
-        max_episode_steps=63,
+        max_episode_steps=252,
         domain_randomize=False,
         block_boundaries=boundaries,
     )
@@ -46,13 +46,42 @@ def test_get_segments_returns_block_list() -> None:
     assert len(segs) >= 2
 
 
+def test_step_truncates_at_active_segment_end() -> None:
+    env = _minimal_env(n_bars=250, boundaries=[120], random_start=False)
+    segs = env.get_segments()
+    assert segs is not None and len(segs) >= 2
+    earliest, seg_end = segs[0]
+    env.reset()
+    assert env._current_seg_end == seg_end
+    seg_limit = seg_end - 1
+    for _ in range(500):
+        if env._t >= seg_limit - 1:
+            break
+        _, _, _, truncated, _ = env.step(env.action_space.sample())
+        assert not truncated
+    _, _, _, truncated, _ = env.step(env.action_space.sample())
+    assert truncated
+    assert env._t >= seg_limit
+    assert env._t < segs[1][0]
+
+
+def test_random_start_training_episode_has_min_runway() -> None:
+    env = _minimal_env(n_bars=80, boundaries=[40], random_start=True)
+    env.domain_randomize = False
+    lengths = []
+    for _ in range(30):
+        env.reset()
+        lengths.append(env._current_ep_max_steps)
+    assert min(lengths) >= MultiAssetPortfolioEnv.MIN_EPISODE_TRAIN_BARS
+
+
 def test_deterministic_reset_covers_full_segment_not_63_cap() -> None:
     env = _minimal_env(n_bars=250, boundaries=[120])
     segs = env.get_segments()
     assert segs is not None and len(segs) == 2
     earliest, seg_end = segs[0]
     env.reset()
-    expected_steps = max(seg_end - earliest - 2, 1)
+    expected_steps = max(seg_end - earliest - 1, 1)
     assert env._current_ep_max_steps == expected_steps
     assert env._current_ep_max_steps > 63
 

@@ -45,7 +45,7 @@ To use **N = 20**, add ten more `LABEL: yfinance_symbol` pairs and extend every 
 
 1. Edit `universe.assets` and all per-asset lists (length **N**, same order).
 2. Run `python scripts/train.py --refresh-data --timesteps 1000 --run-id _data_refresh --no-viz`.
-3. Train with a **new** `--run-id` (new `obs_dim = 9N + 28`; new VecNormalize + LSTM weights).
+3. Train with a **new** `--run-id` or `--window` (new `obs_dim = 10N + 28`; new VecNormalize + LSTM weights).
 
 Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 

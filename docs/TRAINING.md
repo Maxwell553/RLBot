@@ -27,7 +27,7 @@ For each asset key you must provide **one float** in each of (length **N**, same
 - `transaction_costs.tx_fee`
 - `transaction_costs.annual_holding_cost`
 
-Observation size: **`obs_dim = 9 × N + 28`**. Action size: **`N + 1`**.
+Observation size: **`obs_dim = 10 × N + 28`** (includes per-asset live mask in the vector). Action size: **`N + 1`**.
 
 See also [config/README.md](../config/README.md).
 
@@ -107,7 +107,7 @@ Backtest reads `manifest.universe.tickers` and checks observation dimension agai
 
 ## Walk-forward windows
 
-Calendar presets are documented in [RESEARCH.md](../RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`.
+Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`.
 
 ```bash
 python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
@@ -118,6 +118,34 @@ python scripts/backtest.py --run-id W1 --checkpoint both --detailed --stochastic
 
 ## What not to reuse
 
-- **Checkpoints** (`Runs/<run_id>/models/`) trained with a different **N** or `obs_dim`
-- **VecNormalize** pickles from another universe size
-- **Old caches** without `tickers` in the npz — always `--refresh-data` after universe edits
+- **Checkpoints** (`Runs/<run_id>/models/`) trained with a different **N**, `obs_dim`, or pre-`asset_live` cache
+- **VecNormalize** pickles from another universe size or observation layout
+- **Old caches** without `tickers` / `asset_live` in the npz — always `--refresh-data` after universe or data-pipeline edits
+
+## Run artifact layout
+
+Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
+
+| Path | Contents |
+|------|----------|
+| `manifest.json` | Dates, tickers, `n_assets`, `obs_dim`, universe metadata |
+| `config.yaml` | Snapshot of training config |
+| `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl`, `best/best_model.zip` |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV history |
+
+Migrate legacy scattered dirs once: `python scripts/migrate_runs_layout.py`.
+
+---
+
+## Training on Modal (optional)
+
+For long runs on a cloud GPU with the same `Runs/<run_id>/` layout, see [MODAL.md](MODAL.md).
+
+Quick flow:
+
+1. `pip install -e ".[modal]"` and `modal setup`
+2. `modal run scripts/modal_app.py -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
+3. In another terminal: `python scripts/modal_app.py sync --run-id <RUN_ID> --watch` (open `Runs/<RUN_ID>/plots/training.png` in the IDE)
+4. After the job: `python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all` then backtest locally
+
+Use `--run-id` explicitly if you want a fixed id for sync before the job prints logs.

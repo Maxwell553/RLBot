@@ -31,6 +31,7 @@ market-trainer-backtest = "scripts.backtest:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
+modal = ["modal>=0.66.0", "fastapi>=0.100.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]

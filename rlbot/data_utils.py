@@ -13,7 +13,7 @@ configured assets have real quotes.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,12 +56,31 @@ def select_tradeable_columns(
     trend: np.ndarray,
     panel_tickers: Sequence[str],
     universe_tickers: Sequence[str],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    asset_live: np.ndarray | None = None,
+    asset_vol: np.ndarray | None = None,
+    macro_vol: np.ndarray | None = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    List[str],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Restrict asset-axis arrays to ``universe_tickers`` (subset of ``panel_tickers``, same order)."""
     panel = list(panel_tickers)
     want = list(universe_tickers)
+    if asset_live is None:
+        asset_live = np.ones((ohlcv.shape[0], ohlcv.shape[1]), dtype=np.float64)
+    if asset_vol is None or macro_vol is None:
+        raise ValueError(
+            "asset_vol and macro_vol are required (rebuild cache: --refresh-data)"
+        )
     if panel == want:
-        return ohlcv, rsi, macd, fracdiff, trend, want
+        return ohlcv, rsi, macd, fracdiff, trend, want, asset_live, asset_vol, macro_vol
     try:
         indices = [panel.index(t) for t in want]
     except ValueError as e:
@@ -77,6 +96,9 @@ def select_tradeable_columns(
         fracdiff[:, indices],
         trend[:, indices],
         want,
+        asset_live[:, indices],
+        asset_vol[:, indices],
+        macro_vol,
     )
 
 
@@ -224,6 +246,41 @@ def _hy_oas_proxy_pct(hyg: np.ndarray, ief: np.ndarray) -> np.ndarray:
     return np.clip(3.5 - 12.0 * np.log(ratio), 2.0, 15.0)
 
 
+def _calibrate_hy_proxy_expanding(
+    proxy: np.ndarray,
+    fred: np.ndarray,
+    *,
+    min_overlap: int = 30,
+) -> np.ndarray:
+    """Causal affine calibration via expanding OLS (O(n), no per-bar polyfit)."""
+    proxy = np.asarray(proxy, dtype=np.float64)
+    fred = np.asarray(fred, dtype=np.float64)
+    n = len(proxy)
+    out = np.empty(n, dtype=np.float64)
+    a, b = 1.0, 0.0
+    n_eff = 0
+    sx = sy = sxx = sxy = 0.0
+    for i in range(n):
+        if np.isfinite(fred[i]) and np.isfinite(proxy[i]):
+            x = float(proxy[i])
+            y = float(fred[i])
+            n_eff += 1
+            sx += x
+            sy += y
+            sxx += x * x
+            sxy += x * y
+        if n_eff >= min_overlap:
+            denom = n_eff * sxx - sx * sx
+            if abs(denom) > 1e-12:
+                a = (n_eff * sxy - sx * sy) / denom
+                b = (sy - a * sx) / n_eff
+        if np.isfinite(proxy[i]):
+            out[i] = a * proxy[i] + b
+        else:
+            out[i] = np.nan
+    return out
+
+
 def _attach_hy_oas_column(
     merged: pd.DataFrame,
     hyg_close: pd.Series,
@@ -252,13 +309,20 @@ def _attach_hy_oas_column(
     except RuntimeError as e:
         print(f"    → FRED failed ({e}); proxy only")
 
-    overlap = fred_vals.notna() & proxy.notna()
-    if int(overlap.sum()) >= 30:
-        a, b = np.polyfit(proxy[overlap].to_numpy(), fred_vals[overlap].to_numpy(), 1)
-        proxy_cal = a * proxy + b
-        print(f"    → calibrated proxy to FRED (n={int(overlap.sum())}, a={a:.3f}, b={b:.3f})")
-    else:
-        proxy_cal = proxy
+    proxy_cal = pd.Series(
+        _calibrate_hy_proxy_expanding(
+            proxy.to_numpy(dtype=np.float64),
+            fred_vals.to_numpy(dtype=np.float64),
+            min_overlap=30,
+        ),
+        index=merged.index,
+    )
+    overlap_n = int((fred_vals.notna() & proxy.notna()).sum())
+    if overlap_n >= 30:
+        print(
+            f"    → causal expanding proxy→FRED calibration "
+            f"(overlap bars={overlap_n})"
+        )
 
     merged[col] = fred_vals.where(fred_vals.notna(), proxy_cal)
     merged[col] = merged[col].ffill().bfill().fillna(0.0)
@@ -268,12 +332,18 @@ def _attach_hy_oas_column(
 def _ohlcv_macro_from_merged(
     merged: pd.DataFrame,
     active_tickers: List[str],
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
-    """Extract aligned OHLCV + macro panels from a merged daily DataFrame."""
+) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract aligned OHLCV, macro, and per-asset live masks from a merged daily DataFrame."""
     merged = merged.sort_values("date").reset_index(drop=True)
     idx = pd.DatetimeIndex(merged["date"])
     ohlcv = np.zeros((len(merged), len(active_tickers), 5), dtype=np.float64)
+    asset_live = np.zeros((len(merged), len(active_tickers)), dtype=np.float64)
     for j, ticker in enumerate(active_tickers):
+        live_col = f"{ticker}_live"
+        if live_col in merged.columns:
+            asset_live[:, j] = merged[live_col].to_numpy(dtype=np.float64)
+        else:
+            asset_live[:, j] = 1.0
         ohlcv[:, j, 0] = merged[f"{ticker}_open"].to_numpy()
         ohlcv[:, j, 1] = merged[f"{ticker}_high"].to_numpy()
         ohlcv[:, j, 2] = merged[f"{ticker}_low"].to_numpy()
@@ -281,6 +351,7 @@ def _ohlcv_macro_from_merged(
         ohlcv[:, j, 4] = merged[f"{ticker}_volume"].to_numpy()
     ohlcv = np.nan_to_num(ohlcv, nan=0.0, posinf=0.0, neginf=0.0)
     ohlcv[:, :, :4] = np.maximum(ohlcv[:, :, :4], 1e-8)
+    asset_live = np.clip(asset_live, 0.0, 1.0)
 
     macro = np.zeros((len(merged), N_MACRO), dtype=np.float64)
     for j, ticker in enumerate(MACRO_TICKERS):
@@ -288,7 +359,37 @@ def _ohlcv_macro_from_merged(
         if col in merged.columns:
             macro[:, j] = np.nan_to_num(merged[col].to_numpy(dtype=np.float64), nan=0.0)
             macro[:, j] = np.maximum(macro[:, j], 1e-8)
-    return idx, ohlcv, macro
+    return idx, ohlcv, macro, asset_live
+
+
+def _trailing_log_return_std(series: np.ndarray, lookback: int) -> np.ndarray:
+    """Per-bar std of log returns; window ``[max(t-lookback,1), t]`` (env-aligned)."""
+    t = len(series)
+    out = np.zeros(t, dtype=np.float64)
+    for i in range(t):
+        start = max(i - lookback, 1)
+        window = series[start : i + 1]
+        if len(window) >= 2:
+            rets = np.diff(np.log(window + 1e-12))
+            out[i] = float(rets.std())
+    return out
+
+
+def compute_realized_vol_panels(
+    ohlcv: np.ndarray,
+    macro: np.ndarray,
+    lookback: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Trailing log-return std per bar (matches ``MultiAssetPortfolioEnv`` lookback)."""
+    t, n_assets = ohlcv.shape[0], ohlcv.shape[1]
+    asset_vol = np.zeros((t, n_assets), dtype=np.float64)
+    closes = ohlcv[:, :, 3]
+    for j in range(n_assets):
+        asset_vol[:, j] = _trailing_log_return_std(closes[:, j], lookback)
+    macro_vol = np.zeros((t, N_MACRO), dtype=np.float64)
+    for j in range(N_MACRO):
+        macro_vol[:, j] = _trailing_log_return_std(macro[:, j], lookback)
+    return asset_vol, macro_vol
 
 
 def compute_trend_signals(ohlcv: np.ndarray) -> np.ndarray:
@@ -307,8 +408,9 @@ def compute_feature_panel(
     ohlcv: np.ndarray,
     macro: np.ndarray,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """RSI, MACD, trend EMA profile, and fracdiff on a **contiguous** OHLCV slice."""
+    lookback: int = 20,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """RSI, MACD, trend, fracdiff, and trailing realized vol panels on a contiguous slice."""
     t, n_assets = ohlcv.shape[0], ohlcv.shape[1]
     rsi = np.zeros((t, n_assets), dtype=np.float64)
     macd = np.zeros((t, n_assets), dtype=np.float64)
@@ -319,7 +421,8 @@ def compute_feature_panel(
         macd[:, j] = (macd_line / (close_s.abs() + 1e-12)).fillna(0.0).to_numpy()
     trend_signals = compute_trend_signals(ohlcv)
     fracdiff, fracdiff_macro = compute_fracdiff_panel(ohlcv, macro, d=fracdiff_d)
-    return rsi, macd, fracdiff, fracdiff_macro, trend_signals
+    asset_vol, macro_vol = compute_realized_vol_panels(ohlcv, macro, lookback=lookback)
+    return rsi, macd, fracdiff, fracdiff_macro, trend_signals, asset_vol, macro_vol
 
 
 def _neutralize_feature_warmup(
@@ -346,13 +449,23 @@ def _indicators_from_merged(
     merged: pd.DataFrame,
     active_tickers: List[str],
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    pd.DatetimeIndex,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Full-timeline features (OK for contiguous OOS backtest / cache)."""
-    idx, ohlcv, macro = _ohlcv_macro_from_merged(merged, active_tickers)
-    rsi, macd, fracdiff, fracdiff_macro, trend = compute_feature_panel(
+    idx, ohlcv, macro, asset_live = _ohlcv_macro_from_merged(merged, active_tickers)
+    rsi, macd, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol = compute_feature_panel(
         ohlcv, macro, fracdiff_d=fracdiff_d
     )
-    return idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend
+    return idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol, asset_live
 
 
 def _yfinance_daily_history(
@@ -409,15 +522,26 @@ def fetch_aligned_daily(
     since: str = "2014-09-01",
     until: Optional[str] = None,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
-) -> Tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    pd.DatetimeIndex,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
     Daily OHLCV from yfinance for configured tradeable assets + macro context.
 
     Each asset is fetched independently, then outer-joined on date. Short
-    forward-fill bridges exchange holidays (``FFILL_LIMIT``). **Backward-fill
-    is never applied to asset OHLC** — dates before an asset's first real print
-    stay NaN and those rows are **dropped**, so the panel begins when every
-    asset has genuine prices (no anchoring to a future IPO level).
+    forward-fill bridges exchange holidays (``FFILL_LIMIT``). Pre-IPO rows keep
+    calendar history: ``{ticker}_live`` is 0 before the first real close, OHLC is
+    filled with ``1e-8`` for safe numerics (no backward-fill from IPO levels).
 
     Macro series use forward-fill only (no backward-fill into the past).
 
@@ -482,8 +606,7 @@ def fetch_aligned_daily(
         cols = [f"{ticker}_{c}" for c in ("open", "high", "low", "close", "volume")]
         merged[cols] = merged[cols].ffill(limit=FFILL_LIMIT)
 
-    # Volume unknown before first print → 0 (no position); do NOT bfill prices
-    # from the future IPO — those rows are dropped below.
+    # Volume unknown before first print → 0 (no position).
     for ticker in active_tickers:
         vol_col = f"{ticker}_volume"
         merged[vol_col] = merged[vol_col].fillna(0.0)
@@ -506,21 +629,31 @@ def fetch_aligned_daily(
     else:
         print("  WARNING: HY_OAS skipped (missing HYG or BOND10Y on panel)")
 
-    asset_cols = []
     for ticker in active_tickers:
-        asset_cols.extend([f"{ticker}_{c}" for c in ("open", "high", "low", "close")])
-    merged = merged.dropna(subset=asset_cols).reset_index(drop=True)
+        close_col = f"{ticker}_close"
+        merged[f"{ticker}_live"] = np.where(merged[close_col].notna(), 1.0, 0.0)
+
+    asset_fill_cols = []
+    for ticker in active_tickers:
+        asset_fill_cols.extend([f"{ticker}_{c}" for c in ("open", "high", "low", "close")])
+    # Back-fill pre-IPO rows with first listing price (flat returns → neutral RSI/MACD).
+    merged[asset_fill_cols] = merged[asset_fill_cols].bfill()
+    merged[asset_fill_cols] = merged[asset_fill_cols].fillna(1e-8)
 
     if merged.empty:
         raise RuntimeError(
             "No overlapping dates after alignment; check date ranges and asset availability."
         )
 
+    live_counts = {t: int(merged[f"{t}_live"].sum()) for t in active_tickers}
     print(
         f"  Aligned: {len(merged)} daily bars, {len(active_tickers)} assets "
-        f"(all live; no pre-IPO bfill) + {N_MACRO} macro — "
+        f"(live-masked pre-IPO; no global row drop) + {N_MACRO} macro — "
         f"{merged['date'].iloc[0].date()} .. {merged['date'].iloc[-1].date()}"
     )
+    for t, n_live in live_counts.items():
+        if n_live < len(merged):
+            print(f"    {t}: {n_live}/{len(merged)} bars with real prints")
     return _indicators_from_merged(merged, active_tickers, fracdiff_d=fracdiff_d)
 
 
@@ -614,14 +747,82 @@ def reserve_chronological_holdout(
     return (train_idx, *train_arrays), (hold_idx, *hold_arrays)
 
 
+class WalkforwardEnvPack(NamedTuple):
+    """
+    Arrays from ``train_test_split_alternating`` in canonical order.
+
+    Tuple layout: ``(idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend,
+    asset_vol, macro_vol, block_boundaries, asset_live)``. Use ``env_kwargs()`` when building
+    ``MultiAssetPortfolioEnv`` — do not unpack positionally into the env constructor.
+    """
+
+    idx: pd.DatetimeIndex
+    ohlcv: np.ndarray
+    rsi: np.ndarray
+    macd: np.ndarray
+    macro: np.ndarray
+    fracdiff: np.ndarray
+    fracdiff_macro: np.ndarray
+    trend: np.ndarray
+    asset_vol: np.ndarray
+    macro_vol: np.ndarray
+    block_boundaries: list
+    asset_live: np.ndarray
+
+    @classmethod
+    def from_tuple(cls, row: tuple) -> WalkforwardEnvPack:
+        if len(row) != 12:
+            raise ValueError(f"expected 12-tuple walk-forward pack, got len={len(row)}")
+        return cls(*row)
+
+    def env_kwargs(self) -> dict:
+        """Keyword args for ``MultiAssetPortfolioEnv`` (feature order matches this pack)."""
+        return {
+            "ohlcv": self.ohlcv,
+            "rsi": self.rsi,
+            "macd": self.macd,
+            "macro": self.macro,
+            "fracdiff": self.fracdiff,
+            "fracdiff_macro": self.fracdiff_macro,
+            "trend": self.trend,
+            "asset_realized_vol": self.asset_vol,
+            "macro_realized_vol": self.macro_vol,
+            "block_boundaries": self.block_boundaries,
+            "asset_live": self.asset_live,
+        }
+
+
+def align_panel_to_timeline(
+    source_index: pd.DatetimeIndex,
+    target_index: pd.DatetimeIndex,
+    *arrays: np.ndarray,
+) -> Tuple[np.ndarray, ...]:
+    """Row-select panel arrays from ``source_index`` onto ``target_index`` (e.g. after holdout cut)."""
+    if len(source_index) == len(target_index) and source_index.equals(target_index):
+        return arrays
+    loc = source_index.get_indexer(target_index)
+    if np.any(loc < 0):
+        raise ValueError("target_index contains dates not found in source_index")
+    return tuple(np.asarray(a)[loc] for a in arrays)
+
+
 def train_test_split_alternating(
     index: pd.DatetimeIndex,
     ohlcv: np.ndarray,
     macro: np.ndarray,
+    asset_live: np.ndarray | None = None,
     block_size: int = 126,
     eval_stride: int = 4,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     feature_purge_warmup: int = 25,
+    *,
+    rsi: np.ndarray | None = None,
+    macd: np.ndarray | None = None,
+    fracdiff: np.ndarray | None = None,
+    fracdiff_macro: np.ndarray | None = None,
+    trend: np.ndarray | None = None,
+    asset_vol: np.ndarray | None = None,
+    macro_vol: np.ndarray | None = None,
 ) -> Tuple[Tuple, Tuple]:
     """Walk-forward alternating split for representative train/eval regimes.
 
@@ -630,10 +831,14 @@ def train_test_split_alternating(
     to train.  Both sets therefore span the full history and contain a mix of
     bull, bear, high-vol, and low-vol periods.
 
-    **Features are computed per block on raw OHLCV only**, so RSI/MACD/fracdiff
-    on an eval block never inherit EWM or fracdiff memory from adjacent train
-    blocks.  At each join inside a concatenated stream, the first
-    ``feature_purge_warmup`` bars are neutralized (RSI=50, MACD/fracdiff=0).
+    **Features** are sliced from the trainable timeline into blocks. Pass precomputed
+    ``rsi`` / ``macd`` / ``fracdiff`` / ``fracdiff_macro`` / ``trend`` (e.g. from
+    ``load_cache``) to avoid recomputing on every training launch; otherwise they are
+    built once via ``compute_feature_panel`` on ``ohlcv`` + ``macro``.
+
+    Block joins still set ``block_boundaries`` so episodes do not cross calendar gaps.
+
+    ``feature_purge_warmup`` is retained for API compatibility but is not applied.
 
     Contiguous same-label blocks are merged into *segments*.  ``block_boundaries``
     lists join indices so the environment can prevent episodes from spanning them.
@@ -646,8 +851,38 @@ def train_test_split_alternating(
     n = len(index)
     if n == 0:
         raise ValueError("Empty dataset")
+    if asset_live is None:
+        asset_live = np.ones((n, ohlcv.shape[1]), dtype=np.float64)
+    elif asset_live.shape != (n, ohlcv.shape[1]):
+        raise ValueError(
+            f"asset_live shape {asset_live.shape} != ({n}, {ohlcv.shape[1]})"
+        )
 
     n_blocks = (n + block_size - 1) // block_size
+
+    precomputed = (rsi, macd, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol)
+    if all(x is not None for x in precomputed):
+        rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = precomputed  # type: ignore[misc]
+        for name, arr in (
+            ("rsi", rsi_g),
+            ("macd", macd_g),
+            ("fracdiff", fd_g),
+            ("fracdiff_macro", fdm_g),
+            ("trend", trend_g),
+            ("asset_vol", avol_g),
+            ("macro_vol", mvol_g),
+        ):
+            if arr.shape[0] != n:
+                raise ValueError(f"{name} length {arr.shape[0]} != timeline length {n}")
+    else:
+        if any(x is not None for x in precomputed):
+            raise ValueError(
+                "train_test_split_alternating: pass all of rsi, macd, fracdiff, "
+                "fracdiff_macro, trend, asset_vol, macro_vol, or none to recompute"
+            )
+        rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = compute_feature_panel(
+            ohlcv, macro, fracdiff_d=fracdiff_d
+        )
 
     train_ranges: List[Tuple[int, int]] = []
     eval_ranges: List[Tuple[int, int]] = []
@@ -671,16 +906,20 @@ def train_test_split_alternating(
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        np.ndarray,
         List[int],
     ]:
         idx_parts: List[pd.DatetimeIndex] = []
         ohlcv_parts: List[np.ndarray] = []
+        live_parts: List[np.ndarray] = []
         rsi_parts: List[np.ndarray] = []
         macd_parts: List[np.ndarray] = []
         macro_parts: List[np.ndarray] = []
         fd_parts: List[np.ndarray] = []
         fdm_parts: List[np.ndarray] = []
         trend_parts: List[np.ndarray] = []
+        avol_parts: List[np.ndarray] = []
+        mvol_parts: List[np.ndarray] = []
         boundaries: List[int] = []
         offset = 0
         prev_orig_end: Optional[int] = None
@@ -691,48 +930,116 @@ def train_test_split_alternating(
                 boundaries.append(offset)
 
             ohlcv_chunk = ohlcv[orig_start:orig_end]
+            live_chunk = asset_live[orig_start:orig_end]
             macro_chunk = macro[orig_start:orig_end]
-            rsi_c, macd_c, fd_c, fdm_c, trend_c = compute_feature_panel(
-                ohlcv_chunk, macro_chunk, fracdiff_d=fracdiff_d
-            )
-            if segment_idx > 0:
-                _neutralize_feature_warmup(
-                    rsi_c, macd_c, fd_c, fdm_c, feature_purge_warmup, trend_c
-                )
+            rsi_c = rsi_g[orig_start:orig_end]
+            macd_c = macd_g[orig_start:orig_end]
+            fd_c = fd_g[orig_start:orig_end]
+            fdm_c = fdm_g[orig_start:orig_end]
+            trend_c = trend_g[orig_start:orig_end]
+            avol_c = avol_g[orig_start:orig_end]
+            mvol_c = mvol_g[orig_start:orig_end]
 
             chunk_len = orig_end - orig_start
             idx_parts.append(index[orig_start:orig_end])
             ohlcv_parts.append(ohlcv_chunk)
+            live_parts.append(live_chunk)
             rsi_parts.append(rsi_c)
             macd_parts.append(macd_c)
             macro_parts.append(macro_chunk)
             fd_parts.append(fd_c)
             fdm_parts.append(fdm_c)
             trend_parts.append(trend_c)
+            avol_parts.append(avol_c)
+            mvol_parts.append(mvol_c)
             offset += chunk_len
             prev_orig_end = orig_end
             segment_idx += 1
 
         cat_idx = idx_parts[0].append(idx_parts[1:]) if len(idx_parts) > 1 else idx_parts[0]
         cat_ohlcv = np.concatenate(ohlcv_parts, axis=0)
+        cat_live = np.concatenate(live_parts, axis=0)
         cat_rsi = np.concatenate(rsi_parts, axis=0)
         cat_macd = np.concatenate(macd_parts, axis=0)
         cat_macro = np.concatenate(macro_parts, axis=0)
         cat_fd = np.concatenate(fd_parts, axis=0)
         cat_fdm = np.concatenate(fdm_parts, axis=0)
         cat_trend = np.concatenate(trend_parts, axis=0)
-        return cat_idx, cat_ohlcv, cat_rsi, cat_macd, cat_macro, cat_fd, cat_fdm, cat_trend, boundaries
+        cat_avol = np.concatenate(avol_parts, axis=0)
+        cat_mvol = np.concatenate(mvol_parts, axis=0)
+        return (
+            cat_idx,
+            cat_ohlcv,
+            cat_live,
+            cat_rsi,
+            cat_macd,
+            cat_macro,
+            cat_fd,
+            cat_fdm,
+            cat_trend,
+            cat_avol,
+            cat_mvol,
+            boundaries,
+        )
 
-    tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_trend, tr_bounds = _concat_ranges(
-        train_ranges
-    )
-    ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_trend, ev_bounds = _concat_ranges(
-        eval_ranges
-    )
+    (
+        tr_idx,
+        tr_ohlcv,
+        tr_live,
+        tr_rsi,
+        tr_macd,
+        tr_macro,
+        tr_fd,
+        tr_fdm,
+        tr_trend,
+        tr_avol,
+        tr_mvol,
+        tr_bounds,
+    ) = _concat_ranges(train_ranges)
+    (
+        ev_idx,
+        ev_ohlcv,
+        ev_live,
+        ev_rsi,
+        ev_macd,
+        ev_macro,
+        ev_fd,
+        ev_fdm,
+        ev_trend,
+        ev_avol,
+        ev_mvol,
+        ev_bounds,
+    ) = _concat_ranges(eval_ranges)
 
     return (
-        (tr_idx, tr_ohlcv, tr_rsi, tr_macd, tr_macro, tr_fd, tr_fdm, tr_trend, tr_bounds),
-        (ev_idx, ev_ohlcv, ev_rsi, ev_macd, ev_macro, ev_fd, ev_fdm, ev_trend, ev_bounds),
+        (
+            tr_idx,
+            tr_ohlcv,
+            tr_rsi,
+            tr_macd,
+            tr_macro,
+            tr_fd,
+            tr_fdm,
+            tr_trend,
+            tr_avol,
+            tr_mvol,
+            tr_bounds,
+            tr_live,
+        ),
+        (
+            ev_idx,
+            ev_ohlcv,
+            ev_rsi,
+            ev_macd,
+            ev_macro,
+            ev_fd,
+            ev_fdm,
+            ev_trend,
+            ev_avol,
+            ev_mvol,
+            ev_bounds,
+            ev_live,
+        ),
     )
 
 
@@ -746,6 +1053,9 @@ def save_cache(
     fracdiff: np.ndarray,
     fracdiff_macro: np.ndarray,
     trend: np.ndarray,
+    asset_vol: np.ndarray,
+    macro_vol: np.ndarray,
+    asset_live: np.ndarray | None = None,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     tickers: Sequence[str] | None = None,
 ) -> None:
@@ -755,6 +1065,8 @@ def save_cache(
     if idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
     active_tickers = np.asarray(resolve_tickers(tickers), dtype=object)
+    if asset_live is None:
+        asset_live = np.ones((ohlcv.shape[0], ohlcv.shape[1]), dtype=np.float64)
     np.savez_compressed(
         str(cache_path),
         index=idx.to_numpy(dtype="datetime64[ns]"),
@@ -765,6 +1077,9 @@ def save_cache(
         fracdiff=fracdiff,
         fracdiff_macro=fracdiff_macro,
         trend=trend,
+        asset_vol=asset_vol,
+        macro_vol=macro_vol,
+        asset_live=asset_live,
         fracdiff_d=np.array([fracdiff_d], dtype=np.float64),
         tickers=active_tickers,
     )
@@ -817,8 +1132,17 @@ def load_cache(
         trend = z["trend"]
     else:
         trend = compute_trend_signals(ohlcv)
+    if "asset_vol" in z.files and "macro_vol" in z.files:
+        asset_vol = z["asset_vol"]
+        macro_vol = z["macro_vol"]
+    else:
+        asset_vol, macro_vol = compute_realized_vol_panels(ohlcv, macro)
     if ohlcv.shape[1] != len(tickers):
         raise ValueError(
             f"Cache ohlcv has {ohlcv.shape[1]} assets but tickers lists {len(tickers)}: {tickers}"
         )
-    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend, tickers
+    if "asset_live" in z.files:
+        asset_live = z["asset_live"]
+    else:
+        asset_live = np.ones((len(idx), ohlcv.shape[1]), dtype=np.float64)
+    return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend, asset_vol, macro_vol, asset_live, tickers

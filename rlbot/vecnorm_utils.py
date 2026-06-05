@@ -7,6 +7,12 @@ from __future__ import annotations
 from stable_baselines3.common.vec_env import VecNormalize
 
 
+def sync_vecnormalize_stats(train_vn: VecNormalize, eval_vn: VecNormalize) -> None:
+    """Copy training observation (and reward) running stats into the eval wrapper."""
+    eval_vn.obs_rms = train_vn.obs_rms
+    eval_vn.ret_rms = train_vn.ret_rms
+
+
 def freeze_vec_normalize_for_inference(vec_env: VecNormalize) -> VecNormalize:
     """
     Load-time safety for production inference: freeze training statistics

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
-from rlbot.rl_config import get_config, observation_dim_for_universe
-from rlbot.trading_env import MultiAssetPortfolioEnv, portfolio_weights_from_action
+from rlbot.rl_config import get_config, observation_dim_for_universe, set_config
+from rlbot.trading_env import MultiAssetPortfolioEnv, _softmax_1d, portfolio_weights_from_action
 
 _CAP_TOL = 1e-6
 _SIMPLEX_TOL = 1e-8
@@ -31,6 +33,45 @@ def _assert_valid_weights(w: np.ndarray, n_actions: int = _N_ACTIONS) -> None:
 
 def test_config_cap_is_half() -> None:
     assert _max_cap() == pytest.approx(0.35)
+
+
+def test_softmax_mean_decoupling() -> None:
+    a = np.array([0.0, 0.0, 0.0, 0.0])
+    b = np.array([25.0, 25.0, 25.0, 25.0])
+    np.testing.assert_allclose(_softmax_1d(a), _softmax_1d(b), rtol=1e-9, atol=1e-9)
+
+
+def test_asset_live_mask_zeros_pre_ipo_weights() -> None:
+    action = np.zeros(_N_ACTIONS)
+    action[1:] = 10.0
+
+    live = np.ones(_N_ASSETS)
+    if _N_ASSETS > 1:
+        live[1] = 0.0
+
+    w = portfolio_weights_from_action(action, n_actions=_N_ACTIONS, asset_live=live)
+    _assert_valid_weights(w)
+
+    if _N_ASSETS > 1:
+        assert w[2] < 1e-6
+
+
+def test_asset_live_mask_applied_before_cap_loop() -> None:
+    """Dead assets must not inflate active sleeves past max_w after renormalize."""
+    if _N_ASSETS < 3:
+        pytest.skip("needs at least 3 tradeable assets")
+    action = np.zeros(_N_ACTIONS)
+    action[0] = -5.0
+    action[2] = 12.0
+    action[3] = 12.0
+    live = np.ones(_N_ASSETS)
+    live[0] = 0.0
+
+    w = portfolio_weights_from_action(action, n_actions=_N_ACTIONS, asset_live=live)
+    _assert_valid_weights(w)
+    assert w[1] < 1e-6
+    active = w[1:][live > 0.5]
+    assert np.all(active <= _max_cap() + _CAP_TOL)
 
 
 def test_simplex_uniform_logits() -> None:
@@ -118,13 +159,143 @@ def test_env_observation_dim_formula() -> None:
         ohlcv,
         rsi,
         macd,
-        fracdiff,
-        fracdiff_macro,
-        trend,
         macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
         random_start=False,
         domain_randomize=False,
     )
     assert env.n_assets == n_assets
     assert env.n_actions == n_assets + 1
     assert env.observation_space.shape[0] == observation_dim_for_universe(n_assets)
+
+
+def _pad_float_list(xs: list[float], n: int) -> list[float]:
+    out = list(xs)[:n]
+    if len(out) >= n:
+        return out
+    fill = out[-1] if out else 0.0
+    return out + [fill] * (n - len(out))
+
+
+def _install_config_per_asset_lists(n_assets: int):
+    """Align transaction-cost / benchmark vectors with synthetic panel width."""
+    cfg = get_config()
+    weights = _pad_float_list(cfg.reward.benchmark_cap_weights, n_assets)
+    wsum = sum(weights)
+    assert wsum > 0.0
+    weights = [w / wsum for w in weights]
+    patched = replace(
+        cfg,
+        reward=replace(cfg.reward, benchmark_cap_weights=weights),
+        transaction_costs=replace(
+            cfg.transaction_costs,
+            slippage=_pad_float_list(cfg.transaction_costs.slippage, n_assets),
+            tx_fee=_pad_float_list(cfg.transaction_costs.tx_fee, n_assets),
+            annual_holding_cost=_pad_float_list(
+                cfg.transaction_costs.annual_holding_cost, n_assets
+            ),
+        ),
+    )
+    set_config(patched)
+    return cfg
+
+
+@pytest.mark.parametrize("synthetic_n_assets", [5, 23, 55])
+def test_env_strict_shape_invariance(synthetic_n_assets: int) -> None:
+    """Env spaces and reset obs compile across the supported asset-count boundary range."""
+    orig_cfg = _install_config_per_asset_lists(synthetic_n_assets)
+    try:
+        t = 100
+        n_macro = 4
+        ohlcv = np.random.rand(t, synthetic_n_assets, 5) * 50 + 100.0
+        ohlcv[:, :, 3] = np.maximum(ohlcv[:, :, 3], 1.0)
+        rsi = np.full((t, synthetic_n_assets), 50.0)
+        macd = np.zeros((t, synthetic_n_assets))
+        trend = np.zeros((t, synthetic_n_assets))
+        fd = np.zeros((t, synthetic_n_assets))
+        fdm = np.zeros((t, n_macro))
+        macro = np.full((t, n_macro), 10.0)
+
+        env = MultiAssetPortfolioEnv(
+            ohlcv,
+            rsi,
+            macd,
+            fracdiff=fd,
+            fracdiff_macro=fdm,
+            trend=trend,
+            macro=macro,
+            random_start=False,
+            domain_randomize=False,
+        )
+
+        expected_obs_dim = observation_dim_for_universe(synthetic_n_assets, n_macro)
+        assert env.n_assets == synthetic_n_assets
+        assert env.n_actions == synthetic_n_assets + 1
+        assert env.observation_space.shape[0] == expected_obs_dim
+        assert env.action_space.shape[0] == synthetic_n_assets + 1
+
+        obs, _ = env.reset()
+        assert obs.shape == (expected_obs_dim,)
+    finally:
+        set_config(orig_cfg)
+
+
+def _sortino_downside(rets: np.ndarray) -> float:
+    m = float(rets.mean())
+    downside_elements = np.minimum(rets, 0.0) ** 2
+    dv = float(np.sqrt(downside_elements.mean()))
+    return m / (dv + 1e-8)
+
+
+def test_sortino_downside_dev_penalizes_loss_frequency() -> None:
+    """Full-window downside dev: many loss days → lower Sortino than one loss day."""
+    mild = np.array([0.01] * 62 + [-0.02])
+    severe = np.array([-0.02] * 60 + [0.01] * 3)
+    assert _sortino_downside(severe) < _sortino_downside(mild)
+
+
+def test_sortino_bonus_requires_min_steps() -> None:
+    """Sortino differential is withheld until sortino_min_steps (config default 20)."""
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        fee_scale_default=0.0,
+    )
+    env.reset()
+    sortino_seen = False
+    for _ in range(15):
+        _, _, _, _, info = env.step(np.zeros(env.action_space.shape))
+        if abs(info.get("rew_decomp/sortino", 0.0)) > 1e-9:
+            sortino_seen = True
+            break
+    assert not sortino_seen
+
+
+def test_sortino_downside_floor_avoids_tiny_denominator() -> None:
+    rets = np.full(63, 0.0001)
+    downside_elements = np.minimum(rets, 0.0) ** 2
+    dv = max(float(np.sqrt(downside_elements.mean())), 1e-4)
+    assert dv >= 1e-4
+    assert abs(rets.mean() / dv) < 10.0
+
+
+def test_benchmark_return_simple_then_log() -> None:
+    """Weighted simple returns then log ≥ weighted sum of logs (Jensen)."""
+    log_rets = np.array([0.02, -0.01, 0.015])
+    w = np.array([0.55, 0.25, 0.20])
+    wrong = float(np.dot(w, log_rets))
+    simple_agg = float(np.dot(w, np.expm1(log_rets)))
+    correct = float(np.log(1.0 + simple_agg))
+    assert correct >= wrong - 1e-12

@@ -64,6 +64,8 @@ from rlbot.data_utils import (
     reserve_chronological_holdout,
     save_cache,
     select_tradeable_columns,
+    WalkforwardEnvPack,
+    align_panel_to_timeline,
     train_test_split_alternating,
 )
 from rlbot.rl_config import (
@@ -78,16 +80,17 @@ from rlbot.rl_config import (
     validate_config_for_universe,
     write_config_snapshot,
 )
+from rlbot.vecnorm_utils import sync_vecnormalize_stats
 from rlbot.run_artifacts import (
     DEFAULT_DATA_CACHE,
     RunPaths,
     new_run_id,
     resolve_data_cache,
     snapshot_data_cache,
-    write_latest_pointer,
     write_manifest,
 )
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
+from rlbot.modal_cloud import commit_modal_volumes
 from rlbot.visualize import TrainingVizCallback, open_plot_file
 
 _startup_log("[train] Dependencies loaded.")
@@ -113,20 +116,14 @@ def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths
 # ── Env factory ──────────────────────────────────────────────────────────
 
 def _make_env_factory(
-    ohlcv: np.ndarray,
-    rsi: np.ndarray,
-    macd: np.ndarray,
-    macro: np.ndarray,
-    fracdiff: np.ndarray,
-    fracdiff_macro: np.ndarray,
-    trend: np.ndarray,
+    pack: WalkforwardEnvPack,
     random_start: bool,
     log_dir: Path,
     monitor_stem: str,
     max_episode_steps: int = 252,
     obs_noise_std: float = 0.0,
+    noise_scale: np.ndarray | None = None,
     reseed_on_reset: bool = False,
-    block_boundaries: list | None = None,
     obs_lag_default: int = 1,
     domain_randomize: bool = True,
     inactivity_penalty_scale: float = 1.0,
@@ -136,18 +133,12 @@ def _make_env_factory(
 
     def _init():
         env = MultiAssetPortfolioEnv(
-            ohlcv,
-            rsi,
-            macd,
-            fracdiff=fracdiff,
-            fracdiff_macro=fracdiff_macro,
-            trend=trend,
-            macro=macro,
+            **pack.env_kwargs(),
             random_start=random_start,
             max_episode_steps=max_episode_steps,
             obs_noise_std=obs_noise_std,
+            noise_scale=noise_scale,
             reseed_on_reset=reseed_on_reset,
-            block_boundaries=block_boundaries,
             obs_lag=0,
             obs_lag_default=obs_lag_default,
             fee_scale_default=1.0,
@@ -174,6 +165,7 @@ class EvalNavBestModelCallback(EvalCallback):
         eval_env,
         nav_history_path: Path,
         best_model_save_path: str,
+        train_vec_env: VecNormalize | None = None,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
@@ -181,6 +173,7 @@ class EvalNavBestModelCallback(EvalCallback):
         self.best_mean_nav = -np.inf
         self._nav_timesteps: list[int] = []
         self._mean_ending_nav: list[float] = []
+        self._train_vec_env = train_vec_env
         self._load_nav_history()
         super().__init__(eval_env, best_model_save_path=None, **kwargs)
 
@@ -206,6 +199,8 @@ class EvalNavBestModelCallback(EvalCallback):
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            if self._train_vec_env is not None:
+                sync_vecnormalize_stats(self._train_vec_env, self.eval_env)
             self.eval_env.env_method("pop_ending_navs")
 
         continue_training = super()._on_step()
@@ -250,8 +245,8 @@ class AdaptiveEntropyCallback(BaseCallback):
     """High entropy early, then mandatory cosine decay (not eval-gated).
 
     Phase 1 (explore): ``ent_coef = explore_ent`` until ``decay_start_fraction``
-        of the run is complete (default 45%). Exploration floors apply only in
-        this phase (fee curriculum / early training).
+        of the run (default 45%, aligned with fee ramp end). Exploration floors
+        apply while ``num_timesteps < early_floor_steps`` (``early_floor_fraction``).
     Phase 2 (decay): cosine schedule from ``explore_ent`` → ``final_ent`` over
         the remaining ``1 - decay_start_fraction`` of training, regardless of
         eval NAV.
@@ -652,11 +647,13 @@ def main() -> None:
     data_cache = resolve_data_cache()
     if args.refresh_data or not data_cache.is_file():
         _startup_log("[train] Fetching OHLCV from yfinance (may take several minutes)...")
-        idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend = fetch_aligned_daily(
-            symbols_dict=cfg.universe.assets,
-            since=args.since,
-            until=args.until,
-            fracdiff_d=cfg.data.fracdiff_d,
+        idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol, asset_live = (
+            fetch_aligned_daily(
+                symbols_dict=cfg.universe.assets,
+                since=args.since,
+                until=args.until,
+                fracdiff_d=cfg.data.fracdiff_d,
+            )
         )
         save_cache(
             str(data_cache),
@@ -668,6 +665,9 @@ def main() -> None:
             fracdiff,
             fracdiff_macro,
             trend,
+            asset_vol,
+            macro_vol,
+            asset_live=asset_live,
             fracdiff_d=cfg.data.fracdiff_d,
             tickers=cfg.universe.tickers,
         )
@@ -682,11 +682,24 @@ def main() -> None:
             fracdiff,
             fracdiff_macro,
             trend,
+            asset_vol,
+            macro_vol,
+            asset_live,
             panel_tickers,
         ) = load_cache(str(data_cache))
 
     if list(panel_tickers) != cfg.universe.tickers:
-        ohlcv, rsi, macd, fracdiff, trend, panel_tickers = select_tradeable_columns(
+        (
+            ohlcv,
+            rsi,
+            macd,
+            fracdiff,
+            trend,
+            panel_tickers,
+            asset_live,
+            asset_vol,
+            macro_vol,
+        ) = select_tradeable_columns(
             ohlcv,
             rsi,
             macd,
@@ -694,6 +707,9 @@ def main() -> None:
             trend,
             panel_tickers,
             cfg.universe.tickers,
+            asset_live=asset_live,
+            asset_vol=asset_vol,
+            macro_vol=macro_vol,
         )
 
     validate_config_for_universe(cfg, int(ohlcv.shape[1]))
@@ -703,67 +719,85 @@ def main() -> None:
     _startup_log(f"[train] Data panel: {len(idx)} bars, N={n_assets} assets.")
 
     if args.until:
-        idx, (ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend) = clip_index_until(
-            idx,
-            ohlcv,
-            rsi,
-            macd,
-            macro,
-            fracdiff,
-            fracdiff_macro,
-            trend,
-            until=args.until,
+        idx, (ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol, asset_live) = (
+            clip_index_until(
+                idx,
+                ohlcv,
+                rsi,
+                macd,
+                macro,
+                fracdiff,
+                fracdiff_macro,
+                trend,
+                asset_vol,
+                macro_vol,
+                asset_live,
+                until=args.until,
+            )
         )
 
     snapshot_data_cache(data_cache, paths.data_snapshot)
 
-    (idx_fit, ohlcv_fit, macro_fit), (idx_hold, ohlcv_hold, macro_hold) = (
-        reserve_chronological_holdout(
-            idx, ohlcv, macro,
-            holdout_days=args.holdout_days,
-            train_end=args.train_end,
-            holdout_start=args.holdout_start,
-            holdout_end=args.holdout_end,
-        )
+    (idx_fit, ohlcv_fit, macro_fit, asset_live_fit), (
+        idx_hold,
+        ohlcv_hold,
+        macro_hold,
+        asset_live_hold,
+    ) = reserve_chronological_holdout(
+        idx,
+        ohlcv,
+        macro,
+        asset_live,
+        holdout_days=args.holdout_days,
+        train_end=args.train_end,
+        holdout_start=args.holdout_start,
+        holdout_end=args.holdout_end,
     )
 
     purge = cfg.data.feature_purge_warmup
-    _startup_log(
-        f"[train] Walk-forward feature panels "
-        f"(block={args.block_size}, stride={args.eval_stride}; may take 1–3 minutes)..."
-    )
-    (
-        train_idx,
-        train_ohlcv,
-        train_rsi,
-        train_macd,
-        train_macro,
-        train_fd,
-        train_fdm,
-        train_trend,
-        train_boundaries,
-    ), (
-        eval_idx,
-        eval_ohlcv,
-        eval_rsi,
-        eval_macd,
-        eval_macro,
-        eval_fd,
-        eval_fdm,
-        eval_trend,
-        eval_boundaries,
-    ) = train_test_split_alternating(
+    rsi_fit, macd_fit, fd_fit, fdm_fit, trend_fit, avol_fit, mvol_fit = align_panel_to_timeline(
+        idx,
         idx_fit,
-        ohlcv_fit,
-        macro_fit,
-        block_size=args.block_size,
-        eval_stride=args.eval_stride,
-        fracdiff_d=cfg.data.fracdiff_d,
-        feature_purge_warmup=purge,
+        rsi,
+        macd,
+        fracdiff,
+        fracdiff_macro,
+        trend,
+        asset_vol,
+        macro_vol,
     )
+    feat_src = "cache" if data_cache.is_file() and not args.refresh_data else "computed"
+    _startup_log(
+        f"[train] Walk-forward block split ({feat_src} features, "
+        f"block={args.block_size}, stride={args.eval_stride})..."
+    )
+    train_pack, eval_pack = (
+        WalkforwardEnvPack.from_tuple(p)
+        for p in train_test_split_alternating(
+            idx_fit,
+            ohlcv_fit,
+            macro_fit,
+            asset_live_fit,
+            block_size=args.block_size,
+            eval_stride=args.eval_stride,
+            fracdiff_d=cfg.data.fracdiff_d,
+            feature_purge_warmup=purge,
+            rsi=rsi_fit,
+            macd=macd_fit,
+            fracdiff=fd_fit,
+            fracdiff_macro=fdm_fit,
+            trend=trend_fit,
+            asset_vol=avol_fit,
+            macro_vol=mvol_fit,
+        )
+    )
+    train_idx = train_pack.idx
+    eval_idx = eval_pack.idx
+    train_boundaries = train_pack.block_boundaries
+    eval_boundaries = eval_pack.block_boundaries
     print(
-        f"  features: per-block isolation + {purge}-bar purge at segment joins "
-        f"(no cross-block RSI/MACD/fracdiff memory)"
+        f"  features: {feat_src} panel → block slice (purge={purge} unused); "
+        f"matches continuous backtest memory"
     )
 
     if len(train_idx) < 200:
@@ -822,6 +856,12 @@ def main() -> None:
     print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
     print(f"  trade bundle on exit: {paths.models_dir.name}/vec_normalize.pkl + copy → best/ (pair with best_model.zip)")
     print(f"  n_envs={args.n_envs}, n_steps={args.n_steps}, batch={args.batch_size}")
+    rollout_size = int(args.n_steps) * int(args.n_envs)
+    if int(args.batch_size) > rollout_size:
+        raise ValueError(
+            f"batch_size ({args.batch_size}) must be <= n_steps * n_envs "
+            f"({args.n_steps} * {args.n_envs} = {rollout_size}) for PPO"
+        )
     print(f"  max_ep_steps={args.max_ep_steps} (daily bars, train only; eval spans full segment)")
     print(f"  obs_noise={args.obs_noise}, reseed_on_reset=True (training)")
     print(f"  obs_lag: train Uniform{{0,1,2}} per episode; eval fixed at {args.obs_lag}")
@@ -829,7 +869,7 @@ def main() -> None:
     print(
         f"  reward: return*{cfg.reward.reward_scale:g} + Sortino*{cfg.reward.risk_bonus_scale:g} "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
-        f"- inactivity - churn*{cfg.reward.churn_penalty_scale:g} "
+        f"- inactivity - churn*{cfg.reward.churn_penalty:g} "
         f"- quadratic_dd*({cfg.reward.drawdown_penalty_scale:g}*{cfg.reward.drawdown_quadratic_multiplier:g})"
     )
     print(
@@ -888,16 +928,36 @@ def main() -> None:
         f"(first launch may take 1–3 minutes)..."
     )
 
+    train_noise_scale = None
+    if args.obs_noise > 0.0:
+        train_noise_scale = MultiAssetPortfolioEnv.compute_obs_noise_scale(
+            train_pack.ohlcv,
+            train_pack.rsi,
+            train_pack.macd,
+            train_pack.fracdiff,
+            train_pack.fracdiff_macro,
+            train_pack.trend,
+            train_pack.macro,
+            train_pack.asset_vol,
+            train_pack.macro_vol,
+            n_assets=n_assets,
+            n_noisy_features=MultiAssetPortfolioEnv.noisy_market_feature_count(n_assets),
+            lookback=cfg.environment.lookback,
+            return_horizons=MultiAssetPortfolioEnv.RETURN_HORIZONS,
+            min_t=cfg.environment.lookback + cfg.environment.max_obs_lag,
+            max_t=int(train_pack.ohlcv.shape[0]) - 2,
+        )
+
     train_env = SubprocVecEnv([
         _make_env_factory(
-            train_ohlcv, train_rsi, train_macd, train_macro, train_fd, train_fdm, train_trend,
+            train_pack,
             random_start=True,
+            noise_scale=train_noise_scale,
             log_dir=paths.logs_dir,
             monitor_stem=f"train_monitor_{i}",
             max_episode_steps=args.max_ep_steps,
             obs_noise_std=args.obs_noise,
             reseed_on_reset=True,
-            block_boundaries=train_boundaries,
             obs_lag_default=args.obs_lag,
             domain_randomize=True,
             inactivity_penalty_scale=1.0,
@@ -915,13 +975,13 @@ def main() -> None:
 
     eval_env = SubprocVecEnv([
         _make_env_factory(
-            eval_ohlcv, eval_rsi, eval_macd, eval_macro, eval_fd, eval_fdm, eval_trend,
+            eval_pack,
             random_start=False,
+            noise_scale=train_noise_scale,
             log_dir=paths.logs_dir,
             monitor_stem="eval_monitor",
             max_episode_steps=args.max_ep_steps,
             reseed_on_reset=False,
-            block_boundaries=eval_boundaries,
             obs_lag_default=args.obs_lag,
             domain_randomize=False,
             inactivity_penalty_scale=cfg.reward.eval_inactivity_penalty_scale,
@@ -1012,7 +1072,8 @@ def main() -> None:
     print(f"  total params: {total_params:,}  (trainable: {trainable_params:,})")
 
     # ── callbacks ────────────────────────────────────────────────────────
-    eval_freq = max(5_000 // n_envs, args.n_steps)
+    # Evaluate every 500k global timesteps (500k / n_envs vector steps; decoupled from n_steps).
+    eval_freq = max(500_000 // n_envs, 1)
     validation_segments = eval_env.env_method("get_segments")[0]
     n_validation_blocks = (
         len(validation_segments) if validation_segments else tr_cfg.eval_n_episodes
@@ -1027,6 +1088,7 @@ def main() -> None:
         eval_env,
         nav_history_path=paths.eval_nav_history,
         best_model_save_path=str(paths.best_model_dir),
+        train_vec_env=train_env,
         log_path=str(paths.eval_log_dir),
         eval_freq=eval_freq,
         n_eval_episodes=n_validation_blocks,
@@ -1090,6 +1152,7 @@ def main() -> None:
     finally:
         # Always persist VecNormalize + weights so runs are trade-ready even if learn() crashes
         vn_root, vn_best = _persist_trade_artifacts(model, train_env, paths)
+        commit_modal_volumes(reason="training exit")
         print(f"\nTrade bundle: {paths.final_model.name} + vec_normalize (run + best/)")
         print(f"  VecNormalize: {vn_root}")
         print(f"  Copy next to best: {vn_best}")
@@ -1125,7 +1188,6 @@ def main() -> None:
             },
         },
     )
-    write_latest_pointer(run_id)
 
     print(f"\nSaved final model: {paths.final_model}")
     print(f"VecNormalize stats: {paths.models_dir / 'vec_normalize.pkl'}")

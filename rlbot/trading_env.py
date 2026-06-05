@@ -4,8 +4,8 @@ Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / co
 Reward = return + Sortino diff vs cap-weighted benchmark - inactivity - VIX-scaled churn - drawdown
   - return: clipped_log_return * REWARD_SCALE
   - sortino diff: benchmark-relative over last RISK_WINDOW steps (moving window within episode)
-  - inactivity: penalty when cash > 50% and extra when >90% (training scale 1.0;
-    periodic eval uses ``EVAL_INACTIVITY_PENALTY_SCALE`` so defensive cash is not over-penalized)
+  - inactivity: linear in cash fraction (plus extra ramp above 90%); training scale 1.0;
+    periodic eval uses ``EVAL_INACTIVITY_PENALTY_SCALE`` so defensive cash is not over-penalized
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
 
 Execution: trades fill at open[t+1] (next morning after decision), not close[t].
@@ -16,7 +16,7 @@ Domain randomization (training): ``obs_lag`` and ``fee_scale`` resampled each ep
 after the fee curriculum releases; bounds widen progressively (see ``set_randomization_bounds``).
 ``fee_scale`` uses Beta(5, 5) mapped to the current fee bounds (bell curve centered at 1.0).
 Fee curriculum overrides DR until release (see ``set_curriculum_state``).
-Fracdiff features replace raw log-return horizons in market observations.
+Fracdiff panel snapshots at RETURN_HORIZONS lags (no second differencing on top of d=0.4 fracdiff).
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from rlbot.baselines import portfolio_step_nav
 from rlbot.data_utils import MACRO_VIX_INDEX, N_MACRO
 from rlbot.rl_config import get_config
 
@@ -60,6 +61,7 @@ def portfolio_weights_from_action(
     action: np.ndarray,
     *,
     n_actions: int | None = None,
+    asset_live: np.ndarray | None = None,
 ) -> np.ndarray:
     """Map policy logits → portfolio weights via softmax over cash + risky assets.
 
@@ -74,6 +76,13 @@ def portfolio_weights_from_action(
     w = np.zeros(n_act, dtype=np.float64)
     w[0] = float(p[0])
     w[1:] = p[1:]
+
+    if asset_live is not None:
+        live = np.asarray(asset_live, dtype=np.float64).reshape(-1)
+        if live.shape[0] != n_act - 1:
+            raise ValueError(f"asset_live must have length {n_act - 1}, got {live.shape[0]}")
+        w[1:] *= np.clip(live, 0.0, 1.0)
+        w = _enforce_long_only_simplex(w)
 
     max_w = get_config().environment.max_single_asset_weight
     risky_w = w[1:].copy()
@@ -125,22 +134,42 @@ class EpisodeEndNavRecorder(gym.Wrapper):
 
 class MultiAssetPortfolioEnv(gym.Env):
     """
-    Observation size: ``9 * n_assets + 8 + 5 * N_MACRO`` (e.g. 118 when ``n_assets=10``).
+    Observation size: ``10 * n_assets + 8 + 5 * N_MACRO`` (e.g. 128 when ``n_assets=10``).
 
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
     Reward: return + Sortino_bonus + participation - inactivity - VIX-scaled churn - quadratic drawdown penalty.
     Per-step ``info`` includes ``rew_decomp/*`` for each component (see ``config.yaml`` reward section).
+
+    Feature arrays after ``macd`` are keyword-only so walk-forward packs
+    ``(ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, ...)`` cannot be
+    misaligned by positional unpacking.
     """
 
     metadata = {"render_modes": []}
     RETURN_HORIZONS = (1, 5, 10, 20)
+    MIN_EPISODE_TRAIN_BARS = 21
+
+    @staticmethod
+    def noisy_market_feature_count(n_assets: int, n_macro: int = N_MACRO) -> int:
+        """Features in ``_build_obs`` that receive domain-randomization noise (excludes ``asset_live``)."""
+        h = len(MultiAssetPortfolioEnv.RETURN_HORIZONS)
+        return (
+            h * (n_assets + 1)
+            + (n_assets + 1)
+            + n_assets
+            + n_assets
+            + n_assets
+            + h * n_macro
+            + n_macro
+        )
 
     def __init__(
         self,
         ohlcv: np.ndarray,
         rsi: np.ndarray,
         macd: np.ndarray,
+        *,
         fracdiff: np.ndarray,
         fracdiff_macro: np.ndarray,
         trend: np.ndarray,
@@ -158,6 +187,10 @@ class MultiAssetPortfolioEnv(gym.Env):
         domain_randomize: bool = True,
         inactivity_penalty_scale: float = 1.0,
         action_smoothing_alpha: float | None = None,
+        asset_live: np.ndarray | None = None,
+        asset_realized_vol: np.ndarray | None = None,
+        macro_realized_vol: np.ndarray | None = None,
+        noise_scale: np.ndarray | None = None,
     ):
         super().__init__()
         cfg = get_config()
@@ -198,6 +231,30 @@ class MultiAssetPortfolioEnv(gym.Env):
             self.macro = macro.astype(np.float64)
         else:
             self.macro = np.zeros((ohlcv.shape[0], N_MACRO), dtype=np.float64)
+        if asset_live is not None:
+            al = np.asarray(asset_live, dtype=np.float64)
+            if al.shape != (ohlcv.shape[0], self.n_assets):
+                raise ValueError(
+                    f"asset_live shape {al.shape} != ({ohlcv.shape[0]}, {self.n_assets})"
+                )
+            self.asset_live = np.clip(al, 0.0, 1.0)
+        else:
+            self.asset_live = np.ones((ohlcv.shape[0], self.n_assets), dtype=np.float64)
+        n_bars = ohlcv.shape[0]
+        if asset_realized_vol is not None:
+            av = np.asarray(asset_realized_vol, dtype=np.float64)
+            if av.shape != (n_bars, self.n_assets):
+                raise ValueError(f"asset_realized_vol shape {av.shape} != ({n_bars}, {self.n_assets})")
+            self._asset_vol_panel = av
+        else:
+            self._asset_vol_panel = None
+        if macro_realized_vol is not None:
+            mv = np.asarray(macro_realized_vol, dtype=np.float64)
+            if mv.shape != (n_bars, N_MACRO):
+                raise ValueError(f"macro_realized_vol shape {mv.shape} != ({n_bars}, {N_MACRO})")
+            self._macro_vol_panel = mv
+        else:
+            self._macro_vol_panel = None
         self.initial_cash = float(
             env_cfg.initial_cash if initial_cash is None else initial_cash
         )
@@ -239,6 +296,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._reset_count = 0
         self._return_buffer: list[float] = []
         self._market_return_buffer: list[float] = []
+        self._bench_nav = 1.0
+        self._bench_w_prev: np.ndarray | None = None
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
         alpha = (
@@ -249,26 +308,11 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._action_smoothing_alpha = float(np.clip(alpha, 0.0, 1.0))
         self._smoothed_action: np.ndarray | None = None
 
-        n_returns = len(self.RETURN_HORIZONS) * self.n_assets
-        n_mkt_returns = len(self.RETURN_HORIZONS)
-        n_vol = self.n_assets
-        n_mkt_vol = 1
-        n_rsi = self.n_assets
-        n_macd = self.n_assets
-        n_trend = self.n_assets
-        n_macro = N_MACRO * (len(self.RETURN_HORIZONS) + 1)
+        n_live = self.n_assets
         n_port = self.n_actions
         n_meta = 2
-        self._n_market_features = (
-            n_returns
-            + n_mkt_returns
-            + n_vol
-            + n_mkt_vol
-            + n_rsi
-            + n_macd
-            + n_trend
-            + n_macro
-        )
+        self._n_noisy_features = self.noisy_market_feature_count(self.n_assets, N_MACRO)
+        self._n_market_features = self._n_noisy_features + n_live
         obs_dim = self._n_market_features + n_port + n_meta
 
         self.observation_space = spaces.Box(
@@ -287,7 +331,38 @@ class MultiAssetPortfolioEnv(gym.Env):
         # entirely within one segment so observations never span a gap.
         self._segments = self._build_segments(block_boundaries or [])
 
-        self._noise_scale = self._compute_noise_scale() if obs_noise_std > 0.0 else None
+        # Exclusive segment end (see ``_build_segments``); step() must not read past seg_end - 2.
+        self._current_seg_end = self._max_t + 2
+
+        if obs_noise_std > 0.0:
+            if noise_scale is not None:
+                ns = np.asarray(noise_scale, dtype=np.float32).reshape(-1)
+                if ns.shape[0] != self._n_noisy_features:
+                    raise ValueError(
+                        f"noise_scale length {ns.shape[0]} != {self._n_noisy_features}"
+                    )
+                self._noise_scale = ns
+            else:
+                self._noise_scale = self.compute_obs_noise_scale(
+                    self.ohlcv,
+                    self.rsi,
+                    self.macd,
+                    self.fracdiff,
+                    self.fracdiff_macro,
+                    self.trend,
+                    self.macro,
+                    self._asset_vol_panel,
+                    self._macro_vol_panel,
+                    n_assets=self.n_assets,
+                    n_noisy_features=self._n_noisy_features,
+                    lookback=self.lookback,
+                    return_horizons=self.RETURN_HORIZONS,
+                    min_t=self._min_t,
+                    max_t=self._max_t,
+                    obs_lag=0,
+                )
+        else:
+            self._noise_scale = None
 
     def set_curriculum_state(self, fee_override: Optional[float], churn_scale: float) -> None:
         """Called by ``TradingCurriculumCallback`` on training envs only.
@@ -355,54 +430,79 @@ class MultiAssetPortfolioEnv(gym.Env):
                 segments.append((earliest, seg_end))
         return segments if segments else None
 
-    def _compute_noise_scale(self) -> np.ndarray:
-        """
-        Per-feature std from actual data; noise is proportional to each
-        feature's natural variability so noisier assets get more noise.
-        """
-        n_samples = min(2000, self._max_t - self._min_t)
-        indices = np.linspace(self._min_t + 1, self._max_t, n_samples, dtype=int)
+    @staticmethod
+    def compute_obs_noise_scale(
+        ohlcv: np.ndarray,
+        rsi: np.ndarray,
+        macd: np.ndarray,
+        fracdiff: np.ndarray,
+        fracdiff_macro: np.ndarray,
+        trend: np.ndarray,
+        macro: np.ndarray,
+        asset_realized_vol: np.ndarray | None,
+        macro_realized_vol: np.ndarray | None,
+        *,
+        n_assets: int,
+        n_noisy_features: int,
+        lookback: int,
+        return_horizons: tuple[int, ...],
+        min_t: int,
+        max_t: int,
+        obs_lag: int = 0,
+    ) -> np.ndarray:
+        """Per-feature std for domain-randomization noise (compute once per training panel)."""
+        n_samples = min(2000, max_t - min_t)
+        indices = np.linspace(min_t + 1, max_t, n_samples, dtype=int)
 
         samples = []
         for t_raw in indices:
-            t = max(t_raw - self.obs_lag, 0)
+            t = max(int(t_raw) - obs_lag, 0)
             parts = []
-            for h in self.RETURN_HORIZONS:
+            for h in return_horizons:
                 t0 = max(t - h, 0)
-                fd = self.fracdiff[t] - self.fracdiff[t0]
+                fd = fracdiff[t0]
                 parts.append(fd.astype(np.float32) * 100.0)
                 parts.append(np.array([fd.mean()], dtype=np.float32) * 100.0)
 
-            start = max(t - self.lookback, 1)
-            closes_w = self.ohlcv[start : t + 1, :, 3]
-            if len(closes_w) >= 2:
-                vol = np.diff(np.log(closes_w + 1e-12), axis=0).std(axis=0)
+            if asset_realized_vol is not None:
+                vol = asset_realized_vol[t]
             else:
-                vol = np.zeros(self.n_assets)
+                start = max(t - lookback, 1)
+                closes_w = ohlcv[start : t + 1, :, 3]
+                if len(closes_w) >= 2:
+                    vol = np.diff(np.log(closes_w + 1e-12), axis=0).std(axis=0)
+                else:
+                    vol = np.zeros(n_assets)
             parts.append(vol.astype(np.float32) * 100.0)
             parts.append(np.array([vol.mean()], dtype=np.float32) * 100.0)
 
-            parts.append((self.rsi[t] / 50.0 - 1.0).astype(np.float32))
-            parts.append(np.tanh(self.macd[t]).astype(np.float32))
-            parts.append(np.clip(self.trend[t], -1.0, 1.0).astype(np.float32))
+            parts.append((rsi[t] / 50.0 - 1.0).astype(np.float32))
+            parts.append(np.tanh(macd[t]).astype(np.float32))
+            parts.append(np.clip(trend[t], -1.0, 1.0).astype(np.float32))
 
-            for h in self.RETURN_HORIZONS:
+            for h in return_horizons:
                 t0 = max(t - h, 0)
-                mfd = self.fracdiff_macro[t] - self.fracdiff_macro[t0]
+                mfd = fracdiff_macro[t0]
                 parts.append(mfd.astype(np.float32) * 100.0)
-            m_start = max(t - self.lookback, 1)
-            m_vals = self.macro[m_start : t + 1]
-            if len(m_vals) >= 2:
-                m_vol = np.diff(np.log(m_vals + 1e-12), axis=0).std(axis=0)
+            if macro_realized_vol is not None:
+                m_vol = macro_realized_vol[t]
             else:
-                m_vol = np.zeros(N_MACRO)
+                m_start = max(t - lookback, 1)
+                m_vals = macro[m_start : t + 1]
+                if len(m_vals) >= 2:
+                    m_vol = np.diff(np.log(m_vals + 1e-12), axis=0).std(axis=0)
+                else:
+                    m_vol = np.zeros(N_MACRO)
             parts.append(m_vol.astype(np.float32) * 100.0)
 
             samples.append(np.concatenate(parts))
 
         feature_stds = np.stack(samples).std(axis=0)
-        feature_stds = np.maximum(feature_stds, 0.01)
-        return feature_stds.astype(np.float32)
+        if feature_stds.shape[0] != n_noisy_features:
+            raise ValueError(
+                f"noise sample width {feature_stds.shape[0]} != n_noisy_features {n_noisy_features}"
+            )
+        return np.maximum(feature_stds, 0.01).astype(np.float32)
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -457,11 +557,14 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         for h in self.RETURN_HORIZONS:
             t0 = max(t_mkt - h, 0)
-            asset_fd = (self.fracdiff[t_mkt] - self.fracdiff[t0]).astype(np.float32)
+            asset_fd = self.fracdiff[t0].astype(np.float32)
             parts.append(asset_fd * 100.0)
             parts.append(np.array([asset_fd.mean()], dtype=np.float32) * 100.0)
 
-        asset_vol = self._realized_vol(t_mkt).astype(np.float32)
+        if self._asset_vol_panel is not None:
+            asset_vol = self._asset_vol_panel[t_mkt].astype(np.float32)
+        else:
+            asset_vol = self._realized_vol(t_mkt).astype(np.float32)
         parts.append(asset_vol * 100.0)
         parts.append(np.array([asset_vol.mean()], dtype=np.float32) * 100.0)
 
@@ -476,10 +579,15 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         for h in self.RETURN_HORIZONS:
             t0 = max(t_mkt - h, 0)
-            mfd = (self.fracdiff_macro[t_mkt] - self.fracdiff_macro[t0]).astype(np.float32)
+            mfd = self.fracdiff_macro[t0].astype(np.float32)
             parts.append(mfd * 100.0)
-        macro_vol = self._macro_realized_vol(t_mkt).astype(np.float32)
+        if self._macro_vol_panel is not None:
+            macro_vol = self._macro_vol_panel[t_mkt].astype(np.float32)
+        else:
+            macro_vol = self._macro_realized_vol(t_mkt).astype(np.float32)
         parts.append(macro_vol * 100.0)
+
+        parts.append(self.asset_live[t_mkt].astype(np.float32))
 
         close = self.ohlcv[t, :, 3]
         parts.append(self._portfolio_weights(close))
@@ -492,13 +600,52 @@ class MultiAssetPortfolioEnv(gym.Env):
         obs = np.concatenate(parts)
 
         if self.obs_noise_std > 0.0 and self._noise_scale is not None:
-            noise = self._rng.normal(0.0, 1.0, size=self._n_market_features).astype(np.float32)
-            noise *= self._noise_scale * self.obs_noise_std
-            obs[:self._n_market_features] += noise
+            noise = self._rng.normal(0.0, 1.0, size=self._n_noisy_features).astype(np.float32)
+            noise *= self._noise_scale[: self._n_noisy_features] * self.obs_noise_std
+            obs[: self._n_noisy_features] += noise
 
         return obs
 
     # ── execution ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_sortino(rets: np.ndarray) -> float:
+        m = float(rets.mean())
+        downside_elements = np.minimum(rets, 0.0) ** 2
+        dv = max(float(np.sqrt(downside_elements.mean())), 1e-4)
+        return m / dv
+
+    def _benchmark_weights_live(self, live: np.ndarray) -> np.ndarray:
+        w = self._benchmark_weights * np.asarray(live, dtype=np.float64).reshape(-1)
+        total = float(w.sum())
+        if total > 1e-12:
+            return w / total
+        n_live = int(np.sum(live > 0.5))
+        if n_live < 1:
+            return np.zeros(self.n_assets, dtype=np.float64)
+        out = np.zeros(self.n_assets, dtype=np.float64)
+        out[live > 0.5] = 1.0 / n_live
+        return out
+
+    def _benchmark_log_return_step(self, t: int, live: np.ndarray) -> float:
+        """Cap-weight benchmark log return with same friction model as ``portfolio_step_nav``."""
+        w_tgt = self._benchmark_weights_live(live)
+        nav_pre = max(self._bench_nav, 1e-12)
+        nav_next = portfolio_step_nav(
+            nav_pre,
+            self.ohlcv,
+            t,
+            w_tgt,
+            prev_weights=self._bench_w_prev,
+            slippage=self._asset_slippage,
+            tx_fee=self._asset_tx_fee,
+            daily_holding=self._daily_holding_cost,
+            fee_scale=self.fee_scale,
+            asset_live=self.asset_live,
+        )
+        self._bench_nav = nav_next
+        self._bench_w_prev = w_tgt.copy()
+        return float(np.log(max(nav_next, 1e-12) / nav_pre))
 
     def _rebalance(self, price: np.ndarray, target_w: np.ndarray) -> float:
         """Execute trades at given prices with per-asset slippage and fees.
@@ -526,24 +673,33 @@ class MultiAssetPortfolioEnv(gym.Env):
             self._units[i] -= sell_u
             turnover += sell_u * price[i]
 
-        for i in np.argsort(-delta):
-            du = delta[i]
-            if du <= 1e-12:
-                continue
-            cost_rate = (self._asset_slippage[i] + self._asset_tx_fee[i]) * fs
-            unit_cost = price[i] * (1.0 + cost_rate)
-            buy_u = min(du, max(0.0, self._cash / (unit_cost + 1e-12)))
-            if buy_u <= 1e-12:
-                continue
-            self._cash -= buy_u * unit_cost
-            self._units[i] += buy_u
-            turnover += buy_u * price[i]
+        buy_idxs = np.where(delta > 1e-12)[0]
+        if buy_idxs.size > 0:
+            du = delta[buy_idxs]
+            cost_rate = (self._asset_slippage[buy_idxs] + self._asset_tx_fee[buy_idxs]) * fs
+            unit_cost = price[buy_idxs] * (1.0 + cost_rate)
+            need = du * unit_cost
+            buy_cash_need = float(need.sum())
+            scale = (
+                min(1.0, max(0.0, self._cash / (buy_cash_need + 1e-12)))
+                if buy_cash_need > 1e-12
+                else 1.0
+            )
+            buy_u = du * scale
+            filled = buy_u > 1e-12
+            if np.any(filled):
+                idx_f = buy_idxs[filled]
+                bu = buy_u[filled]
+                uc = unit_cost[filled]
+                self._cash -= float((bu * uc).sum())
+                self._units[idx_f] += bu
+                turnover += float((bu * price[idx_f]).sum())
 
         self._units = np.maximum(self._units, 0.0)
         return turnover / max(nav, 1e-12)
 
     def _apply_holding_costs(self, close: np.ndarray) -> float:
-        """Deduct daily holding costs (expense ratios, roll costs) from cash."""
+        """Deduct daily holding on pre-rebalance units (call before ``_rebalance``)."""
         position_values = self._units * close
         notional = np.abs(position_values)
         daily_costs = notional * self._daily_holding_cost * self.fee_scale
@@ -575,6 +731,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._steps = 0
         self._return_buffer = []
         self._market_return_buffer = []
+        self._bench_nav = 1.0
+        self._bench_w_prev = None
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
         self._smoothed_action = None
@@ -592,12 +750,16 @@ class MultiAssetPortfolioEnv(gym.Env):
             else:
                 self.fee_scale = self._fee_scale_default
 
+        panel_end = self._max_t + 2
+        self._current_seg_end = panel_end
+
         if not self.random_start and self._segments is not None:
             # Deterministic eval: one episode per segment, full contiguous block.
             seg_idx = self._reset_count % len(self._segments)
             earliest, seg_end = self._segments[seg_idx]
+            self._current_seg_end = seg_end
             self._t = earliest
-            bars_left = seg_end - self._t - 2
+            bars_left = seg_end - self._t - 1
             self._current_ep_max_steps = max(bars_left, 1)
             self._reset_count += 1
         elif self.random_start:
@@ -614,11 +776,13 @@ class MultiAssetPortfolioEnv(gym.Env):
                 probs = [s / total for s in sizes]
                 seg_idx = int(self._rng.choice(len(sizes), p=probs))
                 earliest, seg_end = self._segments[seg_idx]
-                latest = seg_end - 2
+                self._current_seg_end = seg_end
+                min_run = self.MIN_EPISODE_TRAIN_BARS
+                latest = max(earliest, seg_end - 2 - min_run)
                 self._t = int(self._rng.integers(earliest, latest + 1))
-                bars_left = seg_end - self._t - 2
+                bars_left = seg_end - self._t - 1
                 self._current_ep_max_steps = min(self._current_ep_max_steps, bars_left)
-                self._current_ep_max_steps = max(self._current_ep_max_steps, 1)
+                self._current_ep_max_steps = max(self._current_ep_max_steps, min_run)
             else:
                 self._t = self._min_t
         elif self.random_start:
@@ -651,7 +815,12 @@ class MultiAssetPortfolioEnv(gym.Env):
         v_pre = max(self._nav(close_t), 1e-12)
 
         open_next = self.ohlcv[self._t + 1, :, 0]
-        w = portfolio_weights_from_action(action_for_weights, n_actions=self.n_actions)
+        live_t = self.asset_live[max(self._t - self.obs_lag, 0)]
+        w = portfolio_weights_from_action(
+            action_for_weights,
+            n_actions=self.n_actions,
+            asset_live=live_t,
+        )
         rwd = self._reward_cfg
         # Scale churn with live VIX (same series as obs macro block; undifferenced close).
         current_vix = float(self.macro[self._t, MACRO_VIX_INDEX])
@@ -661,26 +830,27 @@ class MultiAssetPortfolioEnv(gym.Env):
             )
         else:
             vix_multiplier = 1.0
-        active_churn_lambda = rwd.churn_lambda * vix_multiplier * self._churn_scale
-        dw = w[1:] - self._prev_target_w[1:]
-        weight_turnover = float(np.sum(np.abs(dw))) / max(self.n_assets, 1)
-        churn = active_churn_lambda * weight_turnover
+        active_churn_scale = vix_multiplier * self._churn_scale
+        # Holding on pre-rebalance units at close[t] (matches portfolio_step_nav w_prev).
+        self._apply_holding_costs(close_t)
+        turnover_frac = self._rebalance(open_next, w)
         self._prev_target_w = w.copy()
 
-        turnover_frac = self._rebalance(open_next, w)
-
         close_next = self.ohlcv[self._t + 1, :, 3]
-        self._apply_holding_costs(close_next)
         v_next = max(self._nav(close_next), 1e-12)
 
         peak_before = self._episode_peak_nav
 
         log_ret = float(np.log(v_next / v_pre))
-        clipped_ret = float(np.clip(log_ret, -rwd.max_step_log_return, rwd.max_step_log_return))
+        clipped_ret = float(
+            np.clip(
+                log_ret,
+                rwd.max_step_log_return_downside,
+                rwd.max_step_log_return,
+            )
+        )
 
-        # Cap-weighted passive benchmark (SPY-heavy; config benchmark_cap_weights)
-        asset_log_rets = np.log((close_next + 1e-12) / (close_t + 1e-12))
-        market_ret = float(np.dot(self._benchmark_weights, asset_log_rets))
+        market_ret = self._benchmark_log_return_step(self._t, live_t)
         self._return_buffer.append(log_ret)
         self._market_return_buffer.append(market_ret)
 
@@ -689,26 +859,26 @@ class MultiAssetPortfolioEnv(gym.Env):
         reward = return_component
 
         sortino_component = 0.0
-        if len(self._return_buffer) >= rwd.risk_window:
-            def _sortino(rets: np.ndarray) -> float:
-                m = float(rets.mean())
-                ds = rets[rets < 0]
-                dv = float(np.sqrt((ds ** 2).mean())) if len(ds) > 1 else 1e-8
-                return m / (dv + 1e-8)
-
-            agent_s = _sortino(np.array(self._return_buffer[-rwd.risk_window:]))
-            market_s = _sortino(np.array(self._market_return_buffer[-rwd.risk_window:]))
+        available_steps = len(self._return_buffer)
+        if available_steps >= rwd.sortino_min_steps:
+            active_lookback = min(available_steps, rwd.risk_window)
+            agent_s = self._compute_sortino(
+                np.array(self._return_buffer[-active_lookback:], dtype=np.float64)
+            )
+            market_s = self._compute_sortino(
+                np.array(self._market_return_buffer[-active_lookback:], dtype=np.float64)
+            )
             diff = float(np.clip(agent_s - market_s, -3.0, 3.0))
             sortino_component = diff * rwd.risk_bonus_scale
             reward += sortino_component
 
         cash_frac = self._cash / max(v_next, 1e-12)
         inact = self._inactivity_penalty_scale
-        inactivity_component = 0.0
-        if cash_frac > 0.50:
-            inactivity_component += rwd.inactivity_penalty_over_50 * inact
+        inactivity_component = float(cash_frac * rwd.inactivity_penalty_over_50 * inact)
         if cash_frac > 0.90:
-            inactivity_component += rwd.inactivity_penalty_over_90 * inact
+            inactivity_component += float(
+                ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90 * inact
+            )
         reward -= inactivity_component
 
         gross_exposure = float(np.sum(w[1:]))
@@ -717,7 +887,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         )
         reward += participation_component
 
-        churn_component = churn * rwd.churn_penalty_scale
+        churn_component = turnover_frac * active_churn_scale * rwd.churn_penalty
         reward -= churn_component
 
         dd_frac = max(0.0, (peak_before - v_next) / max(peak_before, 1e-12))
@@ -733,7 +903,12 @@ class MultiAssetPortfolioEnv(gym.Env):
         terminated = bool(
             v_next <= self._env_cfg.stop_loss_fraction * self._episode_start_nav
         )
-        truncated = bool(self._t >= self._max_t or self._steps >= self._current_ep_max_steps)
+        seg_bar_limit = self._current_seg_end - 1
+        truncated = bool(
+            self._t >= self._max_t
+            or self._t >= seg_bar_limit
+            or self._steps >= self._current_ep_max_steps
+        )
 
         info: Dict[str, Any] = {
             "nav": v_next,
@@ -748,9 +923,8 @@ class MultiAssetPortfolioEnv(gym.Env):
             "rew_decomp/drawdown": -drawdown_component,
         }
 
-        if terminated or truncated or self._t > self._max_t:
-            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-        else:
-            obs = self._build_obs()
+        obs = self._build_obs()
+        if terminated or truncated:
+            info["terminal_observation"] = obs
 
         return obs, reward, terminated, truncated, info

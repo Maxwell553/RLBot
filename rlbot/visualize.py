@@ -21,6 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from stable_baselines3.common.callbacks import BaseCallback
 
+from rlbot.modal_cloud import mark_plot_saved
+
 
 def _rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
     if len(x) < window or window < 2:
@@ -237,6 +239,15 @@ def _plot_equity_drawdown_benchmarks(
         ens = np.asarray(nav_stochastic_ensemble, dtype=np.float64)
         if ens.shape[1] == len(nav_model):
             eq_paths = ens / np.maximum(ens[:, :1], 1e-12)
+            for path_eq in eq_paths:
+                ax_eq.plot(
+                    t,
+                    path_eq,
+                    color=COLOR_MODEL,
+                    lw=0.45,
+                    alpha=0.18,
+                    zorder=z,
+                )
             p5 = np.percentile(eq_paths, 5, axis=0)
             p50 = np.percentile(eq_paths, 50, axis=0)
             p95 = np.percentile(eq_paths, 95, axis=0)
@@ -402,7 +413,7 @@ def plot_backtest_dashboard(
         axes[2].text(0.5, 0.5, "No weight history", ha="center", va="center", transform=axes[2].transAxes)
 
     axes[2].set_xlabel("time (UTC)")
-    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate(rotation=22)
 
     fig.savefig(save_path, dpi=140)
@@ -539,6 +550,7 @@ class TrainingVizCallback(BaseCallback):
             save_path=self.plot_path,
         )
         self._save_episode_history()
+        mark_plot_saved(self.plot_path)
 
 
 def open_plot_file(path: str | Path) -> None:

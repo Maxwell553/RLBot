@@ -10,8 +10,11 @@ from rlbot.data_utils import (
     N_MACRO,
     MACRO_TICKERS,
     _hy_oas_proxy_pct,
+    compute_feature_panel,
     compute_trend_signals,
     fracdiff_weights,
+    WalkforwardEnvPack,
+    train_test_split_alternating,
 )
 from rlbot.rl_config import (
     UNIVERSE_MAX_ASSETS,
@@ -97,18 +100,52 @@ def test_trend_signals_shape() -> None:
     assert np.all(np.isfinite(trend[-1]))
 
 
+def _mock_ohlcv(bars: int, n_assets: int) -> np.ndarray:
+    ohlcv = np.zeros((bars, n_assets, 5), dtype=np.float64)
+    ohlcv[:, :, 3] = np.cumsum(np.random.rand(bars, n_assets) * 0.01, axis=0) + 100.0
+    ohlcv[:, :, 0] = ohlcv[:, :, 3] * 0.999
+    return ohlcv
+
+
 def test_portfolio_step_simple_return_identity() -> None:
     from rlbot.baselines import portfolio_step_nav
 
     n_assets = get_config().universe.n_assets
-    t = 30
-    close = np.cumsum(np.random.rand(t, n_assets) * 0.01, axis=0) + 100.0
+    ohlcv = _mock_ohlcv(40, n_assets)
     w = np.full(n_assets, 1.0 / n_assets)
     prev = 100_000.0
-    nav_next = portfolio_step_nav(prev, close, 10, 11, w)
-    log_r = np.log((close[11] + 1e-12) / (close[10] + 1e-12))
-    expected = prev * (1.0 + float(np.dot(w, np.expm1(log_r))))
+    t = 10
+    nav_next = portfolio_step_nav(prev, ohlcv, t, w)
+    close_pre = ohlcv[t, :, 3]
+    open_n = ohlcv[t + 1, :, 0]
+    close_n = ohlcv[t + 1, :, 3]
+    r_on = np.expm1(np.log((open_n + 1e-12) / (close_pre + 1e-12)))
+    r_id = np.expm1(np.log((close_n + 1e-12) / (open_n + 1e-12)))
+    expected = prev * (1.0 + float(np.dot(w, r_on))) * (1.0 + float(np.dot(w, r_id)))
     assert nav_next == pytest.approx(expected)
+
+
+def test_portfolio_step_friction_lowers_nav_vs_frictionless() -> None:
+    from rlbot.baselines import _transaction_cost_arrays, portfolio_step_nav
+
+    n_assets = get_config().universe.n_assets
+    ohlcv = _mock_ohlcv(50, n_assets)
+    w = np.full(n_assets, 1.0 / n_assets)
+    slip, fee, hold = _transaction_cost_arrays(n_assets)
+    prev = 100_000.0
+    t = 10
+    free = portfolio_step_nav(prev, ohlcv, t, w)
+    costly = portfolio_step_nav(
+        prev,
+        ohlcv,
+        t,
+        w,
+        prev_weights=w,
+        slippage=slip,
+        tx_fee=fee,
+        daily_holding=hold,
+    )
+    assert costly < free
 
 
 def test_equal_weight_buyhold_nav_length() -> None:
@@ -125,6 +162,37 @@ def test_equal_weight_buyhold_nav_length() -> None:
     assert len(ew) == len(navs)
     assert len(spy) == len(navs)
     assert ew[0] == pytest.approx(navs[0])
+
+
+def test_risk_parity_ignores_pre_ipo_flat_assets() -> None:
+    from rlbot.baselines import naive_risk_parity_nav
+
+    n_assets = 4
+    bars = 80
+    ohlcv = np.zeros((bars, n_assets, 5), dtype=np.float64)
+    ohlcv[:, :, 3] = 100.0
+    ohlcv[:, :, 0] = 100.0
+    ohlcv[40:, 1, 3] = np.linspace(100.0, 110.0, bars - 40)
+    ohlcv[40:, 1, 0] = ohlcv[40:, 1, 3]
+    ohlcv[40:, 2, 3] = np.linspace(100.0, 105.0, bars - 40) + np.random.default_rng(1).normal(
+        0, 0.5, bars - 40
+    )
+    ohlcv[40:, 2, 0] = ohlcv[40:, 2, 3]
+    live = np.zeros((bars, n_assets), dtype=np.float64)
+    live[40:, 1] = 1.0
+    live[40:, 2] = 1.0
+    live[:40, 2] = 0.0
+    navs = np.full(20, 100_000.0)
+    nav_rp = naive_risk_parity_nav(
+        navs,
+        ohlcv,
+        start_bar=35,
+        asset_live=live,
+        lookback=10,
+        apply_costs=False,
+    )
+    assert len(nav_rp) == len(navs)
+    assert np.isfinite(nav_rp).all()
 
 
 def test_balanced_6040_and_risk_parity_nav() -> None:
@@ -144,3 +212,139 @@ def test_balanced_6040_and_risk_parity_nav() -> None:
     assert len(nav_rp) == len(navs)
     assert nav_6040[0] == pytest.approx(100_000.0)
     assert nav_rp[0] == pytest.approx(100_000.0)
+
+
+def test_realized_vol_panel_matches_env_on_the_fly() -> None:
+    from rlbot.trading_env import MultiAssetPortfolioEnv
+
+    n = 120
+    n_assets = get_config().universe.n_assets
+    n_macro = N_MACRO
+    idx = pd.date_range("2018-01-01", periods=n, freq="B")
+    ohlcv = np.cumsum(np.random.default_rng(1).normal(0, 0.01, (n, n_assets, 5)), axis=0) + 100.0
+    ohlcv[:, :, 3] = np.maximum(ohlcv[:, :, 3], 1.0)
+    macro = np.full((n, n_macro), 10.0, dtype=np.float64)
+    _, _, _, _, _, avol, mvol = compute_feature_panel(ohlcv, macro, lookback=20)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        np.full((n, n_assets), 50.0),
+        np.zeros((n, n_assets)),
+        macro=macro,
+        fracdiff=np.zeros((n, n_assets)),
+        fracdiff_macro=np.zeros((n, n_macro)),
+        trend=np.zeros((n, n_assets)),
+        asset_realized_vol=avol,
+        macro_realized_vol=mvol,
+        random_start=False,
+        domain_randomize=False,
+    )
+    t = 60
+    assert np.allclose(env._asset_vol_panel[t], env._realized_vol(t), rtol=0, atol=1e-9)
+    assert np.allclose(env._macro_vol_panel[t], env._macro_realized_vol(t), rtol=0, atol=1e-9)
+
+
+def test_hy_proxy_calibration_uses_only_past_overlap() -> None:
+    from rlbot.data_utils import _calibrate_hy_proxy_expanding
+
+    n = 80
+    proxy = np.linspace(3.0, 5.0, n)
+    fred = np.full(n, np.nan)
+    fred[40:] = proxy[40:] * 2.0 + 1.0
+    out = _calibrate_hy_proxy_expanding(proxy, fred, min_overlap=10)
+    assert np.isfinite(out[39])
+    assert abs(out[39] - proxy[39]) < 1e-6
+    assert abs(out[-1] - fred[-1]) < 0.05
+
+
+def test_walkforward_pack_env_kwargs_feature_order() -> None:
+    """Pack maps macro before fracdiff (matches MultiAssetPortfolioEnv keyword layout)."""
+    n = 400
+    n_assets = 3
+    n_macro = N_MACRO
+    idx = pd.date_range("2015-01-01", periods=n, freq="B")
+    ohlcv = np.ones((n, n_assets, 5), dtype=np.float64) * 100.0
+    macro = np.full((n, n_macro), 7.0, dtype=np.float64)
+    fd = np.full((n, n_assets), 3.0, dtype=np.float64)
+    pack = WalkforwardEnvPack(
+        idx,
+        ohlcv,
+        np.zeros((n, n_assets)),
+        np.zeros((n, n_assets)),
+        macro,
+        fd,
+        np.zeros((n, n_macro)),
+        np.zeros((n, n_assets)),
+        np.zeros((n, n_assets)),
+        np.zeros((n, n_macro)),
+        [],
+        np.ones((n, n_assets)),
+    )
+    kw = pack.env_kwargs()
+    assert kw["macro"] is macro
+    assert kw["fracdiff"] is fd
+    assert np.all(kw["macro"] == 7.0)
+    assert np.all(kw["fracdiff"] == 3.0)
+
+
+def test_train_test_split_accepts_precomputed_features() -> None:
+    n = 400
+    n_assets = 3
+    n_macro = N_MACRO
+    idx = pd.date_range("2015-01-01", periods=n, freq="B")
+    ohlcv = np.ones((n, n_assets, 5), dtype=np.float64) * 100.0
+    macro = np.zeros((n, n_macro), dtype=np.float64)
+    live = np.ones((n, n_assets), dtype=np.float64)
+    sentinel = np.full((n, n_assets), 99.0, dtype=np.float64)
+    train_pack, _ = train_test_split_alternating(
+        idx,
+        ohlcv,
+        macro,
+        asset_live=live,
+        block_size=126,
+        eval_stride=4,
+        rsi=sentinel,
+        macd=sentinel,
+        fracdiff=sentinel,
+        fracdiff_macro=np.zeros((n, n_macro)),
+        trend=sentinel,
+        asset_vol=sentinel,
+        macro_vol=np.zeros((n, n_macro)),
+    )
+    assert np.all(train_pack[2] == 99.0)
+
+
+def test_risk_parity_vol_uses_decision_bar_not_settlement() -> None:
+    from rlbot.baselines import _risk_parity_weights, realized_vol_at_bar
+
+    bars = 50
+    n_assets = 2
+    close = np.ones((bars, n_assets), dtype=np.float64) * 100.0
+    close[30:, 0] = np.linspace(100.0, 120.0, bars - 30)
+    close[30:, 1] = 100.0
+    t = 35
+    lookback = 5
+    vol_t = realized_vol_at_bar(close, t, lookback)
+    vol_tp1 = realized_vol_at_bar(close, t + 1, lookback)
+    assert vol_t[0] > vol_tp1[0] or not np.isclose(vol_t[0], vol_tp1[0])
+
+
+def test_train_test_split_slices_global_fracdiff_panel() -> None:
+    """Block slices must match continuous feature panel (no per-block cold start)."""
+    n = 400
+    n_assets = 4
+    n_macro = N_MACRO
+    idx = pd.date_range("2010-01-01", periods=n, freq="B")
+    ohlcv = np.zeros((n, n_assets, 5), dtype=np.float64)
+    ohlcv[:, :, 3] = np.cumsum(np.random.default_rng(0).normal(0, 0.01, (n, n_assets)), axis=0) + 100.0
+    ohlcv[:, :, 0] = ohlcv[:, :, 3] * 0.999
+    macro = np.full((n, n_macro), 10.0, dtype=np.float64)
+    live = np.ones((n, n_assets), dtype=np.float64)
+
+    _, _, fd_g, _, _, avol_g, _ = compute_feature_panel(ohlcv, macro)
+    train_pack, _ = train_test_split_alternating(
+        idx, ohlcv, macro, asset_live=live, block_size=126, eval_stride=4
+    )
+    tr_idx, tr_fd = train_pack[0], train_pack[5]
+    assert len(tr_idx) > 126
+    assert np.any(np.abs(tr_fd[30]) > 1e-6)
+    assert np.allclose(tr_fd[30], fd_g[30], rtol=0, atol=1e-9)

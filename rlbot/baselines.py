@@ -1,8 +1,9 @@
 """
 Passive OOS benchmark NAV paths (buy-and-hold style).
 
-Multi-asset portfolios combine **simple** returns cross-sectionally each day
-(``w · (exp(r_log) - 1)``), then compound — not a linear mix of asset log returns.
+Execution matches ``MultiAssetPortfolioEnv``: MTM at ``close[t]``, rebalance at
+``open[t+1]``, mark at ``close[t+1]``. Multi-asset books aggregate **simple**
+returns cross-sectionally, then compound.
 """
 
 from __future__ import annotations
@@ -11,26 +12,159 @@ import numpy as np
 import pandas as pd
 
 from rlbot.data_utils import benchmark_ohlcv_index, resolve_tickers
+from rlbot.rl_config import get_config
 
 DEFAULT_VOL_LOOKBACK = 20
 
 
+def _live_mask(
+    asset_live: np.ndarray | None,
+    t: int,
+    n_assets: int,
+) -> np.ndarray:
+    """Boolean mask of tradeable assets at bar ``t`` (excludes pre-IPO / flat bfill rows)."""
+    if asset_live is None:
+        return np.ones(n_assets, dtype=bool)
+    row = np.asarray(asset_live[t], dtype=np.float64).reshape(-1)
+    if row.shape[0] != n_assets:
+        raise ValueError(f"asset_live[{t}] must have length {n_assets}, got {row.shape[0]}")
+    return row > 0.5
+
+
+def _weights_on_live(weights: np.ndarray, live: np.ndarray) -> np.ndarray:
+    """Zero dead assets and renormalize to a fully invested risky book."""
+    w = np.asarray(weights, dtype=np.float64).reshape(-1) * live.astype(np.float64)
+    total = float(w.sum())
+    if total > 1e-12:
+        return w / total
+    n_live = int(live.sum())
+    if n_live < 1:
+        return np.zeros_like(w)
+    out = np.zeros_like(w)
+    out[live] = 1.0 / n_live
+    return out
+
+
+def _transaction_cost_arrays(n_assets: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    tc = get_config().transaction_costs
+    slip = tc.slippage_array()
+    fee = tc.tx_fee_array()
+    hold = tc.daily_holding_cost_array()
+    if slip.shape[0] != n_assets:
+        raise ValueError(f"slippage length {slip.shape[0]} != n_assets {n_assets}")
+    return slip, fee, hold
+
+
 def portfolio_step_nav(
     prev_nav: float,
-    close: np.ndarray,
-    t_prev: int,
-    t_curr: int,
+    ohlcv: np.ndarray,
+    t: int,
     weights: np.ndarray,
+    *,
+    prev_weights: np.ndarray | None = None,
+    slippage: np.ndarray | None = None,
+    tx_fee: np.ndarray | None = None,
+    daily_holding: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    asset_live: np.ndarray | None = None,
 ) -> float:
-    """One step: simple-return aggregation, then NAV compound."""
-    n_assets = close.shape[1]
-    w = np.asarray(weights, dtype=np.float64).reshape(-1)
-    if w.shape[0] != n_assets:
-        raise ValueError(f"weights must have length {n_assets}, got {w.shape[0]}")
-    asset_log_rets = np.log((close[t_curr] + 1e-12) / (close[t_prev] + 1e-12))
-    simple_rets = np.expm1(asset_log_rets)
-    port_simple_ret = float(np.dot(w, simple_rets))
-    return float(prev_nav * (1.0 + port_simple_ret))
+    """
+    One step aligned with the RL env at decision bar ``t``.
+
+    Overnight return on ``prev_weights`` (close[t] → open[t+1]), rebalance at
+    open[t+1], then intraday return on ``weights`` (open[t+1] → close[t+1]).
+    """
+    n_assets = ohlcv.shape[1]
+    live = _live_mask(asset_live, t, n_assets)
+    w_tgt = _weights_on_live(
+        np.asarray(weights, dtype=np.float64).reshape(-1), live
+    )
+    if w_tgt.shape[0] != n_assets:
+        raise ValueError(f"weights must have length {n_assets}, got {w_tgt.shape[0]}")
+
+    close_pre = ohlcv[t, :, 3]
+    open_exec = ohlcv[t + 1, :, 0]
+    close_post = ohlcv[t + 1, :, 3]
+
+    if prev_weights is None:
+        w_prev = w_tgt.copy()
+    else:
+        w_prev = _weights_on_live(
+            np.asarray(prev_weights, dtype=np.float64).reshape(-1), live
+        )
+
+    log_on = np.log((open_exec + 1e-12) / (close_pre + 1e-12))
+    simple_on = np.expm1(log_on)
+
+    if slippage is None and tx_fee is None and daily_holding is None:
+        log_id = np.log((close_post + 1e-12) / (open_exec + 1e-12))
+        simple_id = np.expm1(log_id)
+        r_on = float(np.dot(w_prev, simple_on))
+        r_id = float(np.dot(w_tgt, simple_id))
+        return float(prev_nav * (1.0 + r_on) * (1.0 + r_id))
+
+    slip = np.zeros(n_assets) if slippage is None else np.asarray(slippage, dtype=np.float64)
+    fee = np.zeros(n_assets) if tx_fee is None else np.asarray(tx_fee, dtype=np.float64)
+    hold = np.zeros(n_assets) if daily_holding is None else np.asarray(daily_holding, dtype=np.float64)
+    fs = float(fee_scale)
+
+    holding_cost = float(prev_nav * np.dot(w_prev, hold) * fs)
+    nav_mid = max(prev_nav - holding_cost, 1e-12)
+    nav_mid = float(nav_mid * (1.0 + float(np.dot(w_prev, simple_on))))
+
+    gross = float(np.dot(w_prev, 1.0 + simple_on))
+    if gross > 1e-12:
+        w_drift = w_prev * (1.0 + simple_on) / gross
+    else:
+        w_drift = w_prev.copy()
+
+    delta = w_tgt - w_drift
+    trade_cost = float(np.sum(np.abs(delta) * nav_mid * (slip + fee) * fs))
+    nav_mid = max(nav_mid - trade_cost, 1e-12)
+
+    log_id = np.log((close_post + 1e-12) / (open_exec + 1e-12))
+    simple_id = np.expm1(log_id)
+    return float(nav_mid * (1.0 + float(np.dot(w_tgt, simple_id))))
+
+
+def _asset_vol_fully_warmed(
+    asset_live: np.ndarray | None,
+    t: int,
+    asset_i: int,
+    lookback: int,
+) -> bool:
+    """True when ``asset_i`` has a live print on every bar in the vol window through ``t``."""
+    if asset_live is None:
+        return True
+    window_start = max(t - lookback, 0)
+    window_len = t + 1 - window_start
+    return int(np.sum(asset_live[window_start : t + 1, asset_i] > 0.5)) >= window_len
+
+
+def _risk_parity_weights(
+    close: np.ndarray,
+    t: int,
+    lookback: int,
+    live: np.ndarray,
+    *,
+    asset_live: np.ndarray | None,
+    n_assets: int,
+) -> np.ndarray:
+    """Inverse-vol weights using only data available through decision bar ``t``."""
+    vol = realized_vol_at_bar(close, t, lookback)
+    inv = np.zeros(n_assets, dtype=np.float64)
+    live_idx = np.where(live)[0]
+    for i in live_idx:
+        if _asset_vol_fully_warmed(asset_live, t, int(i), lookback):
+            v = float(vol[i])
+        else:
+            warmed = vol[live]
+            v = float(np.mean(warmed[warmed > 1e-12])) if np.any(warmed > 1e-12) else 1.0
+        if v > 1e-12:
+            inv[i] = 1.0 / v
+    if float(inv.sum()) > 1e-12:
+        return inv / inv.sum()
+    return _weights_on_live(np.ones(n_assets), live)
 
 
 def realized_vol_at_bar(
@@ -55,6 +189,9 @@ def benchmark_buyhold_nav(
     *,
     tickers: list[str] | None = None,
     benchmark_col: int | None = None,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
 ) -> np.ndarray:
     """Benchmark sleeve buy-and-hold NAV aligned to model ``navs`` (length and start)."""
     col = (
@@ -64,27 +201,73 @@ def benchmark_buyhold_nav(
     )
     close = ohlcv_window[:, col, 3].astype(np.float64, copy=False)
     i0, i1 = int(start_bar), int(start_bar + len(navs) - 1)
-    s0 = max(close[i0], 1e-12)
-    return (close[i0 : i1 + 1] / s0) * float(navs[0])
+    n = len(navs)
+    out = np.empty(n, dtype=np.float64)
+    out[0] = float(navs[0])
+    if not apply_costs:
+        s0 = max(close[i0], 1e-12)
+        return (close[i0 : i1 + 1] / s0) * float(navs[0])
+
+    n_assets = ohlcv_window.shape[1]
+    slip, fee, hold = _transaction_cost_arrays(n_assets)
+    w = np.zeros(n_assets, dtype=np.float64)
+    w[col] = 1.0
+    prev_w = w.copy()
+    for k in range(1, n):
+        t = i0 + k - 1
+        out[k] = portfolio_step_nav(
+            out[k - 1],
+            ohlcv_window,
+            t,
+            w,
+            prev_weights=prev_w,
+            slippage=slip,
+            tx_fee=fee,
+            daily_holding=hold,
+            fee_scale=fee_scale,
+            asset_live=asset_live,
+        )
+        prev_w = w
+    return out
 
 
 def equal_weight_buyhold_nav(
     navs: np.ndarray,
     ohlcv_window: np.ndarray,
     start_bar: int,
+    *,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
 ) -> np.ndarray:
     """Equal-weight (1/N) daily-rebalanced passive book on all tradeable assets."""
     close = ohlcv_window[:, :, 3].astype(np.float64, copy=False)
     n_assets = close.shape[1]
     i0 = int(start_bar)
     n = len(navs)
-    w = np.full(n_assets, 1.0 / n_assets, dtype=np.float64)
+    slip = fee = hold = None
+    if apply_costs:
+        slip, fee, hold = _transaction_cost_arrays(n_assets)
     out = np.empty(n, dtype=np.float64)
     out[0] = float(navs[0])
+    prev_w = np.zeros(n_assets, dtype=np.float64)
     for k in range(1, n):
-        t_prev = i0 + k - 1
-        t_curr = i0 + k
-        out[k] = portfolio_step_nav(out[k - 1], close, t_prev, t_curr, w)
+        t = i0 + k - 1
+        live = _live_mask(asset_live, t, n_assets)
+        w = _weights_on_live(np.full(n_assets, 1.0 / max(int(live.sum()), 1)), live)
+        out[k] = portfolio_step_nav(
+            out[k - 1],
+            ohlcv_window,
+            t,
+            w,
+            prev_weights=prev_w,
+            slippage=slip,
+            tx_fee=fee,
+            daily_holding=hold,
+            fee_scale=fee_scale,
+            asset_live=asset_live,
+        )
+        prev_w = w.copy()
     return out
 
 
@@ -94,6 +277,10 @@ def balanced_6040_nav(
     start_bar: int,
     test_idx: pd.DatetimeIndex,
     tickers: list[str] | None = None,
+    *,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
 ) -> np.ndarray:
     """60% SP500 / 40% BOND10Y, rebalanced on the first bar of each calendar month."""
     close = ohlcv_window[:, :, 3].astype(np.float64, copy=False)
@@ -104,24 +291,42 @@ def balanced_6040_nav(
         raise KeyError("balanced_6040_nav requires BOND10Y in the tradeable universe")
     bond_i = active.index("BOND10Y")
     w = np.zeros(n_assets, dtype=np.float64)
-    w[spy_i] = 0.6
-    w[bond_i] = 0.4
+    slip = fee = hold = None
+    if apply_costs:
+        slip, fee, hold = _transaction_cost_arrays(n_assets)
     i0 = int(start_bar)
     n = len(navs)
     out = np.empty(n, dtype=np.float64)
     out[0] = float(navs[0])
     prev_month: tuple[int, int] | None = None
+    prev_w = np.zeros(n_assets, dtype=np.float64)
     for k in range(1, n):
-        t_prev = i0 + k - 1
-        t_curr = i0 + k
-        bar_ts = test_idx[t_curr]
+        t = i0 + k - 1
+        bar_ts = test_idx[t + 1]
         month_key = (int(bar_ts.year), int(bar_ts.month))
         if prev_month != month_key:
-            w = np.zeros(n_assets, dtype=np.float64)
-            w[spy_i] = 0.6
-            w[bond_i] = 0.4
+            raw = np.zeros(n_assets, dtype=np.float64)
+            raw[spy_i] = 0.6
+            raw[bond_i] = 0.4
+            live = _live_mask(asset_live, t, n_assets)
+            w = _weights_on_live(raw, live)
             prev_month = month_key
-        out[k] = portfolio_step_nav(out[k - 1], close, t_prev, t_curr, w)
+        else:
+            live = _live_mask(asset_live, t, n_assets)
+            w = _weights_on_live(w, live)
+        out[k] = portfolio_step_nav(
+            out[k - 1],
+            ohlcv_window,
+            t,
+            w,
+            prev_weights=prev_w,
+            slippage=slip,
+            tx_fee=fee,
+            daily_holding=hold,
+            fee_scale=fee_scale,
+            asset_live=asset_live,
+        )
+        prev_w = w.copy()
     return out
 
 
@@ -130,25 +335,46 @@ def naive_risk_parity_nav(
     ohlcv_window: np.ndarray,
     start_bar: int,
     lookback: int = DEFAULT_VOL_LOOKBACK,
+    *,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
 ) -> np.ndarray:
-    """Inverse-vol weights on all assets, daily rebalance, fully invested."""
+    """Inverse-vol weights on listed assets only, daily rebalance, fully invested."""
     close = ohlcv_window[:, :, 3].astype(np.float64, copy=False)
     n_assets = close.shape[1]
     i0 = int(start_bar)
     n = len(navs)
-    w_eq = np.full(n_assets, 1.0 / n_assets, dtype=np.float64)
+    slip = fee = hold = None
+    if apply_costs:
+        slip, fee, hold = _transaction_cost_arrays(n_assets)
     out = np.empty(n, dtype=np.float64)
     out[0] = float(navs[0])
+    prev_w = np.zeros(n_assets, dtype=np.float64)
     for k in range(1, n):
-        t_prev = i0 + k - 1
-        t_curr = i0 + k
-        vol = realized_vol_at_bar(close, t_curr, lookback)
-        if t_curr < lookback or not np.any(vol > 1e-12):
-            w = w_eq
-        else:
-            inv = 1.0 / np.maximum(vol, 1e-12)
-            w = inv / inv.sum()
-        out[k] = portfolio_step_nav(out[k - 1], close, t_prev, t_curr, w)
+        t = i0 + k - 1
+        live = _live_mask(asset_live, t, n_assets)
+        w = _risk_parity_weights(
+            close,
+            t,
+            lookback,
+            live,
+            asset_live=asset_live,
+            n_assets=n_assets,
+        )
+        out[k] = portfolio_step_nav(
+            out[k - 1],
+            ohlcv_window,
+            t,
+            w,
+            prev_weights=prev_w,
+            slippage=slip,
+            tx_fee=fee,
+            daily_holding=hold,
+            fee_scale=fee_scale,
+            asset_live=asset_live,
+        )
+        prev_w = w.copy()
     return out
 
 

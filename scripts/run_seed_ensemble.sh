@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train multiple RNG seeds with the same calendar/holdout flags (sequential).
 # Run IDs: <COHORT>_seed_<SEED>  (e.g. my_cohort_seed_42)
-# Pass holdout dates on the CLI (see RESEARCH.md); they are stored in each run manifest.
+# Pass holdout dates on the CLI (see docs/RESEARCH.md); they are stored in each run manifest.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
