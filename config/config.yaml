@@ -95,6 +95,8 @@ training:
   viz_freq: 500000
   curriculum_update_freq: 50000
   checkpoint_save_freq_steps: 1000000
+  reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
+  early_stop_patience: 0     # >0 → stop after K evals with no new best (after curriculum)
 
 vec_normalize:
   norm_obs: true
@@ -131,3 +133,8 @@ data:
   since: "2005-01-01"
   fracdiff_d: 0.4
   feature_purge_warmup: 25  # neutralize first N bars at each joined train/eval segment
+  # "continuous" (default): features precomputed on the contiguous panel then sliced
+  #   into train/eval blocks (matches continuous backtest memory; purge NOT applied).
+  # "independent": recompute features per segment + apply feature_purge_warmup, so the
+  #   eval-selection signal is not feature-state-contaminated by adjacent train blocks.
+  feature_split_mode: continuous

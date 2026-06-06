@@ -815,6 +815,7 @@ def train_test_split_alternating(
     eval_stride: int = 4,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     feature_purge_warmup: int = 25,
+    feature_split_mode: str = "continuous",
     *,
     rsi: np.ndarray | None = None,
     macd: np.ndarray | None = None,
@@ -831,14 +832,23 @@ def train_test_split_alternating(
     to train.  Both sets therefore span the full history and contain a mix of
     bull, bear, high-vol, and low-vol periods.
 
-    **Features** are sliced from the trainable timeline into blocks. Pass precomputed
-    ``rsi`` / ``macd`` / ``fracdiff`` / ``fracdiff_macro`` / ``trend`` (e.g. from
-    ``load_cache``) to avoid recomputing on every training launch; otherwise they are
-    built once via ``compute_feature_panel`` on ``ohlcv`` + ``macro``.
+    ``feature_split_mode`` controls how features reach the blocks:
+
+    - ``"continuous"`` (default): features are precomputed on the contiguous trainable
+      timeline and **sliced** into blocks. Pass precomputed ``rsi`` / ``macd`` /
+      ``fracdiff`` / ``fracdiff_macro`` / ``trend`` / ``asset_vol`` / ``macro_vol`` (e.g.
+      from ``load_cache``) to avoid recomputing on every launch; otherwise they are built
+      once via ``compute_feature_panel``. This matches continuous backtest memory, so
+      ``feature_purge_warmup`` is **not** applied (segment heads carry indicator state
+      continuous with the original timeline).
+    - ``"independent"``: features are **recomputed per contiguous segment** via
+      ``compute_feature_panel`` on that segment's ``ohlcv`` + ``macro`` only, then the
+      first ``feature_purge_warmup`` bars of each segment are neutralized via
+      ``_neutralize_feature_warmup``. Any precomputed feature arrays passed in are ignored.
+      Use this so the in-training eval-selection signal is not feature-state-contaminated
+      by adjacent train blocks.
 
     Block joins still set ``block_boundaries`` so episodes do not cross calendar gaps.
-
-    ``feature_purge_warmup`` is retained for API compatibility but is not applied.
 
     Contiguous same-label blocks are merged into *segments*.  ``block_boundaries``
     lists join indices so the environment can prevent episodes from spanning them.
@@ -860,29 +870,40 @@ def train_test_split_alternating(
 
     n_blocks = (n + block_size - 1) // block_size
 
-    precomputed = (rsi, macd, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol)
-    if all(x is not None for x in precomputed):
-        rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = precomputed  # type: ignore[misc]
-        for name, arr in (
-            ("rsi", rsi_g),
-            ("macd", macd_g),
-            ("fracdiff", fd_g),
-            ("fracdiff_macro", fdm_g),
-            ("trend", trend_g),
-            ("asset_vol", avol_g),
-            ("macro_vol", mvol_g),
-        ):
-            if arr.shape[0] != n:
-                raise ValueError(f"{name} length {arr.shape[0]} != timeline length {n}")
-    else:
-        if any(x is not None for x in precomputed):
-            raise ValueError(
-                "train_test_split_alternating: pass all of rsi, macd, fracdiff, "
-                "fracdiff_macro, trend, asset_vol, macro_vol, or none to recompute"
-            )
-        rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = compute_feature_panel(
-            ohlcv, macro, fracdiff_d=fracdiff_d
+    if feature_split_mode not in ("continuous", "independent"):
+        raise ValueError(
+            f"feature_split_mode must be 'continuous' or 'independent', got {feature_split_mode!r}"
         )
+    independent = feature_split_mode == "independent"
+
+    if independent:
+        # Per-segment recompute + purge happens inside _concat_ranges; ignore any
+        # precomputed continuous-panel features that were passed in.
+        rsi_g = macd_g = fd_g = fdm_g = trend_g = avol_g = mvol_g = None
+    else:
+        precomputed = (rsi, macd, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol)
+        if all(x is not None for x in precomputed):
+            rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = precomputed  # type: ignore[misc]
+            for name, arr in (
+                ("rsi", rsi_g),
+                ("macd", macd_g),
+                ("fracdiff", fd_g),
+                ("fracdiff_macro", fdm_g),
+                ("trend", trend_g),
+                ("asset_vol", avol_g),
+                ("macro_vol", mvol_g),
+            ):
+                if arr.shape[0] != n:
+                    raise ValueError(f"{name} length {arr.shape[0]} != timeline length {n}")
+        else:
+            if any(x is not None for x in precomputed):
+                raise ValueError(
+                    "train_test_split_alternating: pass all of rsi, macd, fracdiff, "
+                    "fracdiff_macro, trend, asset_vol, macro_vol, or none to recompute"
+                )
+            rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = compute_feature_panel(
+                ohlcv, macro, fracdiff_d=fracdiff_d
+            )
 
     train_ranges: List[Tuple[int, int]] = []
     eval_ranges: List[Tuple[int, int]] = []
@@ -909,6 +930,11 @@ def train_test_split_alternating(
         np.ndarray,
         List[int],
     ]:
+        if not ranges:
+            raise ValueError(
+                "train_test_split_alternating: empty block set (block_size too large or "
+                f"eval_stride too small for {n} bars); widen the date range or adjust split."
+            )
         idx_parts: List[pd.DatetimeIndex] = []
         ohlcv_parts: List[np.ndarray] = []
         live_parts: List[np.ndarray] = []
@@ -922,39 +948,60 @@ def train_test_split_alternating(
         mvol_parts: List[np.ndarray] = []
         boundaries: List[int] = []
         offset = 0
-        prev_orig_end: Optional[int] = None
-        segment_idx = 0
 
-        for orig_start, orig_end in ranges:
-            if prev_orig_end is not None and orig_start != prev_orig_end:
-                boundaries.append(offset)
+        if independent:
+            # Merge contiguous block ranges into segments, then recompute features per
+            # segment and neutralize the warmup so segment heads do not carry indicator
+            # state from blocks that were removed by the alternating split.
+            segments: List[List[int]] = []
+            for s, e in ranges:
+                if segments and segments[-1][1] == s:
+                    segments[-1][1] = e
+                else:
+                    segments.append([s, e])
+            for k, (seg_start, seg_end) in enumerate(segments):
+                if k > 0:
+                    boundaries.append(offset)
+                ohlcv_chunk = ohlcv[seg_start:seg_end]
+                macro_chunk = macro[seg_start:seg_end]
+                rsi_c, macd_c, fd_c, fdm_c, trend_c, avol_c, mvol_c = compute_feature_panel(
+                    ohlcv_chunk, macro_chunk, fracdiff_d=fracdiff_d
+                )
+                _neutralize_feature_warmup(
+                    rsi_c, macd_c, fd_c, fdm_c, feature_purge_warmup, trend=trend_c
+                )
+                idx_parts.append(index[seg_start:seg_end])
+                ohlcv_parts.append(ohlcv_chunk)
+                live_parts.append(asset_live[seg_start:seg_end])
+                rsi_parts.append(rsi_c)
+                macd_parts.append(macd_c)
+                macro_parts.append(macro_chunk)
+                fd_parts.append(fd_c)
+                fdm_parts.append(fdm_c)
+                trend_parts.append(trend_c)
+                avol_parts.append(avol_c)
+                mvol_parts.append(mvol_c)
+                offset += seg_end - seg_start
+        else:
+            prev_orig_end: Optional[int] = None
+            for orig_start, orig_end in ranges:
+                if prev_orig_end is not None and orig_start != prev_orig_end:
+                    boundaries.append(offset)
 
-            ohlcv_chunk = ohlcv[orig_start:orig_end]
-            live_chunk = asset_live[orig_start:orig_end]
-            macro_chunk = macro[orig_start:orig_end]
-            rsi_c = rsi_g[orig_start:orig_end]
-            macd_c = macd_g[orig_start:orig_end]
-            fd_c = fd_g[orig_start:orig_end]
-            fdm_c = fdm_g[orig_start:orig_end]
-            trend_c = trend_g[orig_start:orig_end]
-            avol_c = avol_g[orig_start:orig_end]
-            mvol_c = mvol_g[orig_start:orig_end]
-
-            chunk_len = orig_end - orig_start
-            idx_parts.append(index[orig_start:orig_end])
-            ohlcv_parts.append(ohlcv_chunk)
-            live_parts.append(live_chunk)
-            rsi_parts.append(rsi_c)
-            macd_parts.append(macd_c)
-            macro_parts.append(macro_chunk)
-            fd_parts.append(fd_c)
-            fdm_parts.append(fdm_c)
-            trend_parts.append(trend_c)
-            avol_parts.append(avol_c)
-            mvol_parts.append(mvol_c)
-            offset += chunk_len
-            prev_orig_end = orig_end
-            segment_idx += 1
+                ohlcv_chunk = ohlcv[orig_start:orig_end]
+                idx_parts.append(index[orig_start:orig_end])
+                ohlcv_parts.append(ohlcv_chunk)
+                live_parts.append(asset_live[orig_start:orig_end])
+                rsi_parts.append(rsi_g[orig_start:orig_end])
+                macd_parts.append(macd_g[orig_start:orig_end])
+                macro_parts.append(macro[orig_start:orig_end])
+                fd_parts.append(fd_g[orig_start:orig_end])
+                fdm_parts.append(fdm_g[orig_start:orig_end])
+                trend_parts.append(trend_g[orig_start:orig_end])
+                avol_parts.append(avol_g[orig_start:orig_end])
+                mvol_parts.append(mvol_g[orig_start:orig_end])
+                offset += orig_end - orig_start
+                prev_orig_end = orig_end
 
         cat_idx = idx_parts[0].append(idx_parts[1:]) if len(idx_parts) > 1 else idx_parts[0]
         cat_ohlcv = np.concatenate(ohlcv_parts, axis=0)

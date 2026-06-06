@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  torch-free-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install light deps (no torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas gymnasium pyyaml pytest
+      - name: Run torch-free test suite
+        run: |
+          pytest -q \
+            tests/test_core.py \
+            tests/test_environment.py \
+            tests/test_eval_segments.py \
+            tests/test_run_artifacts.py \
+            tests/test_block_bootstrap.py \
+            tests/test_docs_invariants.py \
+            tests/test_feature_split_modes.py \
+            tests/test_backtest_config_binding.py \
+            tests/test_reward_logging.py \
+            tests/test_backtest_small_universe.py \
+            tests/test_research_registry.py \
+            tests/test_infer_weights.py

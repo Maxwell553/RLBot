@@ -84,12 +84,16 @@ from rlbot.vecnorm_utils import sync_vecnormalize_stats
 from rlbot.run_artifacts import (
     DEFAULT_DATA_CACHE,
     RunPaths,
+    config_sha256,
+    git_provenance,
     new_run_id,
     resolve_data_cache,
+    sha256_file,
     snapshot_data_cache,
     write_manifest,
 )
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
+from rlbot.reward_logging import RewardDecompAccumulator
 from rlbot.modal_cloud import commit_modal_volumes
 from rlbot.visualize import TrainingVizCallback, open_plot_file
 
@@ -124,6 +128,7 @@ def _make_env_factory(
     obs_noise_std: float = 0.0,
     noise_scale: np.ndarray | None = None,
     reseed_on_reset: bool = False,
+    env_seed: int | None = None,
     obs_lag_default: int = 1,
     domain_randomize: bool = True,
     inactivity_penalty_scale: float = 1.0,
@@ -139,6 +144,7 @@ def _make_env_factory(
             obs_noise_std=obs_noise_std,
             noise_scale=noise_scale,
             reseed_on_reset=reseed_on_reset,
+            env_seed=env_seed,
             obs_lag=0,
             obs_lag_default=obs_lag_default,
             fee_scale_default=1.0,
@@ -166,6 +172,8 @@ class EvalNavBestModelCallback(EvalCallback):
         nav_history_path: Path,
         best_model_save_path: str,
         train_vec_env: VecNormalize | None = None,
+        patience: int = 0,
+        curriculum_end_step: int = 0,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
@@ -174,6 +182,10 @@ class EvalNavBestModelCallback(EvalCallback):
         self._nav_timesteps: list[int] = []
         self._mean_ending_nav: list[float] = []
         self._train_vec_env = train_vec_env
+        self.patience = int(patience)
+        self.curriculum_end_step = int(curriculum_end_step)
+        self._evals_since_best = 0
+        self.early_stop_reason: str | None = None
         self._load_nav_history()
         super().__init__(eval_env, best_model_save_path=None, **kwargs)
 
@@ -217,10 +229,22 @@ class EvalNavBestModelCallback(EvalCallback):
                 self.logger.record("eval/mean_ending_nav", mean_nav)
                 if mean_nav > self.best_mean_nav:
                     self.best_mean_nav = mean_nav
+                    self._evals_since_best = 0
                     if self.verbose >= 1:
                         print(f"New best mean ending NAV: {mean_nav:,.0f}")
                     self._best_model_dir.mkdir(parents=True, exist_ok=True)
                     self.model.save(str(self._best_model_dir / "best_model"))
+                elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
+                    # Patience early-stop, but only after the curriculum has fully released.
+                    self._evals_since_best += 1
+                    self.logger.record("eval/evals_since_best", self._evals_since_best)
+                    if self._evals_since_best >= self.patience:
+                        self.early_stop_reason = (
+                            f"no new best mean ending NAV for {self.patience} evals after "
+                            f"curriculum (step {self.num_timesteps})"
+                        )
+                        print(f"[train] early stop: {self.early_stop_reason}")
+                        return False
 
         return continue_training
 
@@ -494,6 +518,36 @@ class TradingCurriculumCallback(BaseCallback):
         return True
 
 
+class RewardDecompCallback(BaseCallback):
+    """Aggregate ``info['rew_decomp/*']`` → TensorBoard scalars + a windowed JSON snapshot.
+
+    Makes the reward balance observable (the review's asymmetry finding: inactivity
+    can dwarf participation/churn). Logs per-term means and share-of-absolute-reward over
+    the window since the last log, then resets, so ``reward_decomp.json`` reflects recent
+    (steady-state) behavior rather than a run-wide average. TB scalars give the time series.
+    """
+
+    def __init__(self, json_path, log_freq: int = 50_000):
+        super().__init__()
+        self.json_path = json_path
+        self.log_freq = max(int(log_freq), 1)
+        self._acc = RewardDecompAccumulator()
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos")
+        if infos:
+            self._acc.update(infos)
+        if self.n_calls % self.log_freq == 0 and self._acc.count > 0:
+            s = self._acc.summary()
+            for term, val in s["mean"].items():
+                self.logger.record(f"rew_decomp/mean/{term}", val)
+            for term, val in s["abs_share"].items():
+                self.logger.record(f"rew_decomp/abs_share/{term}", val)
+            write_manifest(self.json_path, {"timesteps": int(self.num_timesteps), **s})
+            self._acc.reset()  # windowed: next snapshot reflects the next interval only
+        return True
+
+
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default=str(ROOT / "config" / "config.yaml"))
@@ -755,20 +809,40 @@ def main() -> None:
     )
 
     purge = cfg.data.feature_purge_warmup
-    rsi_fit, macd_fit, fd_fit, fdm_fit, trend_fit, avol_fit, mvol_fit = align_panel_to_timeline(
-        idx,
-        idx_fit,
-        rsi,
-        macd,
-        fracdiff,
-        fracdiff_macro,
-        trend,
-        asset_vol,
-        macro_vol,
-    )
+    split_mode = cfg.data.feature_split_mode
     feat_src = "cache" if data_cache.is_file() and not args.refresh_data else "computed"
+    if split_mode == "independent":
+        # Per-segment recompute + purge happens inside the split; precomputed continuous
+        # features are not used.
+        feature_kwargs: dict = {}
+        feat_desc = f"independent split: per-segment recompute + purge={purge} applied"
+    else:
+        rsi_fit, macd_fit, fd_fit, fdm_fit, trend_fit, avol_fit, mvol_fit = align_panel_to_timeline(
+            idx,
+            idx_fit,
+            rsi,
+            macd,
+            fracdiff,
+            fracdiff_macro,
+            trend,
+            asset_vol,
+            macro_vol,
+        )
+        feature_kwargs = dict(
+            rsi=rsi_fit,
+            macd=macd_fit,
+            fracdiff=fd_fit,
+            fracdiff_macro=fdm_fit,
+            trend=trend_fit,
+            asset_vol=avol_fit,
+            macro_vol=mvol_fit,
+        )
+        feat_desc = (
+            f"continuous split: {feat_src} panel → block slice "
+            f"(purge={purge} unused; matches continuous backtest memory)"
+        )
     _startup_log(
-        f"[train] Walk-forward block split ({feat_src} features, "
+        f"[train] Walk-forward block split ({feat_desc}, "
         f"block={args.block_size}, stride={args.eval_stride})..."
     )
     train_pack, eval_pack = (
@@ -782,23 +856,15 @@ def main() -> None:
             eval_stride=args.eval_stride,
             fracdiff_d=cfg.data.fracdiff_d,
             feature_purge_warmup=purge,
-            rsi=rsi_fit,
-            macd=macd_fit,
-            fracdiff=fd_fit,
-            fracdiff_macro=fdm_fit,
-            trend=trend_fit,
-            asset_vol=avol_fit,
-            macro_vol=mvol_fit,
+            feature_split_mode=split_mode,
+            **feature_kwargs,
         )
     )
     train_idx = train_pack.idx
     eval_idx = eval_pack.idx
     train_boundaries = train_pack.block_boundaries
     eval_boundaries = eval_pack.block_boundaries
-    print(
-        f"  features: {feat_src} panel → block slice (purge={purge} unused); "
-        f"matches continuous backtest memory"
-    )
+    print(f"  features: {feat_desc}")
 
     if len(train_idx) < 200:
         raise RuntimeError(
@@ -811,6 +877,14 @@ def main() -> None:
         "n_assets": n_assets,
         "n_actions": n_actions,
         "obs_dim": obs_dim,
+    }
+
+    # Provenance shared by the pre- and post-training manifest writes.
+    provenance = {
+        "feature_split_mode": cfg.data.feature_split_mode,
+        "config_hash": config_sha256(cfg.to_dict()),
+        "data_cache_hash": sha256_file(paths.data_snapshot),
+        **git_provenance(),
     }
 
     write_manifest(
@@ -835,6 +909,7 @@ def main() -> None:
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
             "data_cache_snapshot": str(paths.data_snapshot),
+            **provenance,
         },
     )
 
@@ -853,7 +928,14 @@ def main() -> None:
         f"  network: RecurrentPPO MlpLstmPolicy — obs_dim={obs_dim}, "
         f"n_actions={n_actions} (cash+{n_assets} assets), LSTM 2×64 + MLP [128,128]"
     )
-    print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
+    _es_patience = int(cfg.training.early_stop_patience)
+    if _es_patience > 0:
+        print(
+            f"  early_stop: patience={_es_patience} evals after curriculum "
+            f"(else full {args.timesteps:,} timesteps); best_model by eval NAV"
+        )
+    else:
+        print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
     print(f"  trade bundle on exit: {paths.models_dir.name}/vec_normalize.pkl + copy → best/ (pair with best_model.zip)")
     print(f"  n_envs={args.n_envs}, n_steps={args.n_steps}, batch={args.batch_size}")
     rollout_size = int(args.n_steps) * int(args.n_envs)
@@ -948,6 +1030,12 @@ def main() -> None:
             max_t=int(train_pack.ohlcv.shape[0]) - 2,
         )
 
+    reproducible = bool(cfg.training.reproducible)
+    if reproducible:
+        _startup_log(
+            "[train] reproducible=True: deterministic per-env seed streams "
+            "(seed + env index); same-seed runs reproduce."
+        )
     train_env = SubprocVecEnv([
         _make_env_factory(
             train_pack,
@@ -957,7 +1045,8 @@ def main() -> None:
             monitor_stem=f"train_monitor_{i}",
             max_episode_steps=args.max_ep_steps,
             obs_noise_std=args.obs_noise,
-            reseed_on_reset=True,
+            reseed_on_reset=not reproducible,
+            env_seed=(int(args.seed) + i) if reproducible else None,
             obs_lag_default=args.obs_lag,
             domain_randomize=True,
             inactivity_penalty_scale=1.0,
@@ -1079,16 +1168,30 @@ def main() -> None:
         len(validation_segments) if validation_segments else tr_cfg.eval_n_episodes
     )
     n_validation_blocks = max(1, int(n_validation_blocks))
+    eval_coverage_bars = (
+        int(sum(max(0, seg_end - earliest - 1) for earliest, seg_end in validation_segments))
+        if validation_segments
+        else 0
+    )
     print(
         f"  eval: {n_validation_blocks} episode(s) = one full rollout per eval segment "
         f"(config eval_n_episodes={tr_cfg.eval_n_episodes} is fallback only)"
     )
-    # No StopTrainingOnNoModelImprovement: train for full --timesteps (eval still logs best_model)
+    print(
+        f"  eval coverage: {n_validation_blocks} segments / {eval_coverage_bars} scored bars "
+        f"(effective sample size of the deterministic eval-selection signal)"
+    )
+    # Patience early-stop is gated on curriculum completion (dr_widen_end); patience=0 keeps
+    # the full --timesteps budget (best_model still side-saved by eval NAV).
+    curriculum_end_step = dr_widen_end_milestone(args.timesteps)
+    early_stop_patience = int(tr_cfg.early_stop_patience)
     eval_callback = EvalNavBestModelCallback(
         eval_env,
         nav_history_path=paths.eval_nav_history,
         best_model_save_path=str(paths.best_model_dir),
         train_vec_env=train_env,
+        patience=early_stop_patience,
+        curriculum_end_step=curriculum_end_step,
         log_path=str(paths.eval_log_dir),
         eval_freq=eval_freq,
         n_eval_episodes=n_validation_blocks,
@@ -1103,7 +1206,11 @@ def main() -> None:
         save_vecnormalize=True,
     )
 
-    callbacks = [eval_callback, checkpoint_callback]
+    reward_decomp_callback = RewardDecompCallback(
+        json_path=paths.eval_log_dir / "reward_decomp.json",
+        log_freq=max(tr_cfg.curriculum_update_freq, 1),
+    )
+    callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
     if not args.resume:
         callbacks.insert(
             0,
@@ -1160,6 +1267,19 @@ def main() -> None:
     if learn_error is not None:
         raise learn_error
 
+    # Best eval-NAV checkpoint provenance for the manifest + training summary.
+    best_eval_nav = (
+        float(eval_callback.best_mean_nav)
+        if np.isfinite(eval_callback.best_mean_nav)
+        else None
+    )
+    best_eval_step = None
+    if eval_callback._mean_ending_nav and eval_callback._nav_timesteps:
+        i = int(np.argmax(np.asarray(eval_callback._mean_ending_nav)))
+        if i < len(eval_callback._nav_timesteps):
+            best_eval_step = int(eval_callback._nav_timesteps[i])
+    early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
+
     write_manifest(
         paths.manifest_path,
         {
@@ -1174,6 +1294,10 @@ def main() -> None:
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             "total_params": total_params,
             "trainable_params": trainable_params,
+            "best_eval_nav": best_eval_nav,
+            "best_eval_step": best_eval_step,
+            "early_stop_reason": early_stop_reason,
+            **provenance,
             "artifacts": {
                 "final_model": str(paths.final_model),
                 "best_model": str(paths.best_model_dir / "best_model.zip"),
@@ -1186,6 +1310,24 @@ def main() -> None:
                 "eval_npz": str(paths.eval_npz),
                 "eval_nav_history": str(paths.eval_nav_history),
             },
+        },
+    )
+
+    # Machine-readable training summary for the research registry / orchestrator.
+    write_manifest(
+        paths.run_meta_dir / "training_summary.json",
+        {
+            "run_id": run_id,
+            "timesteps": int(args.timesteps),
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "best_eval_nav": best_eval_nav,
+            "best_eval_step": best_eval_step,
+            "early_stop_reason": early_stop_reason,
+            "n_train_bars": int(len(train_idx)),
+            "n_eval_bars": int(len(eval_idx)),
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            **provenance,
         },
     )
 
