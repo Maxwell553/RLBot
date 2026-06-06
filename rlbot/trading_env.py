@@ -104,7 +104,18 @@ def portfolio_weights_from_action(
             break
 
     w[1:] = risky_w
-    return _enforce_long_only_simplex(w)
+    w = _enforce_long_only_simplex(w)
+    # Final projection: guarantee the per-asset cap post-condition for arbitrary
+    # cap/N (the 5-iteration redistribute above is best-effort). Park any residual
+    # excess in cash so the result stays a long-only simplex summing to 1.
+    risky = w[1:]
+    over = risky > max_w + 1e-9
+    if np.any(over):
+        excess = float(np.sum(risky[over] - max_w))
+        risky[over] = max_w
+        w[1:] = risky
+        w[0] += excess
+    return w
 
 
 class EpisodeEndNavRecorder(gym.Wrapper):
@@ -180,6 +191,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         max_episode_steps: int | None = None,
         obs_noise_std: float = 0.0,
         reseed_on_reset: bool = False,
+        env_seed: int | None = None,
         block_boundaries: Optional[list] = None,
         obs_lag: int = 0,
         obs_lag_default: int | None = None,
@@ -292,7 +304,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._episode_start_nav = self.initial_cash
         self._episode_peak_nav = self.initial_cash
         self._current_ep_max_steps = self.max_episode_steps
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(env_seed)
         self._reset_count = 0
         self._return_buffer: list[float] = []
         self._market_return_buffer: list[float] = []

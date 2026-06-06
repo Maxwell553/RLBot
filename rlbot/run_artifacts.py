@@ -147,6 +147,10 @@ class RunPaths:
     def data_snapshot(self) -> Path:
         return self.run_meta_dir / "data_cache.npz"
 
+    @property
+    def config_snapshot(self) -> Path:
+        return self.run_meta_dir / "config.yaml"
+
     def mkdirs(self) -> None:
         """Create the unified ``Runs/<run_id>/`` tree (always new layout)."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -190,3 +194,74 @@ def snapshot_data_cache(src: Path, dest: Path) -> None:
     if src.is_file():
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
+
+
+def resolve_run_data_cache(
+    run_id: str,
+    override: str | Path = "",
+    *,
+    root: Path = PROJECT_ROOT,
+    default: Path | None = None,
+) -> Path:
+    """Panel cache for a run: ``override`` > run-local snapshot > ``default``/global.
+
+    Lets a backtest stay reproducible from the run's own ``data_cache.npz`` even after
+    the global cache is refreshed. Raises if an explicit ``override`` is missing.
+    """
+    ov = str(override).strip()
+    if ov:
+        p = Path(ov)
+        if not p.is_file():
+            raise FileNotFoundError(f"data cache override not found: {p}")
+        return p
+    snap = RunPaths(run_id=run_id, root=root).data_snapshot
+    if snap.is_file():
+        return snap
+    return default if default is not None else resolve_data_cache()
+
+
+def sha256_file(path: Path | str) -> str | None:
+    """SHA-256 of a file's bytes (None if missing). Used for run provenance."""
+    import hashlib
+
+    p = Path(path)
+    if not p.is_file():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def config_sha256(config_dict: Mapping[str, Any]) -> str:
+    """Stable SHA-256 of a config dict (sorted keys) for run provenance."""
+    import hashlib
+
+    payload = json.dumps(dict(config_dict), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def git_provenance(root: Path = PROJECT_ROOT) -> dict[str, Any]:
+    """Best-effort ``{git_commit, git_dirty}`` (tolerates a non-git checkout)."""
+    import subprocess
+
+    def _run(cmd: list[str]) -> str | None:
+        # Best-effort: git may be absent or this may not be a repo. Narrow to OS / subprocess
+        # errors so a real bug here is not silently swallowed.
+        try:
+            out = subprocess.run(
+                cmd, cwd=str(root), capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip()
+
+    commit = _run(["git", "rev-parse", "HEAD"])
+    status = _run(["git", "status", "--porcelain"])
+    return {
+        "git_commit": commit,
+        "git_dirty": bool(status) if status is not None else None,
+    }

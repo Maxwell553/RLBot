@@ -133,6 +133,30 @@ def test_risky_mass_at_most_n_times_cap() -> None:
     assert float(w[1:].sum()) <= _N_ASSETS * cap + _CAP_TOL
 
 
+def test_cap_post_condition_across_caps_and_n() -> None:
+    """The final projection guarantees max risky ≤ cap for arbitrary cap and N."""
+    base = get_config()
+    rng = np.random.default_rng(7)
+    try:
+        for cap in (0.2, 0.35, 0.5):
+            set_config(
+                replace(base, environment=replace(base.environment, max_single_asset_weight=cap))
+            )
+            for n_assets in (5, 10, 23):
+                n_act = n_assets + 1
+                for _ in range(200):
+                    action = rng.uniform(-6.0, 6.0, size=n_act)
+                    w = portfolio_weights_from_action(action, n_actions=n_act)
+                    assert w.shape == (n_act,)
+                    assert np.all(w >= -_SIMPLEX_TOL)
+                    assert np.isclose(w.sum(), 1.0, atol=_SIMPLEX_TOL)
+                    assert np.all(w[1:] <= cap + _CAP_TOL), (
+                        f"cap={cap} N={n_assets} max={w[1:].max():.6f}"
+                    )
+    finally:
+        set_config(base)
+
+
 def test_portfolio_weights_variable_n_actions() -> None:
     w = portfolio_weights_from_action(np.zeros(4), n_actions=4)
     _assert_valid_weights(w, n_actions=4)

@@ -47,9 +47,13 @@ from rlbot.run_artifacts import (
     PROJECT_ROOT,
     RUNS_ROOT,
     RunPaths,
+    config_sha256,
     discover_run_ids_with_models,
+    git_provenance,
     read_run_manifest,
     resolve_data_cache,
+    resolve_run_data_cache,
+    sha256_file,
 )
 from rlbot.baselines import (
     balanced_6040_nav,
@@ -64,7 +68,11 @@ from rlbot.inference_load import (
     load_vec_normalize_for_inference,
     swap_recurrent_ppo_weights,
 )
-from rlbot.rl_config import get_config, observation_dim_for_universe
+from rlbot.rl_config import get_config, load_config, observation_dim_for_universe, set_config
+from rlbot.stats import (
+    block_bootstrap_sharpe_percentiles,
+    sharpe_ann_from_log_rets as _sharpe_ann_from_log_rets,
+)
 
 # Lazy-loaded in ensure_backtest_dependencies() (once per process).
 th = None
@@ -116,14 +124,44 @@ def ensure_backtest_dependencies() -> None:
     _bt_log(f"[backtest] Dependencies ready ({time.perf_counter() - t0:.1f}s).")
 
 
-def _get_shared_panel() -> tuple:
+def _get_shared_panel(cache_path: str | Path | None = None) -> tuple:
+    """Load a panel cache once per process, memoized per resolved path."""
     global _PANEL_CACHE
-    if _PANEL_CACHE is None:
-        _bt_log("[backtest] Loading market cache (once per process)...")
+    key = str(cache_path) if cache_path is not None else str(DATA_CACHE)
+    if not isinstance(_PANEL_CACHE, dict):
+        _PANEL_CACHE = {}
+    if key not in _PANEL_CACHE:
+        _bt_log(f"[backtest] Loading market cache (once per path): {key}")
         t0 = time.perf_counter()
-        _PANEL_CACHE = load_cache(str(DATA_CACHE))
+        _PANEL_CACHE[key] = load_cache(key)
         _bt_log(f"[backtest] Cache loaded ({time.perf_counter() - t0:.1f}s).")
-    return _PANEL_CACHE
+    return _PANEL_CACHE[key]
+
+
+def _resolve_run_data_cache(run_id: str, args: argparse.Namespace) -> Path:
+    """Cache path for a run: --data-cache > run-local snapshot > global cache."""
+    return resolve_run_data_cache(
+        run_id, getattr(args, "data_cache", ""), default=DATA_CACHE
+    )
+
+
+def _maybe_load_run_config(run_id: str, args: argparse.Namespace) -> None:
+    """Bind the run-local config snapshot for inference unless overridden.
+
+    With no snapshot, rebind to the fresh global default — otherwise, in a batch
+    (``--run-ids``), a run without a snapshot would silently inherit the *previous*
+    run's run-local config.
+    """
+    if getattr(args, "use_current_config", False):
+        _bt_log("[backtest] Using current global config (--use-current-config).")
+        return
+    snap = RunPaths(run_id).config_snapshot
+    if snap.is_file():
+        set_config(load_config(snap))
+        _bt_log(f"[backtest] Loaded run-local config snapshot: {snap}")
+    else:
+        set_config(load_config())  # fresh global default, no cross-run bleed
+        _bt_log(f"[backtest] No config snapshot at {snap}; using fresh global config.")
 
 
 def _clear_inference_policy_cache() -> None:
@@ -393,6 +431,10 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     manifest = read_run_manifest(run_id)
     if manifest is None:
         raise FileNotFoundError(f"Missing Runs/{run_id}/manifest.json")
+    # Bind the run's own config + data snapshot so OOS metrics are reproducible
+    # regardless of the current global config / cache (override with flags).
+    _maybe_load_run_config(run_id, args)
+    cache_path = _resolve_run_data_cache(run_id, args)
     model_path = _resolve_model_path_for_run(
         run_id,
         allow_latest_checkpoint=args.allow_latest_checkpoint,
@@ -421,9 +463,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             macro_vol,
             asset_live,
             cache_tickers,
-        ) = _get_shared_panel()
+        ) = _get_shared_panel(cache_path)
     else:
-        _bt_log("[backtest] Loading market cache...")
+        _bt_log(f"[backtest] Loading market cache: {cache_path}")
         (
             idx,
             ohlcv,
@@ -437,7 +479,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             macro_vol,
             asset_live,
             cache_tickers,
-        ) = load_cache(str(DATA_CACHE))
+        ) = load_cache(str(cache_path))
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     n_assets = int(ohlcv.shape[1])
     _assert_manifest_panel_compatible(manifest, panel_tickers, n_assets)
@@ -592,14 +634,17 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         nav_ew = equal_weight_buyhold_nav(
             navs, test_ohlcv, start_bar, asset_live=test_live
         )
-        nav_6040 = balanced_6040_nav(
-            navs,
-            test_ohlcv,
-            start_bar,
-            test_idx,
-            tickers=panel_tickers,
-            asset_live=test_live,
-        )
+        try:
+            nav_6040 = balanced_6040_nav(
+                navs,
+                test_ohlcv,
+                start_bar,
+                test_idx,
+                tickers=panel_tickers,
+                asset_live=test_live,
+            )
+        except KeyError:
+            nav_6040 = None  # universe missing SP500/BOND10Y sleeve; skip 60/40 on the plot
         nav_rp = naive_risk_parity_nav(
             navs, test_ohlcv, start_bar, asset_live=test_live
         )
@@ -625,12 +670,13 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         if args.show_viz:
             open_plot_file(out)
 
+    detailed_stats: dict | None = None
     if args.detailed and not getattr(args, "_ensemble_mode", False):
         _bt_log(
             f"[backtest] Detailed stats (bootstrap resamples={args.bootstrap_resamples})..."
         )
         t_det = time.perf_counter()
-        _print_detailed_stats(
+        detailed_stats = _print_detailed_stats(
             test_idx=test_idx,
             navs=navs,
             log_rets=log_rets,
@@ -645,7 +691,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         _bt_log(f"[backtest] Detailed stats done ({time.perf_counter() - t_det:.1f}s).")
 
     prefix = getattr(args, "ensemble_prefix", "") or ""
-    return BacktestResult(
+    result = BacktestResult(
         run_id=run_id,
         model_path=model_path,
         checkpoint_label=ckpt_label,
@@ -655,6 +701,42 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         n_bars=len(test_idx),
         seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
     )
+    _write_backtest_summary(result, args, detailed_stats, cache_path)
+    return result
+
+
+def _write_backtest_summary(
+    result: BacktestResult,
+    args: argparse.Namespace,
+    detailed: dict | None,
+    cache_path: Path,
+) -> None:
+    """Write a machine-readable per-run backtest summary (skipped in ensemble mode)."""
+    if getattr(args, "_ensemble_mode", False):
+        return
+    from dataclasses import asdict
+
+    cfg = get_config()
+    payload = {
+        **asdict(result),
+        "config_path": str(cfg.path),
+        "config_hash": config_sha256(cfg.to_dict()),
+        "data_cache_path": str(cache_path),
+        "data_cache_hash": sha256_file(cache_path),
+        "feature_split_mode": cfg.data.feature_split_mode,
+        **git_provenance(),
+        "detailed": detailed,
+    }
+    override = (getattr(args, "summary_json", "") or "").strip()
+    if override:
+        out = Path(override)
+    else:
+        label = result.checkpoint_label
+        name = "backtest_summary.json" if label == "best" else f"backtest_summary_{label}.json"
+        out = RunPaths(result.run_id).run_meta_dir / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    print(f"Backtest summary: {out}")
 
 
 def _print_ensemble_summary(prefix: str, checkpoint_label: str, results: list[BacktestResult]) -> None:
@@ -800,77 +882,6 @@ def _max_drawdown(equity: np.ndarray) -> float:
     peak = np.maximum.accumulate(equity)
     dd = (equity - peak) / np.maximum(peak, 1e-12)
     return float(dd.min())
-
-
-def _sharpe_ann_from_log_rets(log_rets: np.ndarray) -> float:
-    if log_rets.size < 2:
-        return float("nan")
-    return float(np.mean(log_rets) / (np.std(log_rets) + 1e-12) * np.sqrt(252))
-
-
-def block_bootstrap_log_rets(
-    log_rets: np.ndarray,
-    n_resamples: int = 5000,
-    avg_block_size: int = 10,
-    seed: int = 42,
-    *,
-    progress: bool = False,
-) -> np.ndarray:
-    """Stationary (Politis–Romano style) block bootstrap Sharpe samples.
-
-    Builds synthetic return series by stitching contiguous blocks; block breaks
-    arrive with geometric probability ``1 / avg_block_size``. Indices wrap
-    circularly to preserve length without edge truncation.
-    """
-    log_rets = np.asarray(log_rets, dtype=np.float64).reshape(-1)
-    n = log_rets.size
-    if n < 2:
-        return np.full(n_resamples, np.nan, dtype=np.float64)
-    boot_sharpes = np.empty(n_resamples, dtype=np.float64)
-    p = 1.0 / max(int(avg_block_size), 1)
-    rng = np.random.default_rng(seed)
-
-    log_stride = max(n_resamples // 5, 1) if progress and n_resamples >= 500 else 0
-    for b in range(n_resamples):
-        if log_stride and b > 0 and b % log_stride == 0:
-            _bt_log(f"[backtest] bootstrap: {b}/{n_resamples} resamples...")
-        sim_idx = np.empty(n, dtype=np.int64)
-        curr_idx = int(rng.integers(0, n))
-        for i in range(n):
-            sim_idx[i] = curr_idx
-            if rng.random() < p:
-                curr_idx = int(rng.integers(0, n))
-            else:
-                curr_idx = (curr_idx + 1) % n
-        sample_rets = log_rets[sim_idx]
-        boot_sharpes[b] = _sharpe_ann_from_log_rets(sample_rets)
-    return boot_sharpes
-
-
-def block_bootstrap_sharpe_percentiles(
-    log_rets: np.ndarray,
-    n_resamples: int = 5000,
-    avg_block_size: int = 10,
-    seed: int = 42,
-    *,
-    progress: bool = False,
-) -> tuple[float, float, float]:
-    """2.5 / 50 / 97.5 percentiles of block-bootstrap annualized Sharpe."""
-    sharpes = block_bootstrap_log_rets(
-        log_rets,
-        n_resamples=n_resamples,
-        avg_block_size=avg_block_size,
-        seed=seed,
-        progress=progress,
-    )
-    sharpes = sharpes[np.isfinite(sharpes)]
-    if sharpes.size == 0:
-        return float("nan"), float("nan"), float("nan")
-    return (
-        float(np.percentile(sharpes, 2.5)),
-        float(np.percentile(sharpes, 50.0)),
-        float(np.percentile(sharpes, 97.5)),
-    )
 
 
 def rollout_policy_on_slice(
@@ -1065,8 +1076,12 @@ def _print_detailed_stats(
     bootstrap_avg_block: int = 10,
     nav_ensemble: np.ndarray | None = None,
     bootstrap_progress: bool = False,
-) -> None:
-    """Ohlcv_window is the full OOS test slice; prices align with test_idx rows."""
+) -> dict:
+    """Compute + print detailed OOS stats; return them as a machine-readable dict.
+
+    Ohlcv_window is the full OOS test slice; prices align with test_idx rows.
+    """
+    stats: dict = {}
     n = len(test_idx)
     t0, t1 = test_idx[0], test_idx[-1]
     cal_days = (t1 - t0).days if hasattr(t1 - t0, "days") else int(
@@ -1076,11 +1091,15 @@ def _print_detailed_stats(
     print(
         f"OOS window: {t0} .. {t1}  ({n} daily bars, ~{cal_days} calendar days)"
     )
+    stats["oos_window"] = {"start": str(t0), "end": str(t1), "n_bars": n, "calendar_days": cal_days}
     cagr = float((navs[-1] / max(navs[0], 1e-12)) ** (252.0 / max(len(log_rets), 1)) - 1.0)
     print(f"Compound annualized growth (from daily bars): {cagr * 100:.2f}%")
     mdd = _max_drawdown(navs)
     calmar = float(cagr / max(abs(mdd), 1e-12)) if mdd < 0 else float("nan")
     print(f"Calmar (CAGR / |max DD|): {calmar:.2f}")
+    stats["cagr"] = cagr
+    stats["max_drawdown"] = float(mdd)
+    stats["calmar"] = calmar
 
     nav_spy = benchmark_buyhold_nav(
         navs, ohlcv_window, start_bar, tickers=None, benchmark_col=spy_ohlcv_col
@@ -1091,6 +1110,7 @@ def _print_detailed_stats(
         f"SPY 100% buy&hold (same OOS path, {len(lr_spy)} daily rets): "
         f"total {(nav_spy[-1] / nav_spy[0] - 1) * 100:.2f}%, ann. Sharpe {sh_spy:.2f}"
     )
+    stats["benchmark_spy"] = {"total_return": float(nav_spy[-1] / nav_spy[0] - 1), "sharpe": sh_spy}
     nav_ew = equal_weight_buyhold_nav(
         navs, ohlcv_window, start_bar, asset_live=test_asset_live
     )
@@ -1100,14 +1120,20 @@ def _print_detailed_stats(
         f"Equal-weight buy&hold (1/N assets, daily rebal., {len(lr_ew)} daily rets): "
         f"total {(nav_ew[-1] / nav_ew[0] - 1) * 100:.2f}%, ann. Sharpe {sh_ew:.2f}"
     )
-    nav_6040 = balanced_6040_nav(
-        navs, ohlcv_window, start_bar, test_idx, asset_live=test_asset_live
-    )
-    ret_6040, sh_6040, _ = benchmark_metrics(nav_6040)
-    print(
-        f"60/40 SP500/IEF (monthly rebal., {len(lr_ew)} daily rets): "
-        f"total {ret_6040 * 100:.2f}%, ann. Sharpe {sh_6040:.2f}"
-    )
+    stats["benchmark_equal_weight"] = {"total_return": float(nav_ew[-1] / nav_ew[0] - 1), "sharpe": sh_ew}
+    try:
+        nav_6040 = balanced_6040_nav(
+            navs, ohlcv_window, start_bar, test_idx, asset_live=test_asset_live
+        )
+        ret_6040, sh_6040, _ = benchmark_metrics(nav_6040)
+        print(
+            f"60/40 SP500/BOND10Y (monthly rebal., {len(lr_ew)} daily rets): "
+            f"total {ret_6040 * 100:.2f}%, ann. Sharpe {sh_6040:.2f}"
+        )
+        stats["benchmark_6040"] = {"total_return": float(ret_6040), "sharpe": float(sh_6040)}
+    except KeyError as e:
+        print(f"60/40 SP500/BOND10Y: skipped (universe missing required sleeve: {e})")
+        stats["benchmark_6040"] = None
     nav_rp = naive_risk_parity_nav(
         navs, ohlcv_window, start_bar, asset_live=test_asset_live
     )
@@ -1116,12 +1142,15 @@ def _print_detailed_stats(
         f"Naive risk parity (inverse 20d vol, daily rebal., {len(lr_ew)} daily rets): "
         f"total {ret_rp * 100:.2f}%, ann. Sharpe {sh_rp:.2f}"
     )
+    stats["benchmark_risk_parity"] = {"total_return": float(ret_rp), "sharpe": float(sh_rp)}
     nlr = log_rets.size
+    subperiods: dict = {}
     for label, n_parts in (("1st/2nd half of OOS", 2), ("quarters of OOS", 4)):
         if nlr < n_parts * 2:
             continue
         w = nlr // n_parts
         parts: list[str] = []
+        part_stats: list[dict] = []
         for p in range(n_parts):
             sl = log_rets[p * w : (p + 1) * w if p < n_parts - 1 else nlr]
             if sl.size < 2:
@@ -1129,8 +1158,11 @@ def _print_detailed_stats(
             tr = float(np.expm1(np.sum(sl)) * 100.0)
             sh = _sharpe_ann_from_log_rets(sl)
             parts.append(f"part{p + 1}: {tr:+.1f}% ret, Sh={sh:.2f}")
+            part_stats.append({"total_return_pct": tr, "sharpe": sh})
         if parts:
             print(f"{label}: {', '.join(parts)}")
+            subperiods[str(n_parts)] = part_stats
+    stats["subperiods"] = subperiods
 
     if nlr >= 10:
         lo, med, hi = block_bootstrap_sharpe_percentiles(
@@ -1145,6 +1177,8 @@ def _print_detailed_stats(
             f"avg block ~{bootstrap_avg_block}d, stationary): "
             f"2.5%={lo:.2f}, 50%={med:.2f}, 97.5%={hi:.2f}"
         )
+        stats["bootstrap_sharpe"] = {"p2_5": lo, "p50": med, "p97_5": hi,
+                                     "resamples": bootstrap_resamples, "avg_block": bootstrap_avg_block}
     if nav_ensemble is not None and nav_ensemble.ndim == 2 and nav_ensemble.shape[0] >= 2:
         ens_rets = np.diff(np.log(np.maximum(nav_ensemble, 1e-12)), axis=1)
         ens_sh = np.array([_sharpe_ann_from_log_rets(ens_rets[i]) for i in range(ens_rets.shape[0])])
@@ -1162,11 +1196,22 @@ def _print_detailed_stats(
                 f"50%={np.percentile(tot, 50) * 100:.1f}%, "
                 f"95%={np.percentile(tot, 95) * 100:.1f}%"
             )
+            stats["stochastic_ensemble"] = {
+                "n_paths": int(ens_sh.size),
+                "sharpe_mean": float(ens_sh.mean()),
+                "sharpe_p5": float(np.percentile(ens_sh, 5)),
+                "sharpe_p95": float(np.percentile(ens_sh, 95)),
+                "total_return_p5": float(np.percentile(tot, 5)),
+                "total_return_p50": float(np.percentile(tot, 50)),
+                "total_return_p95": float(np.percentile(tot, 95)),
+            }
     skew = float(np.mean(((log_rets - np.mean(log_rets)) / (np.std(log_rets) + 1e-12)) ** 3))
     print(
         f"Skew of daily log returns: {skew:.2f}  (strong positive skew can raise sample Sharpe in short windows)"
     )
+    stats["skew_daily_log_returns"] = skew
     print("--- end detailed ---")
+    return stats
 
 
 def _print_backtest_summary(results: list[BacktestResult]) -> None:
@@ -1184,6 +1229,12 @@ def _print_backtest_summary(results: list[BacktestResult]) -> None:
 
 
 def _checkpoint_modes(checkpoint: str) -> list[str]:
+    if checkpoint in ("latest", "both"):
+        print(
+            "[backtest] WARNING: evaluating 'latest'/'both' weights on the OOS holdout — "
+            "only 'best' (eval-NAV-selected) is the ex-ante checkpoint. Use --checkpoint best "
+            "for the published metric."
+        )
     if checkpoint == "both":
         return ["best", "latest"]
     return [checkpoint]
@@ -1208,9 +1259,12 @@ def _configure_checkpoint_subargs(sub: argparse.Namespace, run_id: str, ck: str)
 
 
 def run_backtest_batch(args: argparse.Namespace, run_ids: list[str]) -> list[BacktestResult]:
-    """Backtest multiple run ids in one process (one PyTorch import, one cache load)."""
+    """Backtest multiple run ids in one process (one PyTorch import, shared cache loads)."""
     ensure_backtest_dependencies()
-    _get_shared_panel()
+    try:
+        _get_shared_panel()  # warm the global cache when runs share it
+    except FileNotFoundError:
+        pass  # runs may use run-local snapshots; each resolves its own cache lazily
 
     checkpoints = _checkpoint_modes(args.checkpoint)
     results: list[BacktestResult] = []
@@ -1246,9 +1300,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--checkpoint",
-        default="both",
+        default="best",
         choices=("best", "latest", "both"),
-        help="Which weights to evaluate: eval-NAV-best, latest step checkpoint, or both.",
+        help="Which weights to evaluate: eval-NAV-best (default; holdout not used to pick "
+        "weights), latest step checkpoint, or both.",
+    )
+    parser.add_argument(
+        "--use-current-config",
+        action="store_true",
+        help="Use the current global config.yaml instead of Runs/<id>/config.yaml (stress test).",
+    )
+    parser.add_argument(
+        "--data-cache",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="Override the panel cache (default: Runs/<id>/data_cache.npz if present, else global).",
+    )
+    parser.add_argument(
+        "--summary-json",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="Override path for the per-run backtest_summary.json (default: Runs/<id>/).",
     )
     parser.add_argument(
         "--model",

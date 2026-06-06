@@ -152,6 +152,11 @@ class TrainingConfig:
     viz_freq: int
     curriculum_update_freq: int
     checkpoint_save_freq_steps: int
+    # When True, training envs use deterministic per-env seed streams (seed + env index)
+    # instead of fresh OS entropy per episode reset (reseed_on_reset). Default False keeps
+    # the diversity behavior; True makes same-seed runs reproducible.
+    reproducible: bool = False
+    early_stop_patience: int = 0  # >0 enables patience early-stop after curriculum completes
 
 
 @dataclass(frozen=True)
@@ -188,11 +193,20 @@ class CurriculumConfig:
     dr_widen_span_long: int
 
 
+FEATURE_SPLIT_MODES = ("continuous", "independent")
+
+
 @dataclass(frozen=True)
 class DataConfig:
     since: str
     fracdiff_d: float
     feature_purge_warmup: int
+    # "continuous": features precomputed on the contiguous panel then sliced into
+    #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
+    # "independent": features recomputed per contiguous segment + first
+    #   feature_purge_warmup bars neutralized, so the eval-selection signal is not
+    #   feature-state-contaminated by adjacent train blocks.
+    feature_split_mode: str = "continuous"
 
 
 @dataclass(frozen=True)
@@ -309,6 +323,15 @@ def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
     _check(tc.annual_holding_cost, "transaction_costs.annual_holding_cost")
 
 
+def _feature_split_mode(value: Any) -> str:
+    mode = str(value)
+    if mode not in FEATURE_SPLIT_MODES:
+        raise ValueError(
+            f"data.feature_split_mode must be one of {FEATURE_SPLIT_MODES}, got {mode!r}"
+        )
+    return mode
+
+
 def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
     universe = _parse_universe(_req(data, "universe", "root"))
     env = _req(data, "environment", "root")
@@ -420,6 +443,8 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             checkpoint_save_freq_steps=int(
                 _req(tr, "checkpoint_save_freq_steps", "training")
             ),
+            reproducible=bool(tr.get("reproducible", False)),
+            early_stop_patience=int(tr.get("early_stop_patience", 0)),
         ),
         vec_normalize=VecNormalizeConfig(
             norm_obs=bool(_req(vn, "norm_obs", "vec_normalize")),
@@ -453,6 +478,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             since=str(_req(dat, "since", "data")),
             fracdiff_d=float(_req(dat, "fracdiff_d", "data")),
             feature_purge_warmup=int(_req(dat, "feature_purge_warmup", "data")),
+            feature_split_mode=_feature_split_mode(dat.get("feature_split_mode", "continuous")),
         ),
         raw=data,
     )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from scripts.backtest import block_bootstrap_log_rets, block_bootstrap_sharpe_percentiles
+from rlbot.stats import block_bootstrap_log_rets, block_bootstrap_sharpe_percentiles
 
 
 def test_block_bootstrap_preserves_length_and_finite() -> None:
