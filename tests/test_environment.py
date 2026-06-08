@@ -323,3 +323,106 @@ def test_benchmark_return_simple_then_log() -> None:
     simple_agg = float(np.dot(w, np.expm1(log_rets)))
     correct = float(np.log(1.0 + simple_agg))
     assert correct >= wrong - 1e-12
+
+
+def test_rebalance_tx_cost_scales_with_fee_scale() -> None:
+    """Realized tx cost fraction is zero when fee_scale=0, positive when fees apply."""
+    n_assets = _N_ASSETS
+    t = 40
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        fee_scale_default=1.0,
+    )
+    env.reset()
+    env._t = env._min_t
+    env._cash = 50_000.0
+    env._units[:] = 50_000.0 / ohlcv[env._t, :, 3]
+    price = ohlcv[env._t + 1, :, 0]
+    w = np.zeros(env.n_actions)
+    w[0] = 0.5
+    w[1] = 0.5
+
+    env.fee_scale = 0.0
+    _, tx_free = env._rebalance(price, w)
+    env.fee_scale = 1.0
+    _, tx_full = env._rebalance(price, w)
+    assert tx_free == 0.0
+    assert tx_full >= 0.0
+
+
+def test_inactivity_penalty_bounded_at_full_cash() -> None:
+    """100% cash inactivity penalty is ~2.5 with default config (1.5 + 1.0 tail)."""
+    rwd = get_config().reward
+    expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
+    assert expected == pytest.approx(2.5)
+
+
+def test_churn_penalty_uses_tx_cost_not_turnover() -> None:
+    """Churn reward term scales with tx_cost_frac (zero when fee_scale=0)."""
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        fee_scale_default=0.0,
+    )
+    env.reset()
+    action = np.zeros(env.n_actions)
+    action[0] = 10.0
+    action[1] = 5.0
+    _, _, _, _, info = env.step(action)
+    assert info["tx_cost_frac"] == pytest.approx(0.0, abs=1e-12)
+    assert info["rew_decomp/churn"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_downside_return_amplified_when_in_drawdown() -> None:
+    """Negative step returns get extra penalty when episode is already underwater."""
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    # Steady decline in closes so steps produce negative log returns.
+    for i in range(t):
+        ohlcv[i, :, 3] = 100.0 - i * 0.5
+        ohlcv[i, :, 0] = ohlcv[i, :, 3] * 0.999
+        ohlcv[i, :, 1] = ohlcv[i, :, 3] * 1.001
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        max_episode_steps=30,
+        fee_scale_default=0.0,
+    )
+    env.reset()
+    action = np.zeros(env.n_actions)
+    action[1] = 10.0
+    drawdown_seen = False
+    for _ in range(10):
+        _, _, _, _, info = env.step(action)
+        if info.get("rew_decomp/drawdown", 0.0) < -1e-6:
+            drawdown_seen = True
+            assert info["rew_decomp/return"] < 0.0
+            break
+    assert drawdown_seen

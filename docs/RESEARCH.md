@@ -29,7 +29,7 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 | Reward logging | `RewardDecompCallback` → TB `rew_decomp/*` + `eval_logs/reward_decomp.json` |
 | Early stop | Optional `training.early_stop_patience` (after curriculum completes) |
 | OOS backtest | `obs_lag = 1`, full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
-| Checkpoint rule | Eval-NAV-best only (`models/best/best_model.zip`) |
+| Checkpoint rule | Eval-NAV-best only (`models/best/best_model.zip` + matched `best/vec_normalize.pkl`) |
 
 ### Hyperparameter protocol
 
@@ -111,8 +111,10 @@ Implemented in `rlbot/baselines.py`; plotted by `scripts/backtest.py`. Multi-ass
 
 | Benchmark | Allocation | Rebalance |
 |-----------|------------|-----------|
-| Benchmark B&H | 100% `universe.benchmark` sleeve (default SP500/SPY) | — |
-| Equal-weight | 1/N per asset | Daily |
+| Cash / no-trade | 100% cash (flat NAV) | — |
+| Benchmark-only B&H | 100% `universe.benchmark` sleeve (default SP500/SPY) | Buy-and-hold (tx costs on entry) |
+| Equal-weight (daily) | 1/N per live asset | Daily; slippage + fees + holding costs |
+| Equal-weight (monthly) | 1/N per live asset | Calendar month-start; tx-cost-aware |
 | 60/40 | 60% benchmark / 40% BOND10Y (IEF) | Calendar month-start |
 | Naive risk parity | ∝ 1/σ (20d vol) | Daily |
 
@@ -159,22 +161,22 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 Per-step (before VecNormalize during training):
 
-`reward = return + sortino_diff + participation − inactivity − churn − drawdown`
+`reward = return (with downside amp) + sortino_diff + participation − inactivity − churn`
 
 | Component | Sign | Implementation | Default coefficients |
 |-----------|------|----------------|-------------------|
-| **Return** | + | `clip(log_ret, max_step_log_return_downside, max_step_log_return) × reward_scale` | clip **−0.12 / +0.06**; scale **2000** |
+| **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 5` |
 | **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window` (min `sortino_min_steps` warmup), clipped ±3; benchmark uses same friction model | `risk_bonus_scale: 25` |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
-| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **10.0** + **15.0** tail; **no 50% step cliff** |
-| **Churn** | − | `turnover_frac × churn_penalty × VIX_mult × curriculum_churn_scale` | `churn_penalty: 8.5` |
-| **Drawdown** | − | `(dd_frac)² × drawdown_penalty_scale × drawdown_quadratic_multiplier` vs pre-step peak | `25 × 12` |
+| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.5** + **1.0** tail (max **~2.5** at 100% cash) |
+| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` (multiplier on realized tx cost) |
+| **Drawdown amp** | (in return) | Extra negative return when underwater; logged as `rew_decomp/drawdown` | `drawdown_downside_gamma: 5` |
 
 `info` / TensorBoard: `rew_decomp/return`, `sortino`, `participation`, `inactivity`, `churn`, `drawdown`, `vix_churn_mult`.
 
-**Churn detail:** `turnover_frac` = dollar turnover ÷ NAV. `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Training `curriculum_churn_scale` is **0** until `churn_start_fraction` (~13M on 65M run), then linear **0→1** over **10M** steps. Eval/backtest: `churn_scale = 1`.
+**Churn detail:** `tx_cost_frac` = realized slippage + fee dollars ÷ NAV (zero when `fee_scale = 0`). `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Training `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the fee ramp window. Eval/backtest: `churn_scale = 1`.
 
-**Inactivity detail:** Training envs use scale **1.0**. In-training eval envs use `eval_inactivity_penalty_scale: 0.05`.
+**Inactivity detail:** Training and eval envs use `eval_inactivity_penalty_scale: 1.0` (balanced with return term; cash can beat a −1% day).
 
 **Costs:** per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists in `transaction_costs`, keyed like `universe.assets`). Training curriculum: `fee_scale` **0** → linear ramp → **1.0**, then DR on fee/lag bounds. OOS backtest: `fee_scale = 1`.
 
@@ -233,7 +235,7 @@ RecurrentPPO + VecNormalize (obs norm on; reward norm train-only) + `TradingCurr
 |-------|------------------------|--------|
 | Fee-free | 0 – 6.5M (`fee_free_fraction` 0.10) | `fee_scale = 0` |
 | Fee ramp | 6.5M – 29.25M (`fee_ramp_fraction` 0.45) | fees → full |
-| Churn off → on | churn starts ~13M (`churn_start_fraction` 0.20), full by ~23M | `curriculum_churn_scale` 0 → 1 over 10M steps |
+| Churn ramp | 6.5M – 29.25M (aligned with fee ramp) | `curriculum_churn_scale` 0 → 0.1 → 1.0 (`churn_ramp_floor: 0.1`) |
 | DR widen | through ~42.25M (`dr_widen_span_fraction` 0.65) | fee/lag domain-randomization bounds widen |
 | Entropy | cosine decay from `decay_start_fraction` 0.45 (~29.25M) | exploration → `final_ent` |
 | Eval / plot | every **500k** global steps | ~130 eval rollouts per 65M run (decoupled from `n_steps`) |

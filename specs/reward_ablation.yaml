@@ -1,16 +1,15 @@
-# Reward-balance grid (review P1-A / §3.3 asymmetry finding): the inactivity penalty
-# (~ -25 at 100% cash) dwarfs participation (+1) and ordinary churn (-0.85). Sweep the
-# shaping scales and read rew_decomp/abs_share + eval NAV to find a balance where the
-# terms are visible at target behaviors. Dev tier (no OOS read).
+# Reward-balance grid: tx-cost-linked churn multiplier and participation scale.
+# Read rew_decomp/abs_share + eval NAV to find balance where shaping terms are visible.
+# Dev tier (no OOS read).
 id: reward_ablation
 hypothesis: >
-  Raising participation_reward_scale and churn_penalty so each shaping term reaches a
-  meaningful share of absolute reward steers exposure/turnover without degrading eval NAV.
+  Raising participation_reward_scale and churn_penalty (multiplier on realized tx cost)
+  steers exposure/turnover without degrading eval NAV.
 parent: baseline
 base_config: config/config.yaml
 grid:
   reward.participation_reward_scale: [20.0, 60.0, 120.0]
-  reward.churn_penalty: [4.0, 8.5, 15.0]
+  reward.churn_penalty: [0.5, 1.0, 2.0]
 seeds: [42, 101]
 windows:
   - name: w1

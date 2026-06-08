@@ -43,16 +43,14 @@ reward:
   risk_bonus_scale: 25.0
   # Cap-weighted passive benchmark for Sortino differential (same order as universe.assets keys)
   benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
-  # turnover_frac * churn_penalty * VIX_scale * curriculum_churn_scale
-  churn_penalty: 8.5
-  drawdown_penalty_scale: 25.0
-  inactivity_penalty_over_50: 10.0  # linear: cash_frac * this (no 50% step cliff)
-  inactivity_penalty_over_90: 15.0  # extra linear ramp from 90% → 100% cash
-  eval_inactivity_penalty_scale: 0.05
+  # tx_cost_frac * churn_penalty * reward_scale * VIX_scale * curriculum_churn_scale
+  churn_penalty: 1.0  # multiplier on realized tx cost (slippage + fees) in reward units
+  drawdown_downside_gamma: 5.0  # amplifies negative step returns when already in drawdown
+  inactivity_penalty_over_50: 1.5  # linear: cash_frac * this (no 50% step cliff)
+  inactivity_penalty_over_90: 1.0  # extra linear ramp from 90% → 100% cash
+  eval_inactivity_penalty_scale: 1.0
   participation_bonus: 0.05
-  # Bring regularizers into the same order of magnitude as return (after reward_scale)
   participation_reward_scale: 20.0
-  drawdown_quadratic_multiplier: 12.0
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
@@ -121,12 +119,11 @@ curriculum:
   # ≤ budget_short: fraction-of-run schedule
   fee_free_fraction: 0.10
   fee_ramp_fraction: 0.45
-  churn_start_fraction: 0.20
+  churn_ramp_floor: 0.10  # churn scale at fee-ramp start; ramps to 1.0 by fee_ramp_end
   dr_widen_span_fraction: 0.65
   # Long-run anchors (≥ budget_long)
   fee_free_long: 13300000
   fee_ramp_end_long: 40000000
-  churn_start_long: 60000000
   dr_widen_span_long: 30000000
 
 data:

@@ -64,7 +64,7 @@ Use `--refresh-data` (or `modal run scripts/modal_app.py::upload_cache`) when a 
 python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2>,<RUN_ID_3> --checkpoint best
 ```
 
-**Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). Do not change core hyperparameters across walk-forward cohorts unless starting a new study.
+**Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). When changing **N**, run `--refresh-data` so the global cache matches; each run also snapshots the effective **N**-wide panel to `Runs/<id>/data_cache.npz`. Do not change core hyperparameters across walk-forward cohorts unless starting a new study.
 
 **Artifacts** (gitignored): `Runs/`, `.cache/data_cache.npz`. Legacy roots (`models/`, `runs/`, …) are still **read** until you run `python scripts/migrate_runs_layout.py`.
 
@@ -129,20 +129,20 @@ flowchart TB
 
 Per-step reward (before VecNormalize during training):
 
-`reward = return + sortino_diff + participation − inactivity − churn − drawdown`
+`reward = return (with downside amp) + sortino_diff + participation − inactivity − churn`
 
 Logged per term in `info` / TensorBoard as `rew_decomp/*` (including `rew_decomp/vix_churn_mult`):
 
 | Term | Sign | Formula (reward units) | Config knobs |
 |------|------|------------------------|--------------|
-| **Return** | + | `clip(log_ret, −0.12, +0.06) × reward_scale` | `reward_scale: 2000` |
+| **Return** | + | `clip(log_ret, −0.12, +0.06) × reward_scale`; negative returns × `(1 + drawdown_downside_gamma × dd_pre)` | `reward_scale: 2000`; `drawdown_downside_gamma: 5`; `dd_pre` = pre-step drawdown vs episode peak |
 | **Sortino diff** | + | `clip(agent_sortino − bench_sortino, ±3) × risk_bonus_scale` after `sortino_min_steps: 20` over `risk_window: 63` | `risk_bonus_scale: 25`; benchmark uses `benchmark_cap_weights` with same friction model |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
-| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + extra linear ramp from 90%→100% cash | `10.0` + `15.0` tail; eval envs scale by `eval_inactivity_penalty_scale: 0.05` |
-| **Churn** | − | `turnover_frac × churn_penalty × VIX_mult × curriculum_churn_scale` | `churn_penalty: 8.5`; `VIX_mult = clip(VIX/18, 0.75, 1.5)` |
-| **Drawdown** | − | `(dd_frac)² × drawdown_penalty_scale × drawdown_quadratic_multiplier` | `25 × 12`; `dd_frac` vs pre-step episode peak NAV |
+| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + extra linear ramp from 90%→100% cash | `1.5` + `1.0` tail (max ~2.5 at 100% cash) |
+| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` (multiplier on realized slippage+fees); `VIX_mult = clip(VIX/18, 0.75, 1.5)` |
+| **Drawdown amp** | (in return) | Extra negative return when `log_ret < 0` and `dd_pre > 0`; logged as `rew_decomp/drawdown` | See `drawdown_downside_gamma` |
 
-`turnover_frac` = dollar turnover ÷ NAV. Training `curriculum_churn_scale` is **0** until `churn_start_fraction` (~20% of 65M → ~13M steps), then linear **0→1** over **10M** steps (`CHURN_RAMP_DURATION`). OOS backtest: full fees, `churn_scale = 1`, fixed `obs_lag = 1`.
+`tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, fixed `obs_lag = 1`.
 
 #### Transaction costs (`config.yaml` → `transaction_costs`)
 
@@ -172,7 +172,7 @@ Per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists,
 | `scripts/research.py` | Auto-research: `plan`/`launch`/`report` over `specs/*.yaml` with OOS-gated tiers |
 | `scripts/run_seed_ensemble.sh` | Multi-seed training + ensemble backtest |
 | `scripts/migrate_runs_layout.py` | Move legacy `models/`, `plots/`, … into `Runs/<id>/` |
-| `rlbot/baselines.py` | SPY B&H, equal-weight, 60/40, naive risk parity |
+| `rlbot/baselines.py` | Cash, benchmark-only B&H, equal-weight (daily + monthly, tx-cost-aware), 60/40, naive risk parity |
 | `rlbot/inference_load.py` | VecNormalize + RecurrentPPO load helpers |
 | `rlbot/inference_output.py` | Torch-free weight-payload assembly/validation |
 | `rlbot/stats.py` | Block-bootstrap helpers for `--detailed` backtest stats |
@@ -188,7 +188,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best \
   --stochastic-paths 30 --detailed --plot-tag cross_window
 ```
 
-Passive benchmarks use **simple-return** cross-sectional aggregation, then compound (see `rlbot/baselines.py`).
+Passive benchmarks use **simple-return** cross-sectional aggregation, then compound (see `rlbot/baselines.py`). OOS backtest requires VecNormalize by default (`--allow-missing-vec-normalize` for debug only). `best_model.zip` is paired with `best/vec_normalize.pkl` from the same eval step.
 
 ---
 

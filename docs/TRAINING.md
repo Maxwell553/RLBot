@@ -6,6 +6,8 @@
 
 **CLI shortcut:** `scripts/train.py --n-assets N` uses the **first N keys** from that block (YAML order), slices `benchmark_cap_weights` and `transaction_costs.*`, and renormalizes cap weights. You cannot set **N** larger than the number of keys in the file — add symbols to the YAML first. The benchmark label (`universe.benchmark`, usually `SP500`) must stay among those first N keys (it is first in the default config).
 
+**Cache rule when changing N:** Training always writes the **effective** sliced panel to `Runs/<run_id>/data_cache.npz` (width **N**). The global `.cache/data_cache.npz` may still be wider until you refresh. After changing `--n-assets` or editing `universe.assets`, run **`--refresh-data`** before the next study so the global cache, config lists, and panel width stay aligned. Backtest loads the run-local snapshot by default and will error if manifest `n_assets` ≠ cache width.
+
 To change **which** assets are in the panel (not just how many), edit the YAML and run `--refresh-data` to update the cache.
 
 ```yaml
@@ -101,7 +103,9 @@ Training will:
 python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
 ```
 
-Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and checks observation dimension against the saved model / VecNormalize stats. Results land in `Runs/<id>/backtest_summary.json`.
+Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and **requires** `models/best/vec_normalize.pkl` paired with `best_model.zip` (pass `--allow-missing-vec-normalize` only for debugging). Results land in `Runs/<id>/backtest_summary.json`.
+
+**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together whenever eval NAV improves. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
 
 ### 6. Target-weight inference (optional)
 
@@ -111,7 +115,7 @@ For a single as-of date (measurement only — no broker):
 python scripts/infer_weights.py --run-id <RUN_ID> --checkpoint best --as-of 2022-12-31
 ```
 
-Writes audited JSON (target weights, logits, live mask, config/data/model hashes) via the same rollout path as backtest.
+Writes audited JSON (executed target weights after action smoothing, live mask, config/data/model hashes) via the same rollout path as backtest (`info["target_weights"]` from the environment).
 
 ---
 
@@ -125,11 +129,21 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 ---
 
+## Crash resume vs fine-tune
+
+| Flag | Use when | Behavior |
+|------|----------|----------|
+| `--resume PATH` | Modal/local crash after preemption | Load weights + VecNormalize; **continue** curriculum + adaptive-entropy callbacks from checkpoint timestep |
+| `--finetune PATH` | Experimental second stage | Lower LR / entropy / clip; **skips** curriculum + entropy callbacks |
+
+Do not pass both flags. See [MODAL.md](MODAL.md) for preemption resume examples.
+
 ## What not to reuse
 
 - **Checkpoints** (`Runs/<run_id>/models/`) trained with a different **N**, `obs_dim`, or pre-`asset_live` cache
-- **VecNormalize** pickles from another universe size or observation layout
+- **VecNormalize** pickles from another universe size, observation layout, or training step (use `best/vec_normalize.pkl` with `best_model.zip`)
 - **Old caches** without `tickers` / `asset_live` in the npz — always `--refresh-data` after universe or data-pipeline edits
+- **Global cache width ≠ training N** — refresh or rely on run-local `data_cache.npz` (always written with effective **N**)
 
 ## Run artifact layout
 
@@ -137,11 +151,11 @@ Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 
 | Path | Contents |
 |------|----------|
-| `manifest.json` | Dates, tickers, `n_assets`, `obs_dim`, universe metadata |
+| `manifest.json` | Dates, `chronological_holdout`, tickers, `n_assets`, `obs_dim` (holdout block preserved through training) |
 | `config.yaml` | Snapshot of training config |
 | `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
-| `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl`, `best/best_model.zip` |
-| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` |
+| `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair) |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (per-term: return, sortino, inactivity, churn, drawdown amp) |
 | `backtest_summary.json` | OOS metrics + config/data hashes (after backtest) |
 | `training_summary.json` | Training-end summary (after train completes) |
 

@@ -1,11 +1,11 @@
 """
 Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / config).
 
-Reward = return + Sortino diff vs cap-weighted benchmark - inactivity - VIX-scaled churn - drawdown
-  - return: clipped_log_return * REWARD_SCALE
+Reward = return (with drawdown downside amp) + Sortino diff - inactivity - cost-linked churn
+  - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
   - sortino diff: benchmark-relative over last RISK_WINDOW steps (moving window within episode)
-  - inactivity: linear in cash fraction (plus extra ramp above 90%); training scale 1.0;
-    periodic eval uses ``EVAL_INACTIVITY_PENALTY_SCALE`` so defensive cash is not over-penalized
+  - inactivity: linear in cash fraction (plus extra ramp above 90%)
+  - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
 
 Execution: trades fill at open[t+1] (next morning after decision), not close[t].
@@ -149,7 +149,7 @@ class MultiAssetPortfolioEnv(gym.Env):
 
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
-    Reward: return + Sortino_bonus + participation - inactivity - VIX-scaled churn - quadratic drawdown penalty.
+    Reward: return (drawdown-amplified downside) + Sortino_bonus + participation - inactivity - cost-linked churn.
     Per-step ``info`` includes ``rew_decomp/*`` for each component (see ``config.yaml`` reward section).
 
     Feature arrays after ``macd`` are keyword-only so walk-forward packs
@@ -659,21 +659,25 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._bench_w_prev = w_tgt.copy()
         return float(np.log(max(nav_next, 1e-12) / nav_pre))
 
-    def _rebalance(self, price: np.ndarray, target_w: np.ndarray) -> float:
+    def _rebalance(self, price: np.ndarray, target_w: np.ndarray) -> Tuple[float, float]:
         """Execute trades at given prices with per-asset slippage and fees.
 
         Scales transaction costs by self.fee_scale (for curriculum learning).
         Target weights are long-only (cash + nonnegative asset notionals).
+
+        Returns ``(turnover_frac, tx_cost_frac)`` where ``tx_cost_frac`` is total
+        slippage + fee dollars paid this step divided by pre-rebalance NAV.
         """
         tw = _enforce_long_only_simplex(np.asarray(target_w, dtype=np.float64))
         nav = self._nav(price)
         if nav <= 1e-12:
-            return 0.0
+            return 0.0, 0.0
 
         fs = self.fee_scale
         target_units = (tw[1:] * nav) / (price + 1e-12)
         delta = target_units - self._units
         turnover = 0.0
+        tx_cost = 0.0
 
         for i in np.argsort(delta):
             du = delta[i]
@@ -681,9 +685,11 @@ class MultiAssetPortfolioEnv(gym.Env):
                 continue
             sell_u = -du
             cost_rate = (self._asset_slippage[i] + self._asset_tx_fee[i]) * fs
-            self._cash += sell_u * price[i] * (1.0 - cost_rate)
+            notional = sell_u * price[i]
+            tx_cost += notional * cost_rate
+            self._cash += notional * (1.0 - cost_rate)
             self._units[i] -= sell_u
-            turnover += sell_u * price[i]
+            turnover += notional
 
         buy_idxs = np.where(delta > 1e-12)[0]
         if buy_idxs.size > 0:
@@ -703,12 +709,16 @@ class MultiAssetPortfolioEnv(gym.Env):
                 idx_f = buy_idxs[filled]
                 bu = buy_u[filled]
                 uc = unit_cost[filled]
+                cr = cost_rate[filled]
+                pr = price[idx_f]
+                tx_cost += float((bu * pr * cr).sum())
                 self._cash -= float((bu * uc).sum())
                 self._units[idx_f] += bu
-                turnover += float((bu * price[idx_f]).sum())
+                turnover += float((bu * pr).sum())
 
         self._units = np.maximum(self._units, 0.0)
-        return turnover / max(nav, 1e-12)
+        nav_denom = max(nav, 1e-12)
+        return turnover / nav_denom, tx_cost / nav_denom
 
     def _apply_holding_costs(self, close: np.ndarray) -> float:
         """Deduct daily holding on pre-rebalance units (call before ``_rebalance``)."""
@@ -845,13 +855,14 @@ class MultiAssetPortfolioEnv(gym.Env):
         active_churn_scale = vix_multiplier * self._churn_scale
         # Holding on pre-rebalance units at close[t] (matches portfolio_step_nav w_prev).
         self._apply_holding_costs(close_t)
-        turnover_frac = self._rebalance(open_next, w)
+        turnover_frac, tx_cost_frac = self._rebalance(open_next, w)
         self._prev_target_w = w.copy()
 
         close_next = self.ohlcv[self._t + 1, :, 3]
         v_next = max(self._nav(close_next), 1e-12)
 
         peak_before = self._episode_peak_nav
+        dd_frac_pre = max(0.0, (peak_before - v_pre) / max(peak_before, 1e-12))
 
         log_ret = float(np.log(v_next / v_pre))
         clipped_ret = float(
@@ -866,8 +877,15 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._return_buffer.append(log_ret)
         self._market_return_buffer.append(market_ret)
 
-        # ── reward: return + benchmark-relative Sortino - inactivity ─
-        return_component = clipped_ret * rwd.reward_scale
+        # ── reward: return (drawdown-amplified downside) + Sortino - inactivity ─
+        base_return = clipped_ret * rwd.reward_scale
+        if clipped_ret < 0.0:
+            amp = 1.0 + rwd.drawdown_downside_gamma * dd_frac_pre
+            return_component = base_return * amp
+            drawdown_component = base_return * (amp - 1.0)
+        else:
+            return_component = base_return
+            drawdown_component = 0.0
         reward = return_component
 
         sortino_component = 0.0
@@ -899,14 +917,11 @@ class MultiAssetPortfolioEnv(gym.Env):
         )
         reward += participation_component
 
-        churn_component = turnover_frac * active_churn_scale * rwd.churn_penalty
+        churn_component = (
+            tx_cost_frac * rwd.churn_penalty * rwd.reward_scale * active_churn_scale
+        )
         reward -= churn_component
 
-        dd_frac = max(0.0, (peak_before - v_next) / max(peak_before, 1e-12))
-        drawdown_component = (dd_frac ** 2) * (
-            rwd.drawdown_penalty_scale * rwd.drawdown_quadratic_multiplier
-        )
-        reward -= drawdown_component
         self._episode_peak_nav = max(peak_before, v_next)
 
         self._t += 1
@@ -924,7 +939,9 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         info: Dict[str, Any] = {
             "nav": v_next,
+            "target_weights": w.copy(),
             "turnover": turnover_frac,
+            "tx_cost_frac": tx_cost_frac,
             "log_ret": log_ret,
             "rew_decomp/return": return_component,
             "rew_decomp/sortino": sortino_component,
@@ -932,7 +949,7 @@ class MultiAssetPortfolioEnv(gym.Env):
             "rew_decomp/participation": participation_component,
             "rew_decomp/churn": -churn_component,
             "rew_decomp/vix_churn_mult": vix_multiplier,
-            "rew_decomp/drawdown": -drawdown_component,
+            "rew_decomp/drawdown": drawdown_component,
         }
 
         obs = self._build_obs()

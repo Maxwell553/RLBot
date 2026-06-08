@@ -231,6 +231,43 @@ def benchmark_buyhold_nav(
     return out
 
 
+def cash_nav(
+    navs: np.ndarray,
+    ohlcv_window: np.ndarray,
+    start_bar: int,
+    **_,
+) -> np.ndarray:
+    """100% cash / no-trade: flat NAV (no risk-free accrual in the daily bar model)."""
+    del ohlcv_window, start_bar
+    out = np.empty(len(navs), dtype=np.float64)
+    out[:] = float(navs[0])
+    return out
+
+
+def benchmark_only_nav(
+    navs: np.ndarray,
+    ohlcv_window: np.ndarray,
+    start_bar: int,
+    *,
+    tickers: list[str] | None = None,
+    benchmark_col: int | None = None,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
+) -> np.ndarray:
+    """100% benchmark sleeve (config ``universe.benchmark``), buy-and-hold with costs."""
+    return benchmark_buyhold_nav(
+        navs,
+        ohlcv_window,
+        start_bar,
+        tickers=tickers,
+        benchmark_col=benchmark_col,
+        asset_live=asset_live,
+        fee_scale=fee_scale,
+        apply_costs=apply_costs,
+    )
+
+
 def equal_weight_buyhold_nav(
     navs: np.ndarray,
     ohlcv_window: np.ndarray,
@@ -255,6 +292,73 @@ def equal_weight_buyhold_nav(
         t = i0 + k - 1
         live = _live_mask(asset_live, t, n_assets)
         w = _weights_on_live(np.full(n_assets, 1.0 / max(int(live.sum()), 1)), live)
+        out[k] = portfolio_step_nav(
+            out[k - 1],
+            ohlcv_window,
+            t,
+            w,
+            prev_weights=prev_w,
+            slippage=slip,
+            tx_fee=fee,
+            daily_holding=hold,
+            fee_scale=fee_scale,
+            asset_live=asset_live,
+        )
+        prev_w = w.copy()
+    return out
+
+
+def equal_weight_daily_cost_aware_nav(
+    navs: np.ndarray,
+    ohlcv_window: np.ndarray,
+    start_bar: int,
+    *,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+) -> np.ndarray:
+    """Equal-weight 1/N among live assets, **daily** rebalance, slippage + fees + holding costs."""
+    return equal_weight_buyhold_nav(
+        navs,
+        ohlcv_window,
+        start_bar,
+        asset_live=asset_live,
+        fee_scale=fee_scale,
+        apply_costs=True,
+    )
+
+
+def equal_weight_monthly_nav(
+    navs: np.ndarray,
+    ohlcv_window: np.ndarray,
+    start_bar: int,
+    test_idx: pd.DatetimeIndex,
+    *,
+    asset_live: np.ndarray | None = None,
+    fee_scale: float = 1.0,
+    apply_costs: bool = True,
+) -> np.ndarray:
+    """Equal-weight 1/N among live assets, rebalanced on the first bar of each calendar month."""
+    n_assets = ohlcv_window.shape[1]
+    i0 = int(start_bar)
+    n = len(navs)
+    slip = fee = hold = None
+    if apply_costs:
+        slip, fee, hold = _transaction_cost_arrays(n_assets)
+    out = np.empty(n, dtype=np.float64)
+    out[0] = float(navs[0])
+    prev_month: tuple[int, int] | None = None
+    prev_w = np.zeros(n_assets, dtype=np.float64)
+    w = prev_w.copy()
+    for k in range(1, n):
+        t = i0 + k - 1
+        bar_ts = test_idx[t + 1]
+        month_key = (int(bar_ts.year), int(bar_ts.month))
+        live = _live_mask(asset_live, t, n_assets)
+        if prev_month != month_key:
+            w = _weights_on_live(np.full(n_assets, 1.0 / max(int(live.sum()), 1)), live)
+            prev_month = month_key
+        else:
+            w = _weights_on_live(w, live)
         out[k] = portfolio_step_nav(
             out[k - 1],
             ohlcv_window,

@@ -78,13 +78,12 @@ class RewardConfig:
     risk_bonus_scale: float
     benchmark_cap_weights: list[float]
     churn_penalty: float
-    drawdown_penalty_scale: float
+    drawdown_downside_gamma: float
     inactivity_penalty_over_50: float
     inactivity_penalty_over_90: float
     eval_inactivity_penalty_scale: float
     participation_bonus: float
     participation_reward_scale: float
-    drawdown_quadratic_multiplier: float
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -185,11 +184,10 @@ class CurriculumConfig:
     budget_long: int
     fee_free_fraction: float
     fee_ramp_fraction: float
-    churn_start_fraction: float
+    churn_ramp_floor: float
     dr_widen_span_fraction: float
     fee_free_long: int
     fee_ramp_end_long: int
-    churn_start_long: int
     dr_widen_span_long: int
 
 
@@ -379,7 +377,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
                 expected_n=None,
             ),
             churn_penalty=_reward_churn_penalty(rew),
-            drawdown_penalty_scale=float(_req(rew, "drawdown_penalty_scale", "reward")),
+            drawdown_downside_gamma=float(_req(rew, "drawdown_downside_gamma", "reward")),
             inactivity_penalty_over_50=float(_req(rew, "inactivity_penalty_over_50", "reward")),
             inactivity_penalty_over_90=float(_req(rew, "inactivity_penalty_over_90", "reward")),
             eval_inactivity_penalty_scale=float(
@@ -388,9 +386,6 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             participation_bonus=float(_req(rew, "participation_bonus", "reward")),
             participation_reward_scale=float(
                 _req(rew, "participation_reward_scale", "reward")
-            ),
-            drawdown_quadratic_multiplier=float(
-                _req(rew, "drawdown_quadratic_multiplier", "reward")
             ),
         ),
         transaction_costs=TransactionCostsConfig(
@@ -467,11 +462,10 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             budget_long=int(_req(cur, "budget_long", "curriculum")),
             fee_free_fraction=float(_req(cur, "fee_free_fraction", "curriculum")),
             fee_ramp_fraction=float(_req(cur, "fee_ramp_fraction", "curriculum")),
-            churn_start_fraction=float(_req(cur, "churn_start_fraction", "curriculum")),
+            churn_ramp_floor=float(_req(cur, "churn_ramp_floor", "curriculum")),
             dr_widen_span_fraction=float(_req(cur, "dr_widen_span_fraction", "curriculum")),
             fee_free_long=int(_req(cur, "fee_free_long", "curriculum")),
             fee_ramp_end_long=int(_req(cur, "fee_ramp_end_long", "curriculum")),
-            churn_start_long=int(_req(cur, "churn_start_long", "curriculum")),
             dr_widen_span_long=int(_req(cur, "dr_widen_span_long", "curriculum")),
         ),
         data=DataConfig(

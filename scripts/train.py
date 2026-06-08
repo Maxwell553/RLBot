@@ -5,8 +5,9 @@ Train shared RecurrentPPO (LSTM) on synchronized multi-asset daily data.
 Universe size and symbols: ``config/config.yaml`` → ``universe.assets`` (5–55);
 optional CLI ``--n-assets`` slices the first N keys.
 
-Artifacts for inference (backtest): ``Runs/<run_id>/models/vec_normalize.pkl``
-(same stats copied to ``Runs/<run_id>/models/best/`` next to ``best_model.zip``).
+Artifacts for inference (backtest): ``Runs/<run_id>/models/best/best_model.zip`` paired
+with ``Runs/<run_id>/models/best/vec_normalize.pkl`` saved at the same eval step (end-of-run
+``models/vec_normalize.pkl`` is final-step stats only).
 
 Anti-overfitting measures:
   - Fractionally differentiated price features (stationary + memory)
@@ -89,7 +90,7 @@ from rlbot.run_artifacts import (
     new_run_id,
     resolve_data_cache,
     sha256_file,
-    snapshot_data_cache,
+    merge_manifest,
     write_manifest,
 )
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
@@ -103,18 +104,18 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_CACHE = DEFAULT_DATA_CACHE
 
 
-def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path]:
-    """Save VecNormalize stats + final weights so inference matches training input scaling.
+def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path | None]:
+    """Save end-of-run VecNormalize stats + final policy weights.
 
-    Writes ``Runs/<id>/models/vec_normalize.pkl`` and a duplicate
-    ``Runs/<id>/models/best/vec_normalize.pkl`` (same file as best_model.zip).
+    Does **not** overwrite ``best/vec_normalize.pkl`` — that file is written alongside
+    ``best_model.zip`` whenever eval NAV improves.
     """
     root_vn = paths.models_dir / "vec_normalize.pkl"
     train_env.save(str(root_vn))
     best_vn = paths.best_model_dir / "vec_normalize.pkl"
-    shutil.copy2(root_vn, best_vn)
+    best_vn_exists = best_vn.is_file()
     model.save(str(paths.final_model))
-    return root_vn, best_vn
+    return root_vn, best_vn if best_vn_exists else None
 
 
 # ── Env factory ──────────────────────────────────────────────────────────
@@ -234,6 +235,10 @@ class EvalNavBestModelCallback(EvalCallback):
                         print(f"New best mean ending NAV: {mean_nav:,.0f}")
                     self._best_model_dir.mkdir(parents=True, exist_ok=True)
                     self.model.save(str(self._best_model_dir / "best_model"))
+                    if self._train_vec_env is not None:
+                        self._train_vec_env.save(
+                            str(self._best_model_dir / "vec_normalize.pkl")
+                        )
                 elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
                     # Patience early-stop, but only after the curriculum has fully released.
                     self._evals_since_best += 1
@@ -354,13 +359,13 @@ class AdaptiveEntropyCallback(BaseCallback):
         return True
 
 
-def trade_curriculum_milestones(learn_budget: int) -> tuple[int, int, int]:
-    """Return ``(fee_free_until, fee_ramp_end, churn_start_step)`` in environment steps.
+def trade_curriculum_milestones(learn_budget: int) -> tuple[int, int]:
+    """Return ``(fee_free_until, fee_ramp_end)`` in environment steps.
 
     - **Frictionless** until ``fee_free_until``; **fee ramp** until ``fee_ramp_end``; then DR.
-    - **Churn** penalty scale is 0 before ``churn_start_step``, then ramps linearly to 1.
+    - **Churn** penalty scale ramps ``churn_ramp_floor`` → 1.0 over the same fee-ramp window.
 
-    At ≤65M budget: fraction-of-run schedule (8% / 35% / 15%) to avoid a mid-run cliff.
+    At ≤65M budget: fraction-of-run schedule to avoid a mid-run cliff.
     Between 65M and 120M: interpolate toward long-run anchors; ≥120M uses fixed long milestones.
     """
     cur = get_config().curriculum
@@ -368,26 +373,22 @@ def trade_curriculum_milestones(learn_budget: int) -> tuple[int, int, int]:
     if lb <= cur.budget_short:
         fee_free = max(1, int(cur.fee_free_fraction * lb))
         fee_ramp = max(fee_free + 1, int(cur.fee_ramp_fraction * lb))
-        churn_at = max(1, int(cur.churn_start_fraction * lb))
-        return fee_free, fee_ramp, churn_at
+        return fee_free, fee_ramp
     ff_short = max(1, int(cur.fee_free_fraction * cur.budget_short))
     fr_short = max(ff_short + 1, int(cur.fee_ramp_fraction * cur.budget_short))
-    ch_short = max(1, int(cur.churn_start_fraction * cur.budget_short))
     if lb >= cur.budget_long:
-        return cur.fee_free_long, cur.fee_ramp_end_long, cur.churn_start_long
+        return cur.fee_free_long, cur.fee_ramp_end_long
     t = (lb - cur.budget_short) / (cur.budget_long - cur.budget_short)
     ff = int(ff_short + t * (cur.fee_free_long - ff_short))
     fr = int(fr_short + t * (cur.fee_ramp_end_long - fr_short))
-    ch = int(ch_short + t * (cur.churn_start_long - ch_short))
     fee_free = max(1, ff)
     fee_ramp = max(fee_free + 1, fr)
-    churn_at = max(1, ch)
-    return fee_free, fee_ramp, churn_at
+    return fee_free, fee_ramp
 
 
 def fee_curriculum_milestones(learn_budget: int) -> tuple[int, int]:
     """Backward-compatible (fee_free, fee_ramp_end) for logging."""
-    ff, fr, _ = trade_curriculum_milestones(learn_budget)
+    ff, fr = trade_curriculum_milestones(learn_budget)
     return ff, fr
 
 
@@ -401,7 +402,7 @@ def entropy_early_floor_milestones(learn_budget: int) -> int:
 def dr_widen_end_milestone(learn_budget: int) -> int:
     """Last step of progressive DR widening (fee/lag bounds); starts at ``fee_ramp_end``."""
     cur = get_config().curriculum
-    _, fee_ramp_end, _ = trade_curriculum_milestones(learn_budget)
+    _, fee_ramp_end = trade_curriculum_milestones(learn_budget)
     lb = max(1, int(learn_budget))
     if lb <= cur.budget_short:
         span = max(1, int(cur.dr_widen_span_fraction * lb))
@@ -431,10 +432,9 @@ class TradingCurriculumCallback(BaseCallback):
     - Steps ``[fee_free_until, fee_ramp_end)``: linear ramp to ``fee_scale = 1.0``.
     - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds.
     - Steps ``>= dr_widen_end``: full DR (fee in config DR range, lag in {0, 1, 2}).
-    - Churn: ``churn_scale = 0`` before ``churn_start_step``, then linear ramp to ``1`` over 10M steps.
+    - Churn: ``churn_scale = 0`` before ``fee_free_until``; then ``churn_ramp_floor`` → ``1``
+      linearly over the fee-ramp window (aligned with fee ramp).
     """
-
-    CHURN_RAMP_DURATION = 10_000_000
 
     def __init__(
         self,
@@ -445,7 +445,7 @@ class TradingCurriculumCallback(BaseCallback):
         super().__init__()
         self.vec_env = vec_env
         self.learn_budget = int(learn_budget)
-        self.fee_free_until, self.fee_ramp_end, self.churn_start_step = trade_curriculum_milestones(
+        self.fee_free_until, self.fee_ramp_end = trade_curriculum_milestones(
             self.learn_budget
         )
         self.dr_widen_end = dr_widen_end_milestone(self.learn_budget)
@@ -461,14 +461,15 @@ class TradingCurriculumCallback(BaseCallback):
         return None
 
     def _churn_scale(self, t: int) -> float:
-        """Progressively anneal churn penalty to avoid curriculum shock."""
-        if t < self.churn_start_step:
+        """Churn penalty scale aligned with fee curriculum (0 → floor → 1)."""
+        floor = float(get_config().curriculum.churn_ramp_floor)
+        if t < self.fee_free_until:
             return 0.0
-        ramp_end = self.churn_start_step + self.CHURN_RAMP_DURATION
-        if t >= ramp_end:
+        if t >= self.fee_ramp_end:
             return 1.0
-        progress = float(t - self.churn_start_step) / float(self.CHURN_RAMP_DURATION)
-        return progress
+        span = max(self.fee_ramp_end - self.fee_free_until, 1)
+        progress = float(t - self.fee_free_until) / float(span)
+        return floor + (1.0 - floor) * progress
 
     def _dr_bounds(self, t: int) -> tuple[float, float, int, int]:
         """Progressive fee/lag bounds after fee curriculum releases DR."""
@@ -662,10 +663,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--resume", default="", metavar="PATH",
-        help="Resume from a RecurrentPPO checkpoint .zip (loads weights + VecNormalize stats). Old MLP/PPO checkpoints are incompatible.",
+        "--resume",
+        default="",
+        metavar="PATH",
+        help=(
+            "Crash-resume from a checkpoint: restore weights + VecNormalize, continue the "
+            "curriculum and entropy schedule from the checkpoint timestep."
+        ),
+    )
+    parser.add_argument(
+        "--finetune",
+        default="",
+        metavar="PATH",
+        help=(
+            "Fine-tune from a checkpoint: lower LR/entropy/clip, skip curriculum and "
+            "adaptive-entropy callbacks (experimental regime, not crash resume)."
+        ),
     )
     args = parser.parse_args()
+    if args.resume.strip() and args.finetune.strip():
+        raise SystemExit("Use only one of --resume or --finetune, not both.")
     if Path(args.config).resolve() != cfg.path:
         set_config(load_config(args.config))
         cfg = get_config()
@@ -790,7 +807,27 @@ def main() -> None:
             )
         )
 
-    snapshot_data_cache(data_cache, paths.data_snapshot)
+    save_cache(
+        str(paths.data_snapshot),
+        idx,
+        ohlcv,
+        rsi,
+        macd,
+        macro,
+        fracdiff,
+        fracdiff_macro,
+        trend,
+        asset_vol,
+        macro_vol,
+        asset_live=asset_live,
+        fracdiff_d=cfg.data.fracdiff_d,
+        tickers=panel_tickers,
+    )
+    if args.n_assets is not None:
+        print(
+            f"  data snapshot: wrote effective N={n_assets} panel to {paths.data_snapshot.name} "
+            f"(run-local; global cache may be wider — use --refresh-data when changing --n-assets)"
+        )
 
     (idx_fit, ohlcv_fit, macro_fit, asset_live_fit), (
         idx_hold,
@@ -936,7 +973,10 @@ def main() -> None:
         )
     else:
         print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
-    print(f"  trade bundle on exit: {paths.models_dir.name}/vec_normalize.pkl + copy → best/ (pair with best_model.zip)")
+    print(
+        f"  trade bundle: best/ saves model + vec_normalize together on each new best eval NAV; "
+        f"exit writes final model + end-of-run vec_normalize.pkl"
+    )
     print(f"  n_envs={args.n_envs}, n_steps={args.n_steps}, batch={args.batch_size}")
     rollout_size = int(args.n_steps) * int(args.n_envs)
     if int(args.batch_size) > rollout_size:
@@ -949,14 +989,14 @@ def main() -> None:
     print(f"  obs_lag: train Uniform{{0,1,2}} per episode; eval fixed at {args.obs_lag}")
     print(f"  execution=open[t+1] (realistic: decide after close[t-1], fill at next open)")
     print(
-        f"  reward: return*{cfg.reward.reward_scale:g} + Sortino*{cfg.reward.risk_bonus_scale:g} "
+        f"  reward: return*{cfg.reward.reward_scale:g} (downside amp gamma={cfg.reward.drawdown_downside_gamma:g}) "
+        f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
-        f"- inactivity - churn*{cfg.reward.churn_penalty:g} "
-        f"- quadratic_dd*({cfg.reward.drawdown_penalty_scale:g}*{cfg.reward.drawdown_quadratic_multiplier:g})"
+        f"- inactivity - tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g}"
     )
     print(
         f"  eval inactivity scale: {cfg.reward.eval_inactivity_penalty_scale} "
-        f"(train=1.0; eval rewards less punitive for defensive cash)"
+        f"(train=1.0)"
     )
     print(f"  eval plot: mean ending NAV → Runs/<id>/eval_logs/eval_nav_history.npz")
     print(
@@ -969,14 +1009,15 @@ def main() -> None:
         f"  domain_randomization: fee_scale~Beta(5,5) on widening bounds, "
         f"obs_lag~Discrete (training, after fee curriculum)"
     )
-    _ff, _fr, _ch = trade_curriculum_milestones(args.timesteps)
+    _ff, _fr = trade_curriculum_milestones(args.timesteps)
     _ef = entropy_early_floor_milestones(args.timesteps)
     _edl = entropy_dr_lock_milestones(args.timesteps)
     _decay_frac = get_config().entropy_schedule.decay_start_fraction
     _decay_step = int(_decay_frac * args.timesteps)
     print(
         f"  fee curriculum: fee=0 for {_ff:,} steps → ramp to 1.0 by {_fr:,} → "
-        f"progressive DR widen to {_dre:,} → full DR; churn penalty from step {_ch:,}"
+        f"progressive DR widen to {_dre:,} → full DR; "
+        f"churn scale 0 → {cfg.curriculum.churn_ramp_floor:g} → 1.0 over same fee-ramp window"
     )
     print(
         f"  entropy: explore {ent_cfg.explore_ent} (floor 0.02 until {_edl:,} steps, "
@@ -1100,12 +1141,15 @@ def main() -> None:
 
     lr_schedule = _lr_schedule_with_floor(args.learning_rate, floor_lr=hp.learning_rate_floor)
 
-    if args.resume:
-        resume_path = Path(args.resume)
+    finetune_mode = bool(args.finetune.strip())
+    checkpoint_arg = args.finetune.strip() or args.resume.strip()
+    if checkpoint_arg:
+        resume_path = Path(checkpoint_arg)
         if not resume_path.is_file():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
 
-        print(f"  Resuming from: {resume_path}")
+        mode_label = "Fine-tuning" if finetune_mode else "Crash-resuming"
+        print(f"  {mode_label} from: {resume_path}")
         model = RecurrentPPO.load(
             str(resume_path),
             env=train_env,
@@ -1115,8 +1159,9 @@ def main() -> None:
         model.learning_rate = lr_schedule
         model.n_steps = args.n_steps
         model.batch_size = args.batch_size
-        model.ent_coef = hp.ent_coef_finetune
-        model.clip_range = lambda _: hp.clip_range_finetune
+        if finetune_mode:
+            model.ent_coef = hp.ent_coef_finetune
+            model.clip_range = lambda _: hp.clip_range_finetune
 
         stem = resume_path.stem
         parts = stem.split("_", 1)
@@ -1133,7 +1178,12 @@ def main() -> None:
             print("  WARNING: No VecNormalize stats found for checkpoint")
             eval_env.obs_rms = train_env.obs_rms
 
-        print(f"  Fine-tune LR={args.learning_rate}, ent_coef=0.001, clip=0.1")
+        if finetune_mode:
+            print(f"  Fine-tune LR={args.learning_rate}, ent_coef={hp.ent_coef_finetune}, clip={hp.clip_range_finetune}")
+        else:
+            print(
+                f"  Resume at timestep {model.num_timesteps:,}: curriculum + entropy callbacks active"
+            )
     else:
         model = RecurrentPPO(
             "MlpLstmPolicy",
@@ -1211,7 +1261,7 @@ def main() -> None:
         log_freq=max(tr_cfg.curriculum_update_freq, 1),
     )
     callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
-    if not args.resume:
+    if not finetune_mode:
         callbacks.insert(
             0,
             TradingCurriculumCallback(
@@ -1260,9 +1310,12 @@ def main() -> None:
         # Always persist VecNormalize + weights so runs are trade-ready even if learn() crashes
         vn_root, vn_best = _persist_trade_artifacts(model, train_env, paths)
         commit_modal_volumes(reason="training exit")
-        print(f"\nTrade bundle: {paths.final_model.name} + vec_normalize (run + best/)")
-        print(f"  VecNormalize: {vn_root}")
-        print(f"  Copy next to best: {vn_best}")
+        print(f"\nTrade bundle: {paths.final_model.name} + end-of-run vec_normalize")
+        print(f"  VecNormalize (final): {vn_root}")
+        if vn_best is not None:
+            print(f"  VecNormalize (best, paired with best_model.zip): {vn_best}")
+        else:
+            print("  WARNING: no best/vec_normalize.pkl — eval never improved NAV")
 
     if learn_error is not None:
         raise learn_error
@@ -1280,7 +1333,7 @@ def main() -> None:
             best_eval_step = int(eval_callback._nav_timesteps[i])
     early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
 
-    write_manifest(
+    merge_manifest(
         paths.manifest_path,
         {
             "run_id": run_id,
@@ -1333,7 +1386,10 @@ def main() -> None:
 
     print(f"\nSaved final model: {paths.final_model}")
     print(f"VecNormalize stats: {paths.models_dir / 'vec_normalize.pkl'}")
-    print(f"Best model + vec (trade): {paths.best_model_dir}/best_model.zip + vec_normalize.pkl")
+    print(
+        f"Best model + vec (trade, matched pair): "
+        f"{paths.best_model_dir}/best_model.zip + vec_normalize.pkl"
+    )
     print(f"Best checkpoint dir: {paths.models_dir / 'checkpoints'}/")
     if not args.no_viz:
         print(f"Training plot: {paths.training_plot}")

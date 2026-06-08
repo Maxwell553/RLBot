@@ -12,7 +12,7 @@ python scripts/train.py --config /path/to/config.yaml
 
 **N = number of keys** under `universe.assets` (not a separate setting). Supported range: **5–55** (`rlbot.rl_config.UNIVERSE_MIN_ASSETS` / `UNIVERSE_MAX_ASSETS`).
 
-Training CLI: `--n-assets N` keeps the first **N** keys in YAML order and slices per-asset lists (cannot exceed keys defined in this file).
+Training CLI: `--n-assets N` keeps the first **N** keys in YAML order and slices per-asset lists (cannot exceed keys defined in this file). After changing **N**, run `--refresh-data` so the global cache matches; each training run also writes an **N**-wide `Runs/<run_id>/data_cache.npz` snapshot for backtest reproducibility.
 
 Example — default **N = 10**:
 
@@ -55,6 +55,21 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 |-----|---------|
 | `feature_split_mode` | `continuous` (default) or `independent` — how walk-forward blocks get RSI/MACD/fracdiff/trend/vol features |
 | `feature_purge_warmup` | Bars neutralized at segment starts in `independent` mode (default 25) |
+
+## `reward` (key knobs)
+
+| Key | Purpose |
+|-----|---------|
+| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 1.5 + 1.0 tail above 90% cash) |
+| `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 5.0) |
+| `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 1.0) |
+| `eval_inactivity_penalty_scale` | Eval env inactivity scale (default 1.0) |
+
+## `curriculum`
+
+| Key | Purpose |
+|-----|---------|
+| `churn_ramp_floor` | Churn scale at fee-ramp start; ramps to 1.0 by `fee_ramp_fraction` (default 0.1) |
 
 ## Other sections
 

@@ -164,6 +164,17 @@ def write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(dict(payload), indent=2, default=str), encoding="utf-8")
 
 
+def merge_manifest(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write manifest fields, preserving keys from an existing file not in ``payload``."""
+    merged = dict(payload)
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        for key, val in existing.items():
+            if key not in merged:
+                merged[key] = val
+    write_manifest(path, merged)
+
+
 def read_run_manifest(run_id: str) -> dict[str, Any] | None:
     """Load ``Runs/<run_id>/manifest.json`` (or legacy ``runs/<run_id>/``)."""
     path = RunPaths(run_id=run_id).manifest_path

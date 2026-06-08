@@ -59,7 +59,10 @@ from rlbot.baselines import (
     balanced_6040_nav,
     benchmark_buyhold_nav,
     benchmark_metrics,
-    equal_weight_buyhold_nav,
+    benchmark_only_nav,
+    cash_nav,
+    equal_weight_daily_cost_aware_nav,
+    equal_weight_monthly_nav,
     naive_risk_parity_nav,
     portfolio_step_nav,
 )
@@ -546,8 +549,12 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     explicit_vn = Path(args.vec_normalize).expanduser().resolve() if args.vec_normalize.strip() else None
     vec_norm_path = _find_vec_normalize(model_path, run_id, explicit=explicit_vn)
     use_vec_norm = vec_norm_path.is_file()
-    if not use_vec_norm and args.require_vec_normalize:
-        raise FileNotFoundError(f"No VecNormalize stats at {vec_norm_path}")
+    require_vn = not getattr(args, "allow_missing_vec_normalize", False)
+    if not use_vec_norm and require_vn:
+        raise FileNotFoundError(
+            f"No VecNormalize stats at {vec_norm_path} "
+            "(required for OOS backtest; pass --allow-missing-vec-normalize to debug without obs norm)"
+        )
 
     _bt_log("[backtest] Deterministic OOS rollout...")
     t_roll = time.perf_counter()
@@ -976,16 +983,11 @@ def rollout_policy_on_slice(
                 deterministic=deterministic,
             )
             episode_starts = np.zeros((1,), dtype=bool)
-            if collect_weights:
-                live_t = raw_env.asset_live[max(raw_env._t - raw_env.obs_lag, 0)]
-                w_rows.append(
-                    portfolio_weights_from_action(
-                        np.asarray(action).reshape(-1),
-                        n_actions=raw_env.n_actions,
-                        asset_live=live_t,
-                    )
-                )
             obs, _, done, truncated, info = raw_env.step(action)
+            if collect_weights:
+                tw = info.get("target_weights")
+                if tw is not None:
+                    w_rows.append(np.asarray(tw, dtype=np.float64).reshape(-1))
             if use_vec_norm and vec_env is not None:
                 obs = vec_env.normalize_obs(obs)
             if "nav" in info:
@@ -1101,26 +1103,57 @@ def _print_detailed_stats(
     stats["max_drawdown"] = float(mdd)
     stats["calmar"] = calmar
 
-    nav_spy = benchmark_buyhold_nav(
-        navs, ohlcv_window, start_bar, tickers=None, benchmark_col=spy_ohlcv_col
-    )
-    lr_spy = np.diff(np.log(np.maximum(nav_spy, 1e-12)))
-    sh_spy = _sharpe_ann_from_log_rets(lr_spy)
+    nav_cash = cash_nav(navs, ohlcv_window, start_bar)
     print(
-        f"SPY 100% buy&hold (same OOS path, {len(lr_spy)} daily rets): "
-        f"total {(nav_spy[-1] / nav_spy[0] - 1) * 100:.2f}%, ann. Sharpe {sh_spy:.2f}"
+        f"100% cash / no-trade (flat NAV): "
+        f"total {(nav_cash[-1] / nav_cash[0] - 1) * 100:.2f}%"
     )
-    stats["benchmark_spy"] = {"total_return": float(nav_spy[-1] / nav_spy[0] - 1), "sharpe": sh_spy}
-    nav_ew = equal_weight_buyhold_nav(
+    stats["benchmark_cash"] = {"total_return": float(nav_cash[-1] / nav_cash[0] - 1), "sharpe": float("nan")}
+
+    nav_bench = benchmark_only_nav(
+        navs, ohlcv_window, start_bar, tickers=None, benchmark_col=spy_ohlcv_col,
+        asset_live=test_asset_live,
+    )
+    lr_bench = np.diff(np.log(np.maximum(nav_bench, 1e-12)))
+    sh_bench = _sharpe_ann_from_log_rets(lr_bench)
+    print(
+        f"Benchmark-only buy&hold (config benchmark sleeve, {len(lr_bench)} daily rets): "
+        f"total {(nav_bench[-1] / nav_bench[0] - 1) * 100:.2f}%, ann. Sharpe {sh_bench:.2f}"
+    )
+    stats["benchmark_only"] = {
+        "total_return": float(nav_bench[-1] / nav_bench[0] - 1),
+        "sharpe": sh_bench,
+    }
+    stats["benchmark_spy"] = stats["benchmark_only"]
+
+    nav_ew = equal_weight_daily_cost_aware_nav(
         navs, ohlcv_window, start_bar, asset_live=test_asset_live
     )
     lr_ew = np.diff(np.log(np.maximum(nav_ew, 1e-12)))
     sh_ew = _sharpe_ann_from_log_rets(lr_ew)
     print(
-        f"Equal-weight buy&hold (1/N assets, daily rebal., {len(lr_ew)} daily rets): "
+        f"Equal-weight daily (tx-cost-aware, {len(lr_ew)} daily rets): "
         f"total {(nav_ew[-1] / nav_ew[0] - 1) * 100:.2f}%, ann. Sharpe {sh_ew:.2f}"
     )
-    stats["benchmark_equal_weight"] = {"total_return": float(nav_ew[-1] / nav_ew[0] - 1), "sharpe": sh_ew}
+    stats["benchmark_equal_weight_daily"] = {
+        "total_return": float(nav_ew[-1] / nav_ew[0] - 1),
+        "sharpe": sh_ew,
+    }
+    stats["benchmark_equal_weight"] = stats["benchmark_equal_weight_daily"]
+
+    nav_ew_m = equal_weight_monthly_nav(
+        navs, ohlcv_window, start_bar, test_idx, asset_live=test_asset_live
+    )
+    lr_ew_m = np.diff(np.log(np.maximum(nav_ew_m, 1e-12)))
+    sh_ew_m = _sharpe_ann_from_log_rets(lr_ew_m)
+    print(
+        f"Equal-weight monthly (tx-cost-aware, {len(lr_ew_m)} daily rets): "
+        f"total {(nav_ew_m[-1] / nav_ew_m[0] - 1) * 100:.2f}%, ann. Sharpe {sh_ew_m:.2f}"
+    )
+    stats["benchmark_equal_weight_monthly"] = {
+        "total_return": float(nav_ew_m[-1] / nav_ew_m[0] - 1),
+        "sharpe": sh_ew_m,
+    }
     try:
         nav_6040 = balanced_6040_nav(
             navs, ohlcv_window, start_bar, test_idx, asset_live=test_asset_live
@@ -1385,9 +1418,9 @@ def main() -> None:
         help="VecNormalize .pkl (default: auto from run-id / checkpoints next to model)",
     )
     parser.add_argument(
-        "--require-vec-normalize",
+        "--allow-missing-vec-normalize",
         action="store_true",
-        help="Exit with error if no VecNormalize stats file is found (strict trade validation)",
+        help="Allow backtest without VecNormalize stats (debug only; training uses obs norm by default)",
     )
     parser.add_argument("--no-viz", action="store_true", help="Skip saving backtest plot PNG")
     parser.add_argument(

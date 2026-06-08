@@ -1,14 +1,13 @@
-# Curriculum-phase ablation: does turning the churn penalty on earlier/later, or
-# reshaping the fee ramp, move the validation-NAV cliff or participation behavior?
+# Curriculum-phase ablation: churn_ramp_floor vs fee_ramp_fraction interaction.
 # Dev tier (no OOS read).
 id: curriculum_ablation
 hypothesis: >
-  Earlier churn onset and a shorter fee ramp change the cliff timing / turnover without
+  A higher churn_ramp_floor at fee-ramp start reduces early hyper-turnover without
   hurting eval NAV.
 parent: baseline
 base_config: config/config.yaml
 grid:
-  curriculum.churn_start_fraction: [0.10, 0.20, 0.35]
+  curriculum.churn_ramp_floor: [0.0, 0.1, 0.25]
   curriculum.fee_ramp_fraction: [0.35, 0.45]
 seeds: [42]
 windows:

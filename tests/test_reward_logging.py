@@ -18,22 +18,20 @@ def test_empty_summary_is_safe() -> None:
 
 def test_accumulates_means_and_shares() -> None:
     acc = RewardDecompAccumulator()
-    # Two steps: inactivity dominates participation (the review's asymmetry).
     acc.update([_info(return_=0.0)])  # ignored key (not a real term) → contributes nothing
     acc.update(
         [
-            {"rew_decomp/return": 20.0, "rew_decomp/participation": 1.0,
-             "rew_decomp/inactivity": -25.0, "rew_decomp/churn": -0.85,
-             "rew_decomp/sortino": 5.0, "rew_decomp/drawdown": -0.75},
+            {"rew_decomp/return": -25.0, "rew_decomp/participation": 1.0,
+             "rew_decomp/inactivity": -2.5, "rew_decomp/churn": -1.2,
+             "rew_decomp/sortino": 5.0, "rew_decomp/drawdown": -5.0},
         ]
     )
     s = acc.summary()
     assert s["count"] == 1
-    assert s["mean"]["inactivity"] == -25.0
+    assert s["mean"]["inactivity"] == -2.5
     assert s["mean"]["participation"] == 1.0
-    # inactivity's absolute share must exceed participation's (asymmetry visible)
-    assert s["abs_share"]["inactivity"] > s["abs_share"]["participation"]
-    # shares sum to ~1
+    # return (with downside amp) should dominate shaping terms at realistic magnitudes
+    assert s["abs_share"]["return"] > s["abs_share"]["inactivity"]
     assert abs(sum(s["abs_share"].values()) - 1.0) < 1e-9
 
 

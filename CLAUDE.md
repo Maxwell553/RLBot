@@ -73,8 +73,9 @@ A backtest is only valid if its window flags match training. `--until`, `--train
 
 Backtest binds the run's own snapshots by default for reproducibility:
 
-- `backtest.py` loads `Runs/<run_id>/config.yaml` for costs/cap/env mechanics (override with `--use-current-config`) and prefers the run-local `Runs/<run_id>/data_cache.npz` over the global cache (override with `--data-cache PATH`), so editing config or refreshing the cache does not silently change an old run's OOS numbers.
-- `--checkpoint` defaults to **`best`** (eval-NAV-selected; holdout not used to pick weights); `latest`/`both` print an OOS-touch warning.
+- `backtest.py` loads `Runs/<run_id>/config.yaml` for costs/cap/env mechanics (override with `--use-current-config`) and prefers the run-local `Runs/<run_id>/data_cache.npz` over the global cache (override with `--data-cache PATH`), so editing config or refreshing the cache does not silently change an old run's OOS numbers. Training writes the **effective N-wide** panel into the run snapshot (not a byte-copy of a wider global cache); use `--refresh-data` when changing `--n-assets` or `universe.assets`.
+- `--checkpoint` defaults to **`best`** (eval-NAV-selected; holdout not used to pick weights); `latest`/`both` print an OOS-touch warning. **`best_model.zip` is saved with `best/vec_normalize.pkl` from the same eval step** — do not pair best weights with end-of-run normalization stats.
+- OOS backtest **requires** VecNormalize by default (`--allow-missing-vec-normalize` for debug only).
 - Each single-run backtest writes `Runs/<run_id>/backtest_summary.json` (override `--summary-json`) with metrics plus config/data-cache hashes for drift detection.
 
 ## Inference freezes normalization
@@ -93,12 +94,14 @@ Backtest binds the run's own snapshots by default for reproducibility:
 
 - **Experiment specs** (`specs/*.yaml`, parsed by `rlbot/research/spec.py`) declare a hypothesis + a config `patch`/`grid`. A patch may only target method knobs (`reward.*`, `curriculum.*`, `entropy_schedule.*`, `policy.*`, `hyperparameters.*`, `environment.*`, `data.feature_split_mode`, safe `training.*`). Patching the universe, transaction costs, holdout dates, or the split (`block_size`/`eval_stride`/`holdout_days`) is **rejected** — those change what OOS is.
 - **`scripts/research.py`** (`plan`/`launch`/`collect`/`report`/`promote`) shells to the canonical `train.py`/`backtest.py`, writes `Runs/<cohort>/registry.jsonl`, and enforces the OOS firewall via `rlbot/research/gates.py`: tiers 1–3 train + in-training eval only; tier ≥ 4 reads the holdout **once per variant** and requires `--promote`.
-- **Per-term reward logging**: training writes `Runs/<id>/eval_logs/reward_decomp.json` + TB scalars (`rew_decomp/*`) so the reward balance (e.g. inactivity vs participation) is observable.
-- **`scripts/infer_weights.py`** emits audited target weights (long-only simplex ≤ cap) with full provenance (config/data/model hashes), reusing the backtest rollout. Measurement only — no broker adapter, no market-impact/capacity model.
+- **Per-term reward logging**: training writes `Runs/<id>/eval_logs/reward_decomp.json` + TB scalars (`rew_decomp/*`) so the reward balance is observable.
+- **Reward shaping** (`config.yaml` → `reward`): return (with `drawdown_downside_gamma` amplification on negative steps when underwater) + Sortino diff + participation − inactivity (default max ~2.5 at 100% cash) − cost-linked churn (`tx_cost_frac × churn_penalty × reward_scale × VIX × curriculum_churn_scale`). Churn ramp aligns with fee ramp (`churn_ramp_floor: 0.1` → 1.0). See README reward table.
+- **`scripts/infer_weights.py`** emits audited **executed** target weights (`info["target_weights"]` after EMA smoothing) with full provenance (config/data/model hashes), reusing the backtest rollout. Measurement only — no broker adapter, no market-impact/capacity model.
+- **Resume vs fine-tune:** `--resume` continues curriculum + entropy after a crash; `--finetune` lowers LR/entropy/clip and skips those callbacks (experimental).
 - New env behavior knobs in `config.yaml`: `training.early_stop_patience` (>0 → patience early-stop after the curriculum completes) and `training.reproducible` (deterministic per-env seed streams).
 
 ## Artifacts and gitignored paths
 
-The canonical run layout is `Runs/<run_id>/` (capital R): `manifest.json`, `config.yaml`, `data_cache.npz`, `models/{final,best,checkpoints}/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/`. Run paths/IDs/manifests are managed by `rlbot/run_artifacts.py` (`RunPaths`, `new_run_id`, `write_manifest`, `read_run_manifest`, `discover_run_ids_with_models`, `resolve_data_cache`, `snapshot_data_cache`). There is no `LATEST.txt`.
+The canonical run layout is `Runs/<run_id>/` (capital R): `manifest.json` (final write merges in `chronological_holdout` from pre-train), `config.yaml`, `data_cache.npz`, `models/{final,best,checkpoints}/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/`. Run paths/IDs/manifests are managed by `rlbot/run_artifacts.py` (`RunPaths`, `new_run_id`, `write_manifest`, `merge_manifest`, `read_run_manifest`, `discover_run_ids_with_models`, `resolve_data_cache`). There is no `LATEST.txt`.
 
 Gitignored (see `.gitignore`): `.cache/`, `data_cache.npz`, `Runs/`, the legacy artifact roots `models/ runs/ tb_logs/ logs/ plots/` (pre-`Runs/` layout, migratable via `scripts/migrate_runs_layout.py`), `ibkr_paper/`, and `execution/**`. Broker automation and local execution state stay out of the research tree.

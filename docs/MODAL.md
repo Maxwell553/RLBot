@@ -144,7 +144,7 @@ Then open the plot route with `?run_id=<RUN_ID>`.
 
 ## Resume on Modal
 
-Checkpoints land on the runs volume under `Runs/<run_id>/models/checkpoints/`. Resume with the same `--run-id` and:
+Checkpoints land on the runs volume under `Runs/<run_id>/models/checkpoints/`. After a **crash or preemption**, continue with `--resume` (restores curriculum + entropy schedule). Use `--finetune` only for an intentional second-stage experiment (lower LR/entropy, no curriculum).
 
 ```bash
 modal run scripts/modal_app.py -- \
@@ -158,7 +158,7 @@ modal run scripts/modal_app.py -- \
 ## Tips
 
 - **Run id:** Auto ids (`--window N` → `W{N}_MMDD`, month/day at launch) are generated on the remote host. Check Modal logs for `Run id:` or pass `--run-id <RUN_ID>` for predictable sync.
-- **Timeout:** Modal caps each container at **24 hours** (we set the max as headroom). A 65M-step run that takes ~6h locally should finish in one session on an A10G/A100 — use `--resume` only if the job crashes or is preempted (checkpoints every 1M steps).
+- **Timeout:** Modal caps each container at **24 hours** (we set the max as headroom). A 65M-step run that takes ~6h locally should finish in one session on an A10G/A100 — use `--resume` (not `--finetune`) if the job crashes or is preempted (checkpoints every 1M steps).
 - **Costs:** 65M-step jobs are long; pick GPU in `rlbot/modal_cloud.py` (`DEFAULT_GPU` or `--modal-gpu`) to match your budget.
 - **n_envs:** Linux Modal containers usually spawn `SubprocVecEnv` faster than macOS; you can still tune `--n-envs` if memory is tight.
 - **Local vs remote:** Local `Runs/` is gitignored. After `--pull-all`, local backtest uses the same paths as a local training run.
