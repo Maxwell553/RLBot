@@ -1,5 +1,7 @@
 # Claude Review: RLBot / MarketTrainer — 2026-06-05
 
+> **Status (2026-06-08):** Roadmap items P0–P4 largely implemented per [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md). Remaining: dependency lockfile, torch-path smoke runs, Modal research backend, registry-driven RESEARCH.md.
+
 **Reviewer:** Claude (Opus 4.8, 1M context) via Claude Code
 **Date:** 2026-06-05
 **Scope:** Full repository — code (`rlbot/`, `scripts/`), `config/`, tests, docs, Modal integration — plus the two same-day peer reviews (`docs/codex-review-20260605.md`, `docs/grok-review-20260605.md`) and the two May-31 priors (`docs/RLBot_Design_Review.md`, `docs/RLBot_Critical_Review.md`).

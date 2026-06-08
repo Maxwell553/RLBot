@@ -1,5 +1,7 @@
 # RLBot (MarketTrainer) — Critical Review
 
+> **Status (2026-06-08):** Historical snapshot. Since this review: dynamic N (5–55), `infer_weights.py`, auto-research (`research.py` + `specs/`), run-local backtest binding, `feature_split_mode`, and reward-decomp logging shipped. **No new OOS results** are published under the current pipeline — prior numbers in this review are pre-refactor. See [RESEARCH.md](RESEARCH.md).
+
 **Date:** 2026-06 (review performed on current main branch checkout)  
 **Scope:** Full repository: code, configuration, data pipeline, training loop, evaluation, documentation, and research claims.  
 **Purpose:** Independent technical and methodological assessment to guide continued development.

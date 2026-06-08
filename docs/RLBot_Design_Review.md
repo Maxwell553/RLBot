@@ -1,5 +1,7 @@
 # RLBot (MarketTrainer) — Design & Implementation Review
 
+> **Status (2026-06-08):** Historical snapshot (pre-evolution-roadmap). OOS figures cited below (e.g. W3 +37.7%) are **obsolete** — not valid under the current pipeline. See [RESEARCH.md](RESEARCH.md).
+
 **Date:** 2026-05-31
 **Reviewer scope:** Full read of `trading_env.py`, `train.py`, `data_utils.py`, `backtest.py`, `backtest_sweep.py`, `rl_config.py`, `run_artifacts.py`, `vecnorm_utils.py`, `config.yaml`, `tests/`, `windows/`, `README.md`, `RESEARCH.md`.
 **Goal:** Independent technical assessment grounded in the actual code (not the README's self-description), with concrete, prioritized recommendations.

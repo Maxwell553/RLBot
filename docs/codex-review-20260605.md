@@ -1,5 +1,7 @@
 # Codex Repository Review - 2026-06-05
 
+> **Status (2026-06-08):** Historical snapshot. Post-review work documented in [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md).
+
 ## Scope
 
 This review is based on a static read of the current repository, including:

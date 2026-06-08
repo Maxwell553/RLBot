@@ -6,7 +6,7 @@
 
 **CLI shortcut:** `scripts/train.py --n-assets N` uses the **first N keys** from that block (YAML order), slices `benchmark_cap_weights` and `transaction_costs.*`, and renormalizes cap weights. You cannot set **N** larger than the number of keys in the file — add symbols to the YAML first. The benchmark label (`universe.benchmark`, usually `SP500`) must stay among those first N keys (it is first in the default config).
 
-To change **which** assets are in the panel (not just how many), edit the YAML and run `--refresh-data`.
+To change **which** assets are in the panel (not just how many), edit the YAML and run `--refresh-data` to update the cache.
 
 ```yaml
 # config/config.yaml — full list; --n-assets 7 keeps SP500 … BOND10Y
@@ -86,7 +86,7 @@ python scripts/train.py \
   --window 1
 ```
 
-Omit `--run-id` and pass `--window N` to auto-name the run `W{N}_<month><day>` (e.g. `W1_604` on June 4). If that folder already exists, the next id is `W1_604_a`, then `W1_604_b`, etc. You can still set `--run-id` explicitly.
+Omit `--run-id` and pass `--window N` to auto-name the run `W{N}_<month><day>` (e.g. `W1_605` on June 5). If that folder already exists, the next id is `W1_605_a`, then `W1_605_b`, etc. You can still set `--run-id` explicitly.
 
 Training will:
 
@@ -98,20 +98,29 @@ Training will:
 ### 5. OOS backtest (after training)
 
 ```bash
-python scripts/backtest.py --run-id <RUN_ID> --detailed --stochastic-paths 30 --plot-tag best
+python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
 ```
 
-Backtest reads `manifest.universe.tickers` and checks observation dimension against the saved model / VecNormalize stats.
+Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and checks observation dimension against the saved model / VecNormalize stats. Results land in `Runs/<id>/backtest_summary.json`.
+
+### 6. Target-weight inference (optional)
+
+For a single as-of date (measurement only — no broker):
+
+```bash
+python scripts/infer_weights.py --run-id <RUN_ID> --checkpoint best --as-of 2022-12-31
+```
+
+Writes audited JSON (target weights, logits, live mask, config/data/model hashes) via the same rollout path as backtest.
 
 ---
 
 ## Walk-forward windows
 
-Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`.
+Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. **No OOS results are published yet** under the current pipeline — backtest only after a fresh `W*_605` run completes; record numbers in RESEARCH.md.
 
 ```bash
-python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
-python scripts/backtest.py --run-id W1 --checkpoint both --detailed --stochastic-paths 30 --plot-tag best
+python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
 ```
 
 ---
@@ -130,8 +139,11 @@ Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 |------|----------|
 | `manifest.json` | Dates, tickers, `n_assets`, `obs_dim`, universe metadata |
 | `config.yaml` | Snapshot of training config |
+| `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
 | `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl`, `best/best_model.zip` |
-| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV history |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` |
+| `backtest_summary.json` | OOS metrics + config/data hashes (after backtest) |
+| `training_summary.json` | Training-end summary (after train completes) |
 
 Migrate legacy scattered dirs once: `python scripts/migrate_runs_layout.py`.
 
@@ -149,3 +161,17 @@ Quick flow:
 4. After the job: `python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all` then backtest locally
 
 Use `--run-id` explicitly if you want a fixed id for sync before the job prints logs.
+
+---
+
+## Auto-research (method experiments)
+
+For systematic A/B sweeps without hand-editing configs:
+
+```bash
+python scripts/research.py plan   specs/feature_split_ab.yaml   # materialize variant configs
+python scripts/research.py launch specs/feature_split_ab.yaml   # tiers 1–3 (no OOS); tier ≥4 needs --promote
+python scripts/research.py report feature_split_ab
+```
+
+Specs live in `specs/`; results append to `Runs/<cohort>/registry.jsonl`. The firewall rejects patches that change the universe, holdout dates, or transaction costs.

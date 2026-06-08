@@ -49,6 +49,13 @@ To use **N = 20**, add ten more `LABEL: yfinance_symbol` pairs and extend every 
 
 Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 
+## `data` (feature pipeline)
+
+| Key | Purpose |
+|-----|---------|
+| `feature_split_mode` | `continuous` (default) or `independent` — how walk-forward blocks get RSI/MACD/fracdiff/trend/vol features |
+| `feature_purge_warmup` | Bars neutralized at segment starts in `independent` mode (default 25) |
+
 ## Other sections
 
-See the table in [README.md](../README.md#configuration-configconfigyaml-rlbotrl_configpy).
+See the reward/cost tables in [README.md](../README.md) and [docs/RESEARCH.md](../docs/RESEARCH.md).

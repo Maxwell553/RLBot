@@ -8,6 +8,10 @@ auto-research capability, and the issues still open. The full plan lives at
 **Branch:** `feat/evolution-roadmap`. **Tests:** 51 → **92 passing** (+1 torch-gated skip),
 all torch-free and wired into CI (`.github/workflows/ci.yml`).
 
+> **Results status (2026-06-08):** Harness work shipped; **no definitive OOS numbers** under the
+> current config yet. Prior `W*_604` backtests used a different reward/cost/env stack and must not
+> be cited. See [RESEARCH.md](RESEARCH.md).
+
 ---
 
 ## 1. Context
@@ -77,8 +81,8 @@ inference path. This round implements all five phases (with two honestly-scoped 
 - **`scripts/infer_weights.py`**: audited target weights from `--run-id --as-of`, reusing
   the proven backtest rollout (recurrent warmup, frozen VecNormalize), with full provenance;
   torch-free assembly/validation in `rlbot/inference_output.py`.
-- **`scripts/paper_trade.py` + `paper_trade/README.md`**: measurement-only loop (turnover
-  tracking); broker + market-impact/capacity explicitly out of scope.
+- *(Removed 2026-06-08)* `scripts/paper_trade.py` + `paper_trade/` — thin turnover-logging
+  wrapper around `infer_weights.py`; superseded by calling `infer_weights` directly.
 
 ---
 
@@ -98,7 +102,7 @@ inference path. This round implements all five phases (with two honestly-scoped 
 | 60/40 on small N | Hard `KeyError` | Graceful skip + note |
 | Per-asset cap | Best-effort 5-iter redistribute | Guaranteed final projection + fuzz tests |
 | Auto-research | None | Spec → registry → report → gated orchestrator |
-| Inference | No audited in-tree path | `infer_weights.py` + paper-trade scaffold |
+| Inference | No audited in-tree path | `infer_weights.py` + `inference_output.py` |
 | Agent docs | Materially stale | Corrected + invariant test + CI |
 | Tests | 51 | 92 (+ torch-gated) |
 

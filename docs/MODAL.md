@@ -22,7 +22,7 @@ modal setup   # once per machine; links your Modal account
 Optional: upload a local data cache so the remote job skips yfinance download:
 
 ```bash
-# After a local --refresh-data
+# After a local --refresh-data to create the cache
 modal run scripts/modal_app.py::upload_cache
 ```
 
@@ -67,13 +67,13 @@ modal run scripts/modal_app.py -- --modal-gpu A100 --window 2 --timesteps 650000
 Maximum throughput (highest cost):
 
 ```bash
-modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id W1_605 --timesteps 65000000 ...
+modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 65000000 ...
 ```
 
 Use an explicit run id when you plan to watch or sync artifacts:
 
 ```bash
-modal run scripts/modal_app.py -- --run-id W2_modal_605 --timesteps 65000000 ...
+modal run scripts/modal_app.py -- --run-id <RUN_ID> --timesteps 65000000 ...
 ```
 
 Remote writes go to Modal volumes:
@@ -87,10 +87,10 @@ After each training plot refresh, the job commits the runs volume so local sync 
 
 ## Watch plots while training
 
-In a second terminal on your laptop:
+In a second terminal on your device:
 
 ```bash
-python scripts/modal_app.py sync --run-id W2_605 --watch
+python scripts/modal_app.py sync --run-id <RUN_ID> --watch
 ```
 
 This polls the `rlbot-runs` volume every 30 seconds (change with `--interval`) and writes into local `Runs/<run_id>/plots/training.png`. Open that file in Cursor/your IDE — it updates in place without spawning Preview. Omit `--open` (default); `--open` only launches the OS viewer once when the first plot arrives.
@@ -98,14 +98,14 @@ This polls the `rlbot-runs` volume every 30 seconds (change with `--interval`) a
 One-shot sync (no watch):
 
 ```bash
-python scripts/modal_app.py sync --run-id W2_605
+python scripts/modal_app.py sync --run-id <RUN_ID>
 ```
 
 Pull the full run after training finishes (models, logs, TensorBoard, etc.):
 
 ```bash
-python scripts/modal_app.py sync --run-id W2_605 --pull-all
-python scripts/backtest.py --run-id W2_605 --checkpoint best --plot-tag best
+python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all
+python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --plot-tag best
 ```
 
 List run folders on the volume:
@@ -125,13 +125,13 @@ modal deploy scripts/modal_app.py
 Open the plot endpoint (replace host and run id):
 
 ```
-https://<your-workspace>--rlbot-train-plot.modal.run?run_id=W2_605
+https://<your-workspace>--rlbot-train-plot.modal.run?run_id=<RUN_ID>
 ```
 
 Run status JSON:
 
 ```
-https://<your-workspace>--rlbot-train-status.modal.run?run_id=W2_605
+https://<your-workspace>--rlbot-train-status.modal.run?run_id=<RUN_ID>
 ```
 
 For ephemeral dev URLs:
@@ -148,8 +148,8 @@ Checkpoints land on the runs volume under `Runs/<run_id>/models/checkpoints/`. R
 
 ```bash
 modal run scripts/modal_app.py -- \
-  --run-id W2_605 \
-  --resume Runs/W2_605/models/checkpoints/ppo_<steps>_steps.zip \
+  --run-id <RUN_ID> \
+  --resume Runs/<RUN_ID>/models/checkpoints/ppo_<steps>_steps.zip \
   --timesteps 65000000
 ```
 
@@ -157,7 +157,7 @@ modal run scripts/modal_app.py -- \
 
 ## Tips
 
-- **Run id:** Auto ids (`--window N` → `W{N}_MMDD`) are generated on the remote host. Check Modal logs for `Run id:` or pass `--run-id` for predictable sync.
+- **Run id:** Auto ids (`--window N` → `W{N}_MMDD`, month/day at launch) are generated on the remote host. Check Modal logs for `Run id:` or pass `--run-id <RUN_ID>` for predictable sync.
 - **Timeout:** Modal caps each container at **24 hours** (we set the max as headroom). A 65M-step run that takes ~6h locally should finish in one session on an A10G/A100 — use `--resume` only if the job crashes or is preempted (checkpoints every 1M steps).
 - **Costs:** 65M-step jobs are long; pick GPU in `rlbot/modal_cloud.py` (`DEFAULT_GPU` or `--modal-gpu`) to match your budget.
 - **n_envs:** Linux Modal containers usually spawn `SubprocVecEnv` faster than macOS; you can still tune `--n-envs` if memory is tight.

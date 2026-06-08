@@ -1,5 +1,7 @@
 # Grok Review: RLBot / MarketTrainer — 2026-06-05
 
+> **Status (2026-06-08):** Historical snapshot. Agent docs refreshed; `infer_weights.py` + auto-research loop shipped; `paper_trade/` removed. See [README.md](../README.md) and [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md).
+
 **Reviewer:** Grok 4.3 (xAI)  
 **Date:** 2026-06-05  
 **Scope:** Full repository (code, config, data pipeline, training/eval harness, artifacts, docs, tests, Modal integration, prior self-assessments). Grounded in source + execution of key paths (imports, config load, test collection, logic inspection) rather than self-description.  
