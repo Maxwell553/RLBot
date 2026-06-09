@@ -42,6 +42,11 @@ CANONICAL_WINDOWS: dict[str, dict[str, str]] = {
     for n in range(1, 7)
 }
 
+# Reserved terminal validation window: excluded from ALL research specs so at least
+# one holdout stays untouched by the iterate-measure loop. Only a final pre-deployment
+# validation (human-run, outside research.py) or the tier-5 shadow path may use it.
+EMBARGOED_WINDOWS = frozenset({"W6"})
+
 _WINDOW_KEYS = {"name", "train_end", "holdout_start", "holdout_end"}
 _WINDOW_DATE_KEYS = ("train_end", "holdout_start", "holdout_end")
 
@@ -67,7 +72,13 @@ def normalize_window(window: dict) -> dict:
         if name and canon_by_name is None:
             raise ValueError(
                 f"window name {window.get('name')!r} is not canonical and gives no dates; "
-                f"use one of {sorted(CANONICAL_WINDOWS)} or omit windows for the config default."
+                f"use one of {sorted(set(CANONICAL_WINDOWS) - set(EMBARGOED_WINDOWS))} "
+                "or omit windows for the config default."
+            )
+        if name in EMBARGOED_WINDOWS:
+            raise PermissionError(
+                f"window {name} is EMBARGOED — it is the reserved terminal validation "
+                "window and may not be used by research specs. Use W1–W5."
             )
         return {"name": name, **(canon_by_name or {})} if name else {}
     match = next(
@@ -82,7 +93,13 @@ def normalize_window(window: dict) -> dict:
         )
     if canon_by_name is not None and match != name:
         raise ValueError(f"window {window!r}: name says {name} but dates match {match}")
-    return {"name": name or match, **CANONICAL_WINDOWS[match]}
+    resolved = name or match
+    if resolved in EMBARGOED_WINDOWS:
+        raise PermissionError(
+            f"window {resolved} is EMBARGOED — it is the reserved terminal validation "
+            "window and may not be used by research specs. Use W1–W5."
+        )
+    return {"name": resolved, **CANONICAL_WINDOWS[match]}
 _ALLOWED_TRAINING = {
     "training.reproducible",
     "training.early_stop_patience",

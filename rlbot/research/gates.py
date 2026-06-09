@@ -98,3 +98,88 @@ def assert_oos_budget(n_variants: int, budget: int) -> None:
             "the holdout is multiple testing; promote a single pre-registered variant "
             "instead, or raise --oos-budget explicitly if this is deliberate."
         )
+
+
+# ── Success-gate engine: pre-registered decision rules, evaluated at collect ──
+
+# Gate keys a spec may declare. Anything else raises — a typo'd pre-registered
+# gate that silently never evaluates would defeat the point of pre-registration.
+SUPPORTED_SUCCESS_GATES = {
+    "min_seeds",               # scored distinct seeds required, else inconclusive
+    "eval_nav_mean_min",       # mean best_eval_nav across seeds >= x
+    "eval_nav_median_min",     # median best_eval_nav across seeds >= x
+    "eval_nav_spread_max_frac",  # (max-min)/|median| of best_eval_nav <= x (seed stability)
+    "oos_sharpe_min",          # tier>=4 rows only
+    "oos_max_drawdown_floor",  # tier>=4: max_drawdown >= x (x negative, e.g. -0.25)
+    "deflated_sharpe_min",     # tier>=4: selection-aware significance bar
+}
+
+_OOS_GATES = {"oos_sharpe_min", "oos_max_drawdown_floor", "deflated_sharpe_min"}
+
+
+def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> dict:
+    """Evaluate one seed-group's scored records against its spec's success_gates.
+
+    Returns ``{"verdict": "pass"|"fail"|"inconclusive", "checks": {...}}``.
+    ``inconclusive`` = not enough evidence (too few seeds, or an OOS gate declared
+    with no tier>=4 record yet); ``fail`` = a threshold was checked and missed.
+    """
+    gates = dict(success_gates or {})
+    unknown = set(gates) - SUPPORTED_SUCCESS_GATES
+    if unknown:
+        raise ValueError(
+            f"unknown success_gates key(s) {sorted(unknown)}; "
+            f"supported: {sorted(SUPPORTED_SUCCESS_GATES)}"
+        )
+    rows = [r for r in rows if str(r.get("status", "ok")) == "ok"]
+    checks: dict[str, dict] = {}
+    verdict = "pass"
+
+    def _check(name: str, ok: bool | None, observed, threshold) -> None:
+        nonlocal verdict
+        state = "inconclusive" if ok is None else ("pass" if ok else "fail")
+        checks[name] = {"state": state, "observed": observed, "threshold": threshold}
+        if state == "fail":
+            verdict = "fail"
+        elif state == "inconclusive" and verdict != "fail":
+            verdict = "inconclusive"
+
+    navs = [float(r["best_eval_nav"]) for r in rows if r.get("best_eval_nav") is not None]
+    seeds = {r.get("seed") for r in rows if r.get("seed") is not None}
+    n_seeds = len(seeds) if seeds else len(rows)
+    if "min_seeds" in gates:
+        # Too few seeds is missing evidence, not a failed threshold.
+        _check("min_seeds", True if n_seeds >= int(gates["min_seeds"]) else None,
+               n_seeds, int(gates["min_seeds"]))
+    if "eval_nav_mean_min" in gates:
+        obs = sum(navs) / len(navs) if navs else None
+        _check("eval_nav_mean_min", None if obs is None else obs >= float(gates["eval_nav_mean_min"]),
+               obs, float(gates["eval_nav_mean_min"]))
+    if "eval_nav_median_min" in gates:
+        obs = sorted(navs)[len(navs) // 2] if navs else None
+        _check("eval_nav_median_min", None if obs is None else obs >= float(gates["eval_nav_median_min"]),
+               obs, float(gates["eval_nav_median_min"]))
+    if "eval_nav_spread_max_frac" in gates:
+        if len(navs) >= 2:
+            med = sorted(navs)[len(navs) // 2]
+            obs = (max(navs) - min(navs)) / max(abs(med), 1e-9)
+            _check("eval_nav_spread_max_frac", obs <= float(gates["eval_nav_spread_max_frac"]),
+                   obs, float(gates["eval_nav_spread_max_frac"]))
+        else:
+            _check("eval_nav_spread_max_frac", None, None, float(gates["eval_nav_spread_max_frac"]))
+    oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
+    for key, field, cmp_ge in (
+        ("oos_sharpe_min", "oos_sharpe", True),
+        ("oos_max_drawdown_floor", "oos_max_drawdown", True),
+        ("deflated_sharpe_min", "oos_deflated_sharpe", True),
+    ):
+        if key not in gates:
+            continue
+        vals = [float(r[field]) for r in oos_rows if r.get(field) is not None]
+        if not vals:
+            _check(key, None, None, float(gates[key]))
+            continue
+        obs = sorted(vals)[len(vals) // 2]
+        _check(key, obs >= float(gates[key]) if cmp_ge else obs <= float(gates[key]),
+               obs, float(gates[key]))
+    return {"verdict": verdict, "checks": checks}

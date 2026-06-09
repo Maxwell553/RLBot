@@ -75,9 +75,16 @@ Use `--window N` on `train.py` (or `modal run scripts/modal_app.py -- …`) for 
 | 3 | 2019-12-31 | 2020-01-01 … 2021-12-31 | 2021-12-31 | `W3_MMDD` | Pending | Pending |
 | 4 | 2021-12-31 | 2022-01-01 … 2023-12-31 | 2023-12-31 | `W4_MMDD` | Pending | Pending |
 | 5 | 2023-12-31 | 2024-01-01 … 2025-12-31 | 2025-12-31 | `W5_MMDD` | Pending | Pending |
-| 6 | 2025-12-31 | 2026-01-01 … 2027-12-31 | (omit / latest bar) | `W6_MMDD` | Pending | Pending |
+| 6 | 2025-12-31 | 2026-01-01 … 2027-12-31 | (omit / latest bar) | **embargoed** | — | reserved (terminal validation only) |
 
-Window *N* trains through Dec-31 of `2013 + 2N` with a two-year holdout. This table is canonical: research specs may only reference these windows (`rlbot/research/spec.py:CANONICAL_WINDOWS` rejects anything else — a spec that placed its own holdout would change what OOS *is*).
+Window *N* trains through Dec-31 of `2013 + 2N` with a two-year holdout. This table is canonical: research specs may only reference these windows (`rlbot/research/spec.py:CANONICAL_WINDOWS` rejects anything else — a spec that placed its own holdout would change what OOS *is*). **W6 is embargoed** (`EMBARGOED_WINDOWS`): it is the reserved terminal validation window, untouched by the iterate-measure loop, usable only for a final human-run pre-deployment validation or the tier-5 shadow path.
+
+### Holdout-burn accounting & selection-aware significance
+
+- **Every** OOS backtest — research-launched or manual — appends a record to the global ledger `Runs/oos_ledger.jsonl` *before* the rollout starts (a crash still burns). Burn is counted in **distinct models per window** (re-scoring the same run adds no selection pressure).
+- `research.py launch/promote` enforce a cumulative per-window budget (`--window-budget`, default `oos_ledger.DEFAULT_WINDOW_BUDGET = 10` distinct models). Past budget, further research reads are refused — iterate on tiers ≤ 3 instead.
+- `backtest_summary.json` reports `deflated_sharpe`: the probabilistic Sharpe ratio (Bailey & López de Prado, skew/kurtosis-adjusted) evaluated against the expected max Sharpe of *N* zero-skill strategies, with *N* = the ledger's distinct-model count for the window read. DSR > 0.95 is the conventional significance bar **after** selection. (Simplification: the null cross-trial SR variance is taken as `1/n_obs`; see `rlbot/stats.py`.)
+- **Pre-registered decision rules**: spec `success_gates` (`min_seeds`, `eval_nav_mean_min`, `eval_nav_median_min`, `eval_nav_spread_max_frac`, `oos_sharpe_min`, `oos_max_drawdown_floor`, `deflated_sharpe_min`) are evaluated per seed-group at `collect`; verdicts (`pass`/`fail`/`inconclusive`) land in `Runs/<cohort>/verdicts.json`. `promote` refuses to spend a holdout read on a group whose verdict is not `pass` unless `--force-gates` is passed explicitly.
 
 **Local train example (window 1):**
 

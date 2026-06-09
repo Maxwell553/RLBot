@@ -163,5 +163,8 @@ def build_record(
         "oos_sharpe_ci": [boot.get("p2_5"), boot.get("p50"), boot.get("p97_5")]
         if boot
         else None,
+        "oos_window": backtest_summary.get("oos_window"),
+        "oos_trials_for_window": backtest_summary.get("oos_trials_for_window"),
+        "oos_deflated_sharpe": backtest_summary.get("deflated_sharpe"),
         "benchmark_spy": (detailed.get("benchmark_spy") or {}).get("sharpe"),
     }

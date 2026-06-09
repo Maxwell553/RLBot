@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml  # noqa: E402
 
-from rlbot.research import gates, registry, report  # noqa: E402
+from rlbot.research import gates, oos_ledger, registry, report  # noqa: E402
 from rlbot.research.spec import (  # noqa: E402
     ExperimentSpec,
     build_variant_config_dict,
@@ -152,6 +153,13 @@ def _train_cmd(entry: dict, spec: ExperimentSpec, overwrite_run: bool = False) -
     return cmd
 
 
+def _oos_env(cohort: str) -> dict:
+    """Subprocess env for gated backtests: stamps the ledger context."""
+    env = dict(os.environ)
+    env["RLBOT_OOS_CONTEXT"] = f"research:{cohort}"
+    return env
+
+
 def _backtest_cmd(entry: dict) -> list[str]:
     return [
         sys.executable,
@@ -229,9 +237,22 @@ def cmd_launch(args: argparse.Namespace) -> None:
         already = _scored_keys(registry.read_records(reg, on_corrupt="raise"))
         pending = [e for e in variants if (e["run_id"], tier) not in already]
         gates.assert_oos_budget(len(pending), args.oos_budget)
+        # Cumulative per-window burn budget (global ledger, across all cohorts).
+        by_window: dict[str, list[str]] = {}
+        for e in pending:
+            w = e.get("window") or {}
+            if w.get("holdout_start") and w.get("holdout_end"):
+                wkey = oos_ledger.window_key(w["holdout_start"], w["holdout_end"])
+                by_window.setdefault(wkey, []).append(e["run_id"])
+        ledger_records = oos_ledger.read_ledger(on_corrupt="raise")
+        for wkey, rids in by_window.items():
+            oos_ledger.assert_window_budget(
+                ledger_records, wkey, rids,
+                budget=(getattr(args, "window_budget", None) or oos_ledger.DEFAULT_WINDOW_BUDGET),
+            )
         print(f"[research] WARNING: this launch will read the OOS holdout for "
-              f"{len(pending)} variant(s) (budget {args.oos_budget}; per-launch — "
-              "cumulative per-window accounting is the OOS ledger's job).")
+              f"{len(pending)} variant(s) (budget {args.oos_budget}; cumulative "
+              "per-window budgets enforced from Runs/oos_ledger.jsonl).")
     failures: list[tuple[str, str]] = []
     cohort_t0 = time.perf_counter()
     for n, e in enumerate(variants, 1):
@@ -274,7 +295,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
                         reg, _collect_one(cm, e, tier=tier, status="oos_read_attempt")
                     )
                 print(f"[research] [{n}/{len(variants)}] backtest (OOS) {e['run_id']} ...")
-                subprocess.run(bt, check=True, cwd=str(REPO))
+                subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"]))
             registry.append_record(reg, _collect_one(cm, e, tier=tier))
             print(f"[research] [{n}/{len(variants)}] {e['run_id']} done "
                   f"({time.perf_counter() - t0:.0f}s)")
@@ -292,6 +313,29 @@ def cmd_launch(args: argparse.Namespace) -> None:
             for rid, msg in failures:
                 print(f"[research]   FAILED {rid}: {msg}", file=sys.stderr)
             raise SystemExit(f"{len(failures)} variant(s) failed; see log above.")
+
+
+def _evaluate_cohort_gates(cm: dict, records: list[dict]) -> dict:
+    """Per-seed-group success_gates verdicts; written to Runs/<cohort>/verdicts.json."""
+    success_gates = (cm.get("spec") or {}).get("success_gates") or cm.get("success_gates") or {}
+    if not success_gates:
+        return {}
+    by_group: dict[str, list[dict]] = {}
+    for r in records:
+        gid = r.get("group_id") or str(r.get("variant_id"))
+        by_group.setdefault(str(gid), []).append(r)
+    verdicts = {
+        gid: gates.evaluate_success_gates(success_gates, rows)
+        for gid, rows in sorted(by_group.items())
+    }
+    out = _cohort_dir(cm["cohort"]) / "verdicts.json"
+    out.write_text(json.dumps({"success_gates": dict(success_gates),
+                               "verdicts": verdicts}, indent=2), encoding="utf-8")
+    for gid, v in verdicts.items():
+        print(f"[research] gate verdict {gid}: {v['verdict'].upper()} "
+              + ", ".join(f"{k}={c['state']}" for k, c in v["checks"].items()))
+    print(f"[research] wrote {out}")
+    return verdicts
 
 
 def cmd_collect(args: argparse.Namespace) -> None:
@@ -312,6 +356,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
         registry.append_record(reg, _collect_one(cm, e, tier=tier))
         n_new += 1
     print(f"[research] collected {n_new} new record(s) into {reg}")
+    _evaluate_cohort_gates(cm, registry.read_records(reg))
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -347,6 +392,38 @@ def cmd_promote(args: argparse.Namespace) -> None:
         raise SystemExit(f"variant {args.variant!r} not in cohort {spec.id!r}")
     reg = _registry_path(spec.id)
     promote_tier = max(4, int(cm.get("evaluation_tier", 1)))
+
+    # Pre-registered promotion rule: when the spec declares success_gates, the
+    # variant's seed-group must PASS them on in-training evidence before its one
+    # holdout read is spent. --force-gates overrides with a loud trail.
+    success_gates = cm.get("success_gates") or {}
+    if success_gates:
+        rows = [
+            r for r in registry.read_records(reg)
+            if (r.get("group_id") or r.get("variant_id")) == (entry.get("group_id") or entry["variant_id"])
+        ]
+        verdict = gates.evaluate_success_gates(success_gates, rows)
+        print(f"[research] promote gate verdict for {entry.get('group_id') or entry['variant_id']}: "
+              f"{verdict['verdict'].upper()}")
+        if verdict["verdict"] != "pass":
+            if not getattr(args, "force_gates", False):
+                raise SystemExit(
+                    f"Promotion gate verdict is {verdict['verdict']!r} "
+                    f"({json.dumps(verdict['checks'], default=str)}). The holdout read "
+                    "is spent forever — fix the evidence (more seeds / better eval NAV) "
+                    "or pass --force-gates to spend it anyway (recorded)."
+                )
+            print("[research] WARNING: promoting despite gate verdict "
+                  f"{verdict['verdict']!r} (--force-gates).")
+
+    # Cumulative per-window burn budget from the global OOS ledger.
+    w = entry.get("window") or {}
+    if w.get("holdout_start") and w.get("holdout_end"):
+        wkey = oos_ledger.window_key(w["holdout_start"], w["holdout_end"])
+        oos_ledger.assert_window_budget(
+            oos_ledger.read_ledger(on_corrupt="raise"), wkey, [entry["run_id"]],
+            budget=(getattr(args, "window_budget", None) or oos_ledger.DEFAULT_WINDOW_BUDGET),
+        )
     bt = _backtest_cmd(entry)
     if args.dry_run:
         existing = registry.read_records(reg, on_corrupt="raise")
@@ -368,7 +445,7 @@ def cmd_promote(args: argparse.Namespace) -> None:
             reg, _collect_one(cm, entry, tier=promote_tier, status="oos_read_attempt")
         )
     try:
-        subprocess.run(bt, check=True, cwd=str(REPO))
+        subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"]))
     except subprocess.CalledProcessError as exc:
         msg = f"exit {exc.returncode} from backtest"
         registry.append_record(
@@ -394,6 +471,10 @@ def main() -> None:
     sl.add_argument("--promote", action="store_true")
     sl.add_argument("--dry-run", action="store_true")
     sl.add_argument(
+        "--window-budget", type=int, default=None,
+        help="Cumulative distinct-model budget per holdout window (global ledger); "
+        "default rlbot.research.oos_ledger.DEFAULT_WINDOW_BUDGET.")
+    sl.add_argument(
         "--oos-budget", type=int, default=1,
         help="max holdout reads a tier>=4 launch may perform (default 1; raising this "
              "is an explicit multiple-testing decision)",
@@ -406,6 +487,13 @@ def main() -> None:
     spm.add_argument("--variant", required=True)
     spm.add_argument("--promote", action="store_true")
     spm.add_argument("--dry-run", action="store_true")
+    spm.add_argument(
+        "--window-budget", type=int, default=None,
+        help="Cumulative distinct-model budget per holdout window (global ledger).")
+    spm.add_argument(
+        "--force-gates", action="store_true",
+        help="Promote even when the pre-registered success_gates verdict is not 'pass' "
+        "(spends the holdout read anyway; use deliberately).")
     spm.add_argument(
         "--allow-failed-rescore", action="store_true",
         help="retry the holdout read for a variant whose previous tier-4 read crashed "

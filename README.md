@@ -211,7 +211,7 @@ The canonical window table (enforced for research specs by `rlbot/research/spec.
 | 3 | 2019-12-31 | 2020–2021 | `W3_MMDD` |
 | 4 | 2021-12-31 | 2022–2023 | `W4_MMDD` |
 | 5 | 2023-12-31 | 2024–2025 | `W5_MMDD` |
-| 6 | 2025-12-31 | 2026–2027 | `W6_MMDD` |
+| 6 | 2025-12-31 | 2026–2027 | **embargoed** (terminal validation only; rejected for research specs) |
 
 `MMDD` = month and day at train launch; use `--window N` to auto-generate or `--run-id <RUN_ID>` for a custom id. Calendar flags, Modal commands, and the OOS results table (all pending): [docs/RESEARCH.md](docs/RESEARCH.md#walk-forward-status-results-pending).
 

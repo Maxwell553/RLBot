@@ -86,3 +86,72 @@ def block_bootstrap_sharpe_percentiles(
         float(np.percentile(sharpes, 50.0)),
         float(np.percentile(sharpes, 97.5)),
     )
+
+
+# ── Selection-aware significance (Bailey & López de Prado) ────────────────
+
+_EULER_GAMMA = 0.5772156649015329
+
+
+def probabilistic_sharpe_ratio(
+    sr_hat: float,
+    sr_benchmark: float,
+    n_obs: int,
+    skew: float = 0.0,
+    kurt: float = 3.0,
+) -> float:
+    """PSR: P(true SR > ``sr_benchmark``) given an observed (non-annualized,
+    per-period) ``sr_hat`` over ``n_obs`` returns with the given skew/kurtosis.
+
+    Bailey & López de Prado (2012). All Sharpe inputs must be PER-PERIOD (daily),
+    not annualized.
+    """
+    from statistics import NormalDist
+
+    if n_obs < 2 or not np.isfinite(sr_hat):
+        return float("nan")
+    denom = np.sqrt(
+        max(1.0 - skew * sr_hat + ((kurt - 1.0) / 4.0) * sr_hat**2, 1e-12)
+    )
+    z = (sr_hat - sr_benchmark) * np.sqrt(n_obs - 1) / denom
+    return float(NormalDist().cdf(float(z)))
+
+
+def expected_max_sharpe_null(n_trials: int, n_obs: int) -> float:
+    """E[max SR] (per-period) across ``n_trials`` independent zero-skill strategies
+    evaluated over ``n_obs`` periods — the selection benchmark for the deflated
+    Sharpe ratio. Uses the standard extreme-value approximation with the null
+    cross-trial SR variance V[SR] ≈ 1/n_obs (we rarely have per-trial SRs to
+    estimate it; this simplification is documented in docs/RESEARCH.md).
+    """
+    from statistics import NormalDist
+
+    n_trials = max(int(n_trials), 1)
+    if n_trials == 1 or n_obs < 2:
+        return 0.0
+    nd = NormalDist()
+    z1 = nd.inv_cdf(1.0 - 1.0 / n_trials)
+    z2 = nd.inv_cdf(1.0 - 1.0 / (n_trials * np.e))
+    e_max_z = (1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2
+    return float(np.sqrt(1.0 / n_obs) * e_max_z)
+
+
+def deflated_sharpe_ratio(
+    sr_hat_ann: float,
+    n_obs: int,
+    n_trials: int,
+    skew: float = 0.0,
+    kurt: float = 3.0,
+    periods_per_year: int = 252,
+) -> float:
+    """DSR: PSR evaluated against the expected-max-SR-under-selection benchmark.
+
+    ``sr_hat_ann`` is the ANNUALIZED observed Sharpe (what the backtest reports);
+    it is de-annualized internally. ``n_trials`` should come from the OOS ledger:
+    the number of distinct models that have read this holdout window.
+    Interpretation: probability the strategy's true SR exceeds what the best of
+    ``n_trials`` zero-skill strategies would show. > 0.95 is the usual bar.
+    """
+    sr_daily = float(sr_hat_ann) / np.sqrt(periods_per_year)
+    sr0 = expected_max_sharpe_null(n_trials, n_obs)
+    return probabilistic_sharpe_ratio(sr_daily, sr0, n_obs, skew=skew, kurt=kurt)

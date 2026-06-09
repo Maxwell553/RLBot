@@ -21,6 +21,7 @@ _bootstrap_mod = importlib.util.module_from_spec(_bootstrap_spec)
 _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 
 import argparse
+import os
 import copy
 import json
 import re
@@ -43,6 +44,8 @@ from rlbot.data_utils import (
     resolve_panel_tickers,
     reserve_chronological_holdout,
 )
+from rlbot.research import oos_ledger
+from rlbot.stats import deflated_sharpe_ratio
 from rlbot.run_artifacts import (
     check_holdout_window_against_manifest,
     PROJECT_ROOT,
@@ -277,6 +280,10 @@ class BacktestResult:
     max_drawdown: float
     n_bars: int
     seed_label: str = ""
+    # return-distribution stats for selection-aware significance (PSR/DSR)
+    n_rets: int = 0
+    ret_skew: float = float("nan")
+    ret_kurt: float = float("nan")
 
 
 def _resolve_model_path_for_run(
@@ -570,6 +577,27 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     if len(test_idx) < 10:
         raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
 
+    # Global holdout-burn accounting: EVERY read lands in Runs/oos_ledger.jsonl —
+    # this is the chokepoint, so manual backtests are counted too. Recorded before
+    # the rollout so a crash still burns (fail-closed). Budgets are enforced by the
+    # research loop; here we only record and report the burn.
+    _ledger_window = oos_ledger.window_key(test_idx[0], test_idx[-1])
+    oos_ledger.record_oos_read(
+        run_id=run_id,
+        holdout_start=test_idx[0],
+        holdout_end=test_idx[-1],
+        checkpoint=getattr(args, "checkpoint", "") or "",
+        data_cache_hash=None,  # hashed later in the summary; ledger stays cheap
+        context=os.environ.get("RLBOT_OOS_CONTEXT", "manual"),
+    )
+    args._ledger_window = _ledger_window  # type: ignore[attr-defined]
+    _burn = oos_ledger.trials_for_window(_ledger_window)
+    _bt_log(
+        f"[backtest] OOS ledger: window {_ledger_window} has now been read by "
+        f"{_burn} distinct model(s) — selection-aware significance (deflated Sharpe) "
+        "uses this trial count."
+    )
+
     _bt_log(
         f"[backtest] OOS holdout: {test_idx[0].date()} .. {test_idx[-1].date()} "
         f"({len(test_idx)} bars, setup {time.perf_counter() - t_phase:.1f}s)"
@@ -679,6 +707,10 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     log_rets = np.diff(np.log(np.maximum(navs, 1e-12)))
     total_return = float(navs[-1] / navs[0] - 1.0)
     sharpe = _sharpe_ann_from_log_rets(log_rets)
+    _sd = float(np.std(log_rets)) + 1e-12
+    _z = (log_rets - float(np.mean(log_rets))) / _sd
+    ret_skew = float(np.mean(_z**3)) if log_rets.size >= 3 else float("nan")
+    ret_kurt = float(np.mean(_z**4)) if log_rets.size >= 4 else float("nan")
 
     if not args.no_viz and not getattr(args, "_ensemble_mode", False):
         _bt_log("[backtest] Building plot...")
@@ -768,6 +800,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         max_drawdown=_max_drawdown(navs),
         n_bars=len(test_idx),
         seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
+        n_rets=int(log_rets.size),
+        ret_skew=ret_skew,
+        ret_kurt=ret_kurt,
     )
     _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
     return result
@@ -797,6 +832,33 @@ def _write_backtest_summary(
                 f"({trained[:12]}… → {now[:12]}…); this backtest does not bind the "
                 "exact training-time inputs and may not reproduce the run's OOS numbers."
             )
+    # Selection-aware significance: the deflated Sharpe deflates the observed Sharpe
+    # by the expected max-Sharpe of N zero-skill models, where N = distinct models
+    # that have read this window per the global OOS ledger.
+    # Use the window ACTUALLY read this invocation (recorded in the ledger at
+    # rollout time) — under an explicit CLI cross-window override it differs from
+    # the manifest's recorded window.
+    window = getattr(args, "_ledger_window", None)
+    if window is None:
+        ch = (manifest or {}).get("chronological_holdout") or {}
+        if ch.get("date_start") and ch.get("date_end"):
+            window = oos_ledger.window_key(ch["date_start"], ch["date_end"])
+    n_trials = oos_ledger.trials_for_window(window) if window else 1
+    dsr = None
+    if result.n_rets >= 4 and np.isfinite(result.sharpe):
+        dsr = float(
+            deflated_sharpe_ratio(
+                result.sharpe,
+                n_obs=result.n_rets,
+                n_trials=n_trials,
+                skew=result.ret_skew if np.isfinite(result.ret_skew) else 0.0,
+                kurt=result.ret_kurt if np.isfinite(result.ret_kurt) else 3.0,
+            )
+        )
+        print(
+            f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
+            f"window): {dsr:.3f} (>0.95 = significant after selection)"
+        )
     payload = {
         **asdict(result),
         "config_path": str(cfg.path),
@@ -804,6 +866,9 @@ def _write_backtest_summary(
         "data_cache_path": str(cache_path),
         "data_cache_hash": data_cache_hash,
         "hash_drift": hash_drift or None,
+        "oos_window": window,
+        "oos_trials_for_window": n_trials,
+        "deflated_sharpe": dsr,
         "feature_split_mode": cfg.data.feature_split_mode,
         **git_provenance(),
         "detailed": detailed,
