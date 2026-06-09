@@ -535,3 +535,29 @@ def test_global_report_lists_lineage_and_sensitivity(tmp_path: Path) -> None:
     assert "| base | — |" in text
     assert "reward.churn_penalty" in text      # sensitivity table
     assert "| base | — | baseline | 2 | 1 | 4 | 1 |" in text  # OOS read counted
+
+
+def test_knob_sensitivity_dedupes_promoted_runs_and_marks_no_contrast() -> None:
+    from rlbot.research.report import knob_sensitivity
+
+    records = [
+        {"cohort": "c1", "run_id": "r1", "status": "ok", "evaluation_tier": 3,
+         "best_eval_nav": 100.0, "patch": {"reward.reward_scale": 1000}},
+        {"cohort": "c1", "run_id": "r2", "status": "ok", "evaluation_tier": 3,
+         "best_eval_nav": 140.0, "patch": {"reward.reward_scale": 2000}},
+        # promoted winner: second record, same run — must not double-count
+        {"cohort": "c1", "run_id": "r2", "status": "ok", "evaluation_tier": 4,
+         "best_eval_nav": 140.0, "patch": {"reward.reward_scale": 2000}},
+        # single-value cohort: no within-cohort contrast
+        {"cohort": "c2", "run_id": "r3", "status": "ok", "evaluation_tier": 3,
+         "best_eval_nav": 90.0, "patch": {"reward.reward_scale": 2000.0}},
+    ]
+    sens = knob_sensitivity(records)
+    cells = sens["reward.reward_scale"]
+    c1_2000 = next(c for c in cells if c["cohort"] == "c1" and c["value"] == "2000")
+    assert c1_2000["n_runs"] == 1  # deduped
+    # cohort median is median(100, 140) = 120 → delta +20 (would be 0/-40 skewed if doubled)
+    assert c1_2000["delta_vs_cohort_median"] == pytest.approx(20.0)
+    c2 = next(c for c in cells if c["cohort"] == "c2")
+    assert c2["value"] == "2000"  # 2000.0 normalizes to the same cell label as 2000
+    assert c2["delta_vs_cohort_median"] is None  # no contrast ≠ no effect

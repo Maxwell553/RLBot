@@ -135,6 +135,7 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
     rows = [r for r in rows if str(r.get("status", "ok")) == "ok"]
     checks: dict[str, dict] = {}
     verdict = "pass"
+    from rlbot.research.report import dedupe_scored_by_run  # shared: never inline this
 
     def _check(name: str, ok: bool | None, observed, threshold) -> None:
         nonlocal verdict
@@ -145,17 +146,7 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
         elif state == "inconclusive" and verdict != "fail":
             verdict = "inconclusive"
 
-    # One run can hold several scored records (tier-3 + a tier-4 promote): dedupe
-    # per run_id keeping the highest tier, exactly as the report does — otherwise the
-    # promoted (best) seed enters the gate medians twice.
-    by_run: dict[str, Mapping] = {}
-    for i, r in enumerate(rows):
-        rid = str(r.get("run_id") or f"__row{i}")
-        if rid not in by_run or int(r.get("evaluation_tier", 0)) > int(
-            by_run[rid].get("evaluation_tier", 0)
-        ):
-            by_run[rid] = r
-    rows = list(by_run.values())
+    rows = dedupe_scored_by_run(rows)
     # Tier-1 rows are smoke/screen evidence (tiny budgets) — never promotion
     # evidence. A group with ONLY tier-1 rows has no decision evidence at all:
     # every threshold check below goes inconclusive on the empty set.

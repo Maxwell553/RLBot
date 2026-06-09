@@ -474,7 +474,9 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 def cmd_report(args: argparse.Namespace) -> None:
-    if getattr(args, "all", False) or args.cohort == "--all":
+    if getattr(args, "all", False):
+        if getattr(args, "cohort", ""):
+            raise SystemExit("report takes a cohort id OR --all, not both")
         return cmd_report_all(args)
     if not args.cohort:
         raise SystemExit("report needs a cohort id or --all")

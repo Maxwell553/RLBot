@@ -32,6 +32,52 @@ def _is_scored(r: Mapping) -> bool:
     return str(r.get("status", "ok")) not in _UNSCORED_STATUSES
 
 
+def dedupe_scored_by_run(rows: Iterable[Mapping]) -> list[Mapping]:
+    """One record per run_id, keeping the highest tier.
+
+    A variant launched at tier 3 and later promoted holds TWO scored records for
+    the same run; any median over raw records double-counts the promoted (best)
+    run. This bug was reintroduced three times in three aggregations — every
+    consumer must go through this helper."""
+    by_run: dict[str, Mapping] = {}
+    for i, r in enumerate(rows):
+        rid = str(r.get("run_id") or f"__row{i}")
+        if rid not in by_run or int(r.get("evaluation_tier", 0)) > int(
+            by_run[rid].get("evaluation_tier", 0)
+        ):
+            by_run[rid] = r
+    return list(by_run.values())
+
+
+def count_oos_reads(records: Iterable[Mapping]) -> int:
+    """Holdout reads = attempt records + legacy scored tier>=4 records that predate
+    attempt-writing. Shared by the per-cohort and global reports (they must agree)."""
+    records = list(records)
+    tier4 = [r for r in records if int(r.get("evaluation_tier", 0)) >= 4]
+    attempts = [r for r in tier4 if str(r.get("status", "ok")) == "oos_read_attempt"]
+    attempted_runs = {str(r.get("run_id")) for r in attempts}
+    legacy_scored = [
+        r for r in tier4
+        if _is_scored(r) and str(r.get("run_id")) not in attempted_runs
+    ]
+    return len(attempts) + len(legacy_scored)
+
+
+def _md_cell(text: object, limit: int = 60) -> str:
+    """Sanitize free text for a markdown table cell (hypotheses come from YAML)."""
+    out = str(text).replace("\n", " ").replace("|", "\\|").strip()
+    return out[: limit - 1] + "…" if len(out) > limit else out
+
+
+def _norm_value(value: object) -> str:
+    """Canonical display for a patched value: 1000 and 1000.0 are one cell."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{float(value):g}"
+    return str(value)
+
+
 def _ci_cell(rows: list[Mapping]) -> str:
     cis = [r.get("oos_sharpe_ci") for r in rows if r.get("oos_sharpe_ci")]
     if not cis:
@@ -53,17 +99,7 @@ def _render(by_group: dict[str, list[Mapping]]) -> str:
             tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
             lines.append(f"| {group_id} | {tier} | 0 | — | — | — | — | — | — |")
             continue
-        # One run can hold several scored records (tier-3 launch + tier-4 promote).
-        # Dedupe per run_id keeping the highest-tier record — otherwise the promoted
-        # (best) seed enters every median twice, biasing best_eval_nav upward.
-        by_run: dict[str, Mapping] = {}
-        for i, r in enumerate(rows):
-            rid = str(r.get("run_id") or f"__row{i}")  # legacy records without run_id
-            if rid not in by_run or int(r.get("evaluation_tier", 0)) > int(
-                by_run[rid].get("evaluation_tier", 0)
-            ):
-                by_run[rid] = r
-        runs = list(by_run.values())
+        runs = dedupe_scored_by_run(rows)
         # Tier-1 rows are smoke/screen evidence (tiny budgets, e.g. `research.py
         # screen` runs sharing this group_id) — they never feed decision metrics
         # unless they are ALL the group has.
@@ -94,16 +130,7 @@ def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "
     by_group = _group(records)
     n_variants = len({str(r.get("variant_id")) for r in records})
     n_groups = len(by_group)
-    # One holdout read = one "oos_read_attempt" record (written before the backtest).
-    # Scored tier>=4 records without a matching attempt are legacy single-record reads.
-    tier4 = [r for r in records if int(r.get("evaluation_tier", 0)) >= 4]
-    attempts = [r for r in tier4 if str(r.get("status", "ok")) == "oos_read_attempt"]
-    attempted_runs = {str(r.get("run_id")) for r in attempts}
-    legacy_scored = [
-        r for r in tier4
-        if _is_scored(r) and str(r.get("run_id")) not in attempted_runs
-    ]
-    n_oos_reads = len(attempts) + len(legacy_scored)
+    n_oos_reads = count_oos_reads(records)
     body = [
         f"# {title}",
         "",
@@ -156,10 +183,9 @@ def knob_sensitivity(records: Iterable[Mapping]) -> dict[str, list[dict]]:
     how much. Tier-1 (smoke/screen) rows are excluded.
     """
     scored = [
-        r for r in records
-        if _is_scored(r)
-        and int(r.get("evaluation_tier", 0)) >= 2
-        and r.get("best_eval_nav") is not None
+        r
+        for r in dedupe_scored_by_run(r for r in records if _is_scored(r))
+        if int(r.get("evaluation_tier", 0)) >= 2 and r.get("best_eval_nav") is not None
     ]
     cohort_navs: dict[str, list[float]] = {}
     for r in scored:
@@ -173,19 +199,35 @@ def knob_sensitivity(records: Iterable[Mapping]) -> dict[str, list[dict]]:
             continue
         for key, value in patch.items():
             cells.setdefault(
-                (str(key), str(r.get("cohort")), repr(value)), []
+                (str(key), str(r.get("cohort")), _norm_value(value)), []
             ).append(float(r["best_eval_nav"]))
 
+    # values-per-(key,cohort): a single value means no within-cohort contrast — its
+    # delta is structurally 0 and must not read as "knob has no effect".
+    n_values: dict[tuple[str, str], set[str]] = {}
+    for key, cohort, value in cells:
+        n_values.setdefault((key, cohort), set()).add(value)
+
+    def _sort_key(item):
+        (key, cohort, value), _ = item
+        try:
+            return (key, cohort, 0, float(value), "")
+        except ValueError:
+            return (key, cohort, 1, 0.0, value)
+
     out: dict[str, list[dict]] = {}
-    for (key, cohort, value), navs in sorted(cells.items()):
+    for (key, cohort, value), navs in sorted(cells.items(), key=_sort_key):
         med = statistics.median(navs)
+        has_contrast = len(n_values[(key, cohort)]) > 1
         out.setdefault(key, []).append(
             {
                 "cohort": cohort,
                 "value": value,
                 "n_runs": len(navs),
                 "median_best_eval_nav": med,
-                "delta_vs_cohort_median": med - cohort_median.get(cohort, med),
+                "delta_vs_cohort_median": (
+                    med - cohort_median.get(cohort, med) if has_contrast else None
+                ),
             }
         )
     return out
@@ -214,17 +256,13 @@ def write_global_report(
         meta = cohort_meta.get(cohort) or {}
         groups = _group(records)
         tiers = [int(r.get("evaluation_tier", 0)) for r in records] or [0]
-        oos_reads = sum(
-            1 for r in records
-            if int(r.get("evaluation_tier", 0)) >= 4
-            and str(r.get("status", "ok")) == "oos_read_attempt"
-        )
-        hyp = str(meta.get("hypothesis") or next(
+        oos_reads = count_oos_reads(records)  # same counting as the per-cohort report
+        hyp = _md_cell(meta.get("hypothesis") or next(
             (r.get("hypothesis") for r in records if r.get("hypothesis")), ""
-        ))[:60]
+        ))
         lines.append(
-            f"| {cohort} | {meta.get('parent') or '—'} | {hyp} | {len(records)} | "
-            f"{len(groups)} | {max(tiers)} | {oos_reads} |"
+            f"| {_md_cell(cohort)} | {_md_cell(meta.get('parent') or '—')} | {hyp} | "
+            f"{len(records)} | {len(groups)} | {max(tiers)} | {oos_reads} |"
         )
 
     lines += ["", "## Knob sensitivity (median best_eval_nav by patched value)", ""]
@@ -238,10 +276,12 @@ def write_global_report(
         ]
         for key in sorted(sens):
             for cell in sens[key]:
+                delta = cell["delta_vs_cohort_median"]
+                delta_cell = f"{delta:+.2f}" if delta is not None else "— (no contrast)"
                 lines.append(
-                    f"| {key} | {cell['cohort']} | {cell['value']} | {cell['n_runs']} | "
-                    f"{_fmt(cell['median_best_eval_nav'])} | "
-                    f"{cell['delta_vs_cohort_median']:+.2f} |"
+                    f"| {_md_cell(key)} | {_md_cell(cell['cohort'])} | "
+                    f"{_md_cell(cell['value'])} | {cell['n_runs']} | "
+                    f"{_fmt(cell['median_best_eval_nav'])} | {delta_cell} |"
                 )
     lines.append("")
     out = Path(path)
