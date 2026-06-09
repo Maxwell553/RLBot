@@ -111,7 +111,7 @@ flowchart TB
 
 ### Data (`rlbot/data_utils.py`)
 
-1. Fetch aligned daily OHLCV for `universe.assets` (yfinance; HY OAS via FRED / proxy).
+1. Fetch aligned daily OHLCV for `universe.assets` (yfinance, **dividend/split-adjusted** `auto_adjust=True` → total-return series for distributing symbols like SPY/IEF/EEM; `^N225`/`^FTSE` are price indices and FX/futures have no distributions, so those sleeves are price-return by nature; HY OAS via FRED / proxy). Pre-adjustment caches trigger a rebuild warning.
 2. Cache panel, `tickers`, and **`asset_live`** (1 = real print, 0 = pre-IPO / missing) in `.cache/data_cache.npz` — **no global `dropna`** on the calendar.
 3. Reserve chronological OOS holdout before any in-training split.
 4. Walk-forward alternating split (`training.block_size: 126`; `eval_stride: 4`); precomputed `WalkforwardEnvPack` panels aligned per segment.

@@ -549,7 +549,13 @@ class TradingCurriculumCallback(BaseCallback):
         env_cfg = get_config().environment
         lag_lo, lag_hi = env_cfg.min_obs_lag, env_cfg.max_obs_lag
         if t < self.fee_ramp_end:
-            return dr_min, dr_max, lag_lo, lag_hi
+            # No DR before the fee curriculum releases: fee is pinned by the override
+            # anyway, and obs_lag stays at the deterministic default. Returning the
+            # full-wide bounds here (the old behavior) randomized lag from step 0 and
+            # then snapped it to a 1-bar cliff exactly at fee_ramp_end — the same step
+            # the best-model gate opens.
+            lag_fixed = max(lag_lo, min(env_cfg.obs_lag_default, lag_hi))
+            return 1.0, 1.0, lag_fixed, lag_fixed
         if t >= self.dr_widen_end:
             return dr_min, dr_max, lag_lo, lag_hi
         progress = (t - self.fee_ramp_end) / max(self.dr_widen_end - self.fee_ramp_end, 1)
@@ -1278,7 +1284,12 @@ def main() -> None:
         parts = stem.split("_", 1)
         vn_path = resume_path.parent / f"{parts[0]}_vecnormalize_{parts[1]}.pkl" if len(parts) == 2 else None
         if vn_path is None or not vn_path.is_file():
-            vn_path = resume_path.parent.parent / "vec_normalize.pkl"
+            # Prefer the stats saved NEXT TO the checkpoint (e.g. best/vec_normalize.pkl
+            # for best_model.zip) before falling back to the run-level end-of-run stats —
+            # the grandparent fallback alone silently mispaired best weights with
+            # end-of-run normalization.
+            sibling = resume_path.parent / "vec_normalize.pkl"
+            vn_path = sibling if sibling.is_file() else resume_path.parent.parent / "vec_normalize.pkl"
         if vn_path and vn_path.is_file():
             loaded_vn = VecNormalize.load(str(vn_path), train_env.venv)
             train_env.obs_rms = loaded_vn.obs_rms
@@ -1444,9 +1455,18 @@ def main() -> None:
     )
     best_eval_step = None
     if eval_callback._mean_ending_nav and eval_callback._nav_timesteps:
-        i = int(np.argmax(np.asarray(eval_callback._mean_ending_nav)))
-        if i < len(eval_callback._nav_timesteps):
-            best_eval_step = int(eval_callback._nav_timesteps[i])
+        # Only consider post-gate evals: pre-gate NAVs run at reduced fees/churn and
+        # never wrote best_model.zip, so the argmax over the full history would point
+        # at an eval that does not correspond to the saved best checkpoint.
+        navs_arr = np.asarray(eval_callback._mean_ending_nav, dtype=np.float64)
+        steps_arr = np.asarray(eval_callback._nav_timesteps, dtype=np.int64)
+        n = min(len(navs_arr), len(steps_arr))
+        navs_arr, steps_arr = navs_arr[:n], steps_arr[:n]
+        gate = int(eval_callback.best_model_min_step)
+        post_gate = steps_arr >= gate if gate > 0 else np.ones(n, dtype=bool)
+        if post_gate.any():
+            j = int(np.argmax(navs_arr[post_gate]))
+            best_eval_step = int(steps_arr[post_gate][j])
     early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
 
     # Merge (never rebuild) the pre-training manifest: it carries the

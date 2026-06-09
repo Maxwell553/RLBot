@@ -35,13 +35,29 @@ from rlbot.run_artifacts import (  # noqa: E402
 )
 
 
-def _resolve_model_and_vecnorm(run_id: str, checkpoint: str) -> tuple[Path, Path]:
+def _resolve_model_and_vecnorm(
+    run_id: str, checkpoint: str, allow_vecnorm_fallback: bool = False
+) -> tuple[Path, Path]:
     rp = RunPaths(run_id)
     if checkpoint == "best":
         model = rp.best_model_dir / "best_model.zip"
         vn = rp.best_model_dir / "vec_normalize.pkl"
         if not vn.is_file():
-            vn = rp.models_dir / "vec_normalize.pkl"
+            # End-of-run stats are NOT the stats best_model.zip was selected under;
+            # substituting them silently recreates the weights/normalization mismatch
+            # this pipeline exists to prevent. Require an explicit override.
+            fallback = rp.models_dir / "vec_normalize.pkl"
+            if not allow_vecnorm_fallback:
+                raise FileNotFoundError(
+                    f"Missing {vn} (the stats best_model.zip was selected under). "
+                    f"Pass --allow-vecnorm-fallback to use end-of-run stats "
+                    f"({fallback}) — weights+stats will be mispaired; debug only."
+                )
+            print(
+                f"[infer] WARNING: using end-of-run VecNormalize stats {fallback} with "
+                "best weights (--allow-vecnorm-fallback) — mispaired; debug only."
+            )
+            vn = fallback
     else:
         model = rp.final_model
         vn = rp.models_dir / "vec_normalize.pkl"
@@ -66,6 +82,11 @@ def main() -> None:
         help="Permit inference without VecNormalize stats even though the run trained "
         "with norm_obs: true (refused by default).",
     )
+    parser.add_argument(
+        "--allow-vecnorm-fallback", action="store_true",
+        help="Permit pairing best weights with end-of-run VecNormalize stats when "
+        "best/vec_normalize.pkl is missing (mispaired; debug only).",
+    )
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "auto"))
     parser.add_argument("--data-cache", default="", metavar="PATH")
     parser.add_argument("--use-current-config", action="store_true")
@@ -88,12 +109,20 @@ def main() -> None:
     print(f"[infer] cache: {cache_path}")
 
     # rollout_policy_on_slice lives in backtest.py (imports torch); import lazily.
-    from scripts.backtest import ensure_backtest_dependencies, rollout_policy_on_slice
+    from scripts.backtest import (
+        _assert_manifest_panel_compatible,
+        ensure_backtest_dependencies,
+        rollout_policy_on_slice,
+    )
 
     ensure_backtest_dependencies()
     (idx, ohlcv, rsi, macd, macro, fd, fdm, trend, avol, mvol, live, cache_tickers) = load_cache(
         str(cache_path), expected_fracdiff_d=cfg.data.fracdiff_d
     )
+    # Hard-fail on ticker/width drift between the loaded cache and the training
+    # manifest — a same-width reordered cache would otherwise emit target weights
+    # mapped to the WRONG tickers with no error.
+    _assert_manifest_panel_compatible(manifest, cache_tickers, ohlcv.shape[1])
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
 
     as_of = args.as_of.strip() or str(idx[-1].date())
@@ -112,7 +141,9 @@ def main() -> None:
         print(f"[infer] obs_lag={obs_lag} (from manifest/run config)")
     obs_lag = int(obs_lag)
 
-    model_path, vn_path = _resolve_model_and_vecnorm(run_id, args.checkpoint)
+    model_path, vn_path = _resolve_model_and_vecnorm(
+        run_id, args.checkpoint, allow_vecnorm_fallback=args.allow_vecnorm_fallback
+    )
     if not vn_path.is_file() and cfg.vec_normalize.norm_obs and not args.allow_raw_obs:
         raise FileNotFoundError(
             f"No VecNormalize stats at {vn_path}, but this run trained with "
@@ -149,13 +180,23 @@ def main() -> None:
     print(f"[infer] rollout done ({time.perf_counter() - t0:.1f}s)")
     target = np.asarray(weights[-1], dtype=np.float64)
 
+    last_bar = str(idx[-1].date())
+    if last_bar != as_of:
+        print(
+            f"[infer] NOTE: requested as-of {as_of} but last available bar is {last_bar}; "
+            "weights are computed from the last available bar."
+        )
     provenance = {
         "config_path": str(cfg.path),
         "config_hash": config_sha256(cfg.to_dict()),
         "data_cache_path": str(cache_path),
         "data_cache_hash": sha256_file(cache_path),
         "model_path": str(model_path),
+        "model_hash": sha256_file(model_path),
         "vec_normalize_path": str(vn_path) if vn_path.is_file() else None,
+        "vec_normalize_hash": sha256_file(vn_path) if vn_path.is_file() else None,
+        "as_of_requested": as_of,
+        "as_of_last_bar": last_bar,
         "feature_split_mode": cfg.data.feature_split_mode,
         "warmup_bars": warm,
         "obs_lag": obs_lag,

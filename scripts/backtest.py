@@ -409,6 +409,36 @@ def resolve_oos_holdout(
         holdout_end=holdout_end,
     )
     test_idx = holdout[0]
+
+    # Cross-check the realized window against what training recorded. For tail-based
+    # (holdout_days) runs especially, the window is recomputed from the CURRENT cache's
+    # last bar — a refreshed/extended cache would silently shift the OOS window away
+    # from what training reserved. Explicit CLI window flags (the documented
+    # cross-window check) downgrade the failure to a loud warning.
+    rec_start_raw, rec_end_raw = ch.get("date_start"), ch.get("date_end")
+    if rec_start_raw and rec_end_raw:
+        rec_start = pd.Timestamp(rec_start_raw).date()
+        rec_end = pd.Timestamp(rec_end_raw).date()
+        got_start, got_end = test_idx[0].date(), test_idx[-1].date()
+        cli_override = any(
+            v is not None
+            for v in (args.train_end, args.holdout_start, args.holdout_end, args.holdout_days)
+        )
+        if (got_start, got_end) != (rec_start, rec_end):
+            msg = (
+                f"OOS window mismatch: training recorded {rec_start}..{rec_end} but this "
+                f"backtest resolved {got_start}..{got_end}. The evaluated holdout is NOT "
+                "the one training reserved (refreshed cache or window overrides)."
+            )
+            if cli_override:
+                print(f"[backtest] WARNING: {msg} (explicit CLI window flags — proceeding)")
+            else:
+                raise ValueError(
+                    msg + " Re-run with the run-local data snapshot, or pass explicit "
+                    "--train-end/--holdout-start/--holdout-end to acknowledge a "
+                    "deliberate cross-window evaluation."
+                )
+
     if train_end and holdout_start:
         print(
             f"Strict OOS backtest: {holdout_start} .. {test_idx[-1].date()} "

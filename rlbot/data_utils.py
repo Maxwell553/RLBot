@@ -500,11 +500,17 @@ def _yfinance_daily_history(
     """
     import time
 
+    # auto_adjust=True → dividend + split adjusted OHLC (total-return prices). Without
+    # it, SPY/IEF/EEM/GLD returns are price-only: bond ETF coupons (most of IEF's
+    # return) and ~1.5-2%/yr equity dividends vanish, biasing the agent, the
+    # cap-weighted benchmark, and every baseline. Price indices (^N225, ^FTSE), FX,
+    # and futures have no distributions — adjustment is a no-op for them (their
+    # price-return nature is a documented universe caveat, not fixable here).
     def _h_start_end() -> pd.DataFrame:
-        return tkr.history(start=since, end=until, interval="1d", auto_adjust=False)
+        return tkr.history(start=since, end=until, interval="1d", auto_adjust=True)
 
     def _h_period(period: str) -> pd.DataFrame:
-        return tkr.history(period=period, interval="1d", auto_adjust=False)
+        return tkr.history(period=period, interval="1d", auto_adjust=True)
 
     df0 = _h_start_end()
     for attempt in range(3):
@@ -1179,6 +1185,9 @@ def save_cache(
         asset_live=asset_live,
         fracdiff_d=np.array([fracdiff_d], dtype=np.float64),
         tickers=active_tickers,
+        # Distribution-adjusted (total-return) OHLC since the auto_adjust=True switch;
+        # load_cache warns when an old price-return cache is loaded.
+        prices_adjusted=np.array([True]),
     )
 
 
@@ -1199,6 +1208,12 @@ def load_cache(
     z = np.load(path, allow_pickle=True)
     idx = pd.DatetimeIndex(z["index"])
     ohlcv = z["ohlcv"]
+    if "prices_adjusted" not in z.files or not bool(np.asarray(z["prices_adjusted"]).ravel()[0]):
+        print(
+            f"[data] WARNING: cache {path} predates the total-return switch "
+            "(price-return OHLC: ETF dividends/coupons missing). Rebuild with "
+            "--refresh-data before training or publishing numbers."
+        )
     if "tickers" in z.files:
         tickers = [str(x) for x in z["tickers"].tolist()]
     else:
