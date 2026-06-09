@@ -577,18 +577,31 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     if len(test_idx) < 10:
         raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
 
-    # Global holdout-burn accounting: EVERY read lands in Runs/oos_ledger.jsonl —
-    # this is the chokepoint, so manual backtests are counted too. Recorded before
-    # the rollout so a crash still burns (fail-closed). Budgets are enforced by the
-    # research loop; here we only record and report the burn.
-    _ledger_window = oos_ledger.window_key(test_idx[0], test_idx[-1])
+    # Global holdout-burn accounting: EVERY backtest read lands in
+    # Runs/oos_ledger.jsonl, recorded before the rollout so a crash still burns
+    # (fail-closed). Keyed on the REGISTERED calendar window from the manifest when
+    # present (the same key research budgets use), else the realized trading days.
+    # Research-driven reads (RLBOT_OOS_CONTEXT=research:*) re-check the cumulative
+    # window budget atomically at read time — a launch-time check alone would leave
+    # an hours-long gap to concurrent burns.
+    _ch = (manifest or {}).get("chronological_holdout") or {}
+    _ledger_window = oos_ledger.window_key_for_read(
+        _ch.get("holdout_start"), _ch.get("holdout_end"), test_idx[0], test_idx[-1]
+    )
+    _oos_context = os.environ.get("RLBOT_OOS_CONTEXT", "manual")
+    _budget_env = os.environ.get("RLBOT_WINDOW_BUDGET", "")
+    _enforce = None
+    if _oos_context.startswith("research:"):
+        _enforce = int(_budget_env) if _budget_env.strip() else oos_ledger.DEFAULT_WINDOW_BUDGET
+    _cache_hash = sha256_file(cache_path)
+    args._data_cache_hash = _cache_hash  # type: ignore[attr-defined]
     oos_ledger.record_oos_read(
         run_id=run_id,
-        holdout_start=test_idx[0],
-        holdout_end=test_idx[-1],
+        window=_ledger_window,
         checkpoint=getattr(args, "checkpoint", "") or "",
-        data_cache_hash=None,  # hashed later in the summary; ledger stays cheap
-        context=os.environ.get("RLBOT_OOS_CONTEXT", "manual"),
+        data_cache_hash=_cache_hash,
+        context=_oos_context,
+        enforce_budget=_enforce,
     )
     args._ledger_window = _ledger_window  # type: ignore[attr-defined]
     _burn = oos_ledger.trials_for_window(_ledger_window)
@@ -820,7 +833,7 @@ def _write_backtest_summary(
 
     cfg = get_config()
     config_hash = config_sha256(cfg.to_dict())
-    data_cache_hash = sha256_file(cache_path)
+    data_cache_hash = getattr(args, "_data_cache_hash", None) or sha256_file(cache_path)
     # Drift detection: hashes are not just recorded, they are compared to training.
     hash_drift: dict[str, dict] = {}
     for key, now in (("config_hash", config_hash), ("data_cache_hash", data_cache_hash)):
@@ -841,9 +854,18 @@ def _write_backtest_summary(
     window = getattr(args, "_ledger_window", None)
     if window is None:
         ch = (manifest or {}).get("chronological_holdout") or {}
-        if ch.get("date_start") and ch.get("date_end"):
-            window = oos_ledger.window_key(ch["date_start"], ch["date_end"])
-    n_trials = oos_ledger.trials_for_window(window) if window else 1
+        if ch.get("holdout_start") and ch.get("holdout_end"):
+            window = oos_ledger.window_key(ch["holdout_start"], ch["holdout_end"])
+    n_trials = 1
+    if window:
+        # A batch/ensemble is ONE selection event: every seed's DSR must use the same
+        # trial count (prior burns ∪ the whole invocation), not an order-dependent
+        # running count.
+        prior = oos_ledger.distinct_models_for_window(
+            oos_ledger.read_ledger(on_corrupt="raise"), window
+        )
+        invocation = {str(r) for r in getattr(args, "_invocation_run_ids", [])}
+        n_trials = max(1, len(prior | invocation))
     dsr = None
     if result.n_rets >= 4 and np.isfinite(result.sharpe):
         dsr = float(
@@ -855,10 +877,13 @@ def _write_backtest_summary(
                 kurt=result.ret_kurt if np.isfinite(result.ret_kurt) else 3.0,
             )
         )
-        print(
-            f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
-            f"window): {dsr:.3f} (>0.95 = significant after selection)"
-        )
+        if not np.isfinite(dsr):
+            dsr = None
+        else:
+            print(
+                f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
+                f"window): {dsr:.3f} (>0.95 = significant after selection)"
+            )
     payload = {
         **asdict(result),
         "config_path": str(cfg.path),
@@ -946,6 +971,7 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
 
     args._ensemble_mode = True  # type: ignore[attr-defined]
     args._multi_run_summary = True  # type: ignore[attr-defined]
+    args._invocation_run_ids = list(run_ids)  # type: ignore[attr-defined]
     if not args.no_viz:
         _bt_log("[backtest] Ensemble mode: per-run plots are skipped (μ±σ table + ensemble_summary.json).")
     args.no_viz = True
@@ -1659,6 +1685,7 @@ def main() -> None:
         if not run_ids:
             raise SystemExit("--run-ids is empty")
         args._multi_run_summary = len(run_ids) > 1  # type: ignore[attr-defined]
+        args._invocation_run_ids = list(run_ids)  # type: ignore[attr-defined]
         full_batch = args.detailed or int(args.stochastic_paths) > 0
         if not full_batch:
             args.no_viz = True

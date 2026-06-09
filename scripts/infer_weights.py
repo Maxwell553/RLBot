@@ -24,6 +24,7 @@ from rlbot.data_utils import clip_index_until, load_cache, resolve_panel_tickers
 from rlbot.inference_load import load_recurrent_ppo_inference  # noqa: E402
 from rlbot.inference_output import build_weights_payload  # noqa: E402
 from rlbot.rl_config import get_config, load_config, set_config  # noqa: E402
+from rlbot.research import oos_ledger  # noqa: E402
 from rlbot.run_artifacts import (  # noqa: E402
     RunPaths,
     config_sha256,
@@ -153,6 +154,17 @@ def main() -> None:
     t0 = time.perf_counter()
     model = load_recurrent_ppo_inference(model_path, device=args.device)
     print(f"[infer] loaded model {model_path.name} ({time.perf_counter() - t0:.1f}s)")
+
+    # Audit trail: inference reads recent bars (typically inside the newest holdout
+    # tail). Record it in the global OOS ledger under the actually-read slice so
+    # repeated as-of sweeps over a holdout are visible, with context "infer_weights".
+    oos_ledger.record_oos_read(
+        run_id=run_id,
+        window=oos_ledger.window_key(idx[sl][0], idx[sl][-1]),
+        checkpoint=args.checkpoint,
+        data_cache_hash=None,
+        context="infer_weights",
+    )
 
     print(f"[infer] warming recurrent state over {warm} bars ending {as_of} ...")
     t0 = time.perf_counter()

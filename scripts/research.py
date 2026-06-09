@@ -153,10 +153,13 @@ def _train_cmd(entry: dict, spec: ExperimentSpec, overwrite_run: bool = False) -
     return cmd
 
 
-def _oos_env(cohort: str) -> dict:
-    """Subprocess env for gated backtests: stamps the ledger context."""
+def _oos_env(cohort: str, window_budget: int | None = None) -> dict:
+    """Subprocess env for gated backtests: stamps the ledger context + budget so the
+    backtest re-checks the cumulative window budget atomically at read time."""
     env = dict(os.environ)
     env["RLBOT_OOS_CONTEXT"] = f"research:{cohort}"
+    if window_budget is not None:
+        env["RLBOT_WINDOW_BUDGET"] = str(int(window_budget))
     return env
 
 
@@ -230,10 +233,21 @@ def cmd_launch(args: argparse.Namespace) -> None:
     touches_oos = gates.tier_touches_oos(spec.evaluation_tier)
     tier = int(cm["evaluation_tier"])
     variants = cm["variants"]
-    if spec.success_gates or spec.budget:
-        print("[research] note: spec success_gates/budget are recorded in cohort.json "
-              "but not enforced by the orchestrator.")
+    if spec.budget:
+        print("[research] note: spec budget (e.g. max_modal_hours) is recorded in "
+              "cohort.json; wall-clock enforcement arrives with the modal backend.")
     if touches_oos:
+        windowless = [
+            e["variant_id"] for e in variants
+            if not ((e.get("window") or {}).get("holdout_start"))
+        ]
+        if windowless:
+            raise SystemExit(
+                f"tier-{tier} spec has variant(s) without a canonical window: "
+                f"{windowless}. OOS reads must name W1–W5 explicitly — the config-"
+                "default calendar-tail holdout would bypass per-window budgets and "
+                "can overlap the embargoed W6 range."
+            )
         already = _scored_keys(registry.read_records(reg, on_corrupt="raise"))
         pending = [e for e in variants if (e["run_id"], tier) not in already]
         gates.assert_oos_budget(len(pending), args.oos_budget)
@@ -248,7 +262,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
         for wkey, rids in by_window.items():
             oos_ledger.assert_window_budget(
                 ledger_records, wkey, rids,
-                budget=(getattr(args, "window_budget", None) or oos_ledger.DEFAULT_WINDOW_BUDGET),
+                budget=(args.window_budget if getattr(args, "window_budget", None) is not None else oos_ledger.DEFAULT_WINDOW_BUDGET),
             )
         print(f"[research] WARNING: this launch will read the OOS holdout for "
               f"{len(pending)} variant(s) (budget {args.oos_budget}; cumulative "
@@ -295,7 +309,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
                         reg, _collect_one(cm, e, tier=tier, status="oos_read_attempt")
                     )
                 print(f"[research] [{n}/{len(variants)}] backtest (OOS) {e['run_id']} ...")
-                subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"]))
+                subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"], getattr(args, "window_budget", None)))
             registry.append_record(reg, _collect_one(cm, e, tier=tier))
             print(f"[research] [{n}/{len(variants)}] {e['run_id']} done "
                   f"({time.perf_counter() - t0:.0f}s)")
@@ -396,10 +410,16 @@ def cmd_promote(args: argparse.Namespace) -> None:
     # Pre-registered promotion rule: when the spec declares success_gates, the
     # variant's seed-group must PASS them on in-training evidence before its one
     # holdout read is spent. --force-gates overrides with a loud trail.
+    if not ((entry.get("window") or {}).get("holdout_start")):
+        raise SystemExit(
+            f"variant {entry['variant_id']!r} has no canonical window; tier-4 promotion "
+            "requires an explicit W1–W5 window (config-tail holdouts bypass per-window "
+            "budgets and can overlap the embargoed W6 range)."
+        )
     success_gates = cm.get("success_gates") or {}
     if success_gates:
         rows = [
-            r for r in registry.read_records(reg)
+            r for r in registry.read_records(reg, on_corrupt="raise")
             if (r.get("group_id") or r.get("variant_id")) == (entry.get("group_id") or entry["variant_id"])
         ]
         verdict = gates.evaluate_success_gates(success_gates, rows)
@@ -422,7 +442,7 @@ def cmd_promote(args: argparse.Namespace) -> None:
         wkey = oos_ledger.window_key(w["holdout_start"], w["holdout_end"])
         oos_ledger.assert_window_budget(
             oos_ledger.read_ledger(on_corrupt="raise"), wkey, [entry["run_id"]],
-            budget=(getattr(args, "window_budget", None) or oos_ledger.DEFAULT_WINDOW_BUDGET),
+            budget=(args.window_budget if getattr(args, "window_budget", None) is not None else oos_ledger.DEFAULT_WINDOW_BUDGET),
         )
     bt = _backtest_cmd(entry)
     if args.dry_run:
@@ -445,7 +465,7 @@ def cmd_promote(args: argparse.Namespace) -> None:
             reg, _collect_one(cm, entry, tier=promote_tier, status="oos_read_attempt")
         )
     try:
-        subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"]))
+        subprocess.run(bt, check=True, cwd=str(REPO), env=_oos_env(cm["cohort"], getattr(args, "window_budget", None)))
     except subprocess.CalledProcessError as exc:
         msg = f"exit {exc.returncode} from backtest"
         registry.append_record(

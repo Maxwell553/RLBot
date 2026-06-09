@@ -7,6 +7,7 @@ for a variant already scored at T4 (multiple-testing guard).
 
 from __future__ import annotations
 
+import statistics
 from typing import Iterable, Mapping
 
 # tier -> (label, touches_oos, needs_promotion)
@@ -144,6 +145,18 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
         elif state == "inconclusive" and verdict != "fail":
             verdict = "inconclusive"
 
+    # One run can hold several scored records (tier-3 + a tier-4 promote): dedupe
+    # per run_id keeping the highest tier, exactly as the report does — otherwise the
+    # promoted (best) seed enters the gate medians twice.
+    by_run: dict[str, Mapping] = {}
+    for i, r in enumerate(rows):
+        rid = str(r.get("run_id") or f"__row{i}")
+        if rid not in by_run or int(r.get("evaluation_tier", 0)) > int(
+            by_run[rid].get("evaluation_tier", 0)
+        ):
+            by_run[rid] = r
+    rows = list(by_run.values())
+
     navs = [float(r["best_eval_nav"]) for r in rows if r.get("best_eval_nav") is not None]
     seeds = {r.get("seed") for r in rows if r.get("seed") is not None}
     n_seeds = len(seeds) if seeds else len(rows)
@@ -156,22 +169,22 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
         _check("eval_nav_mean_min", None if obs is None else obs >= float(gates["eval_nav_mean_min"]),
                obs, float(gates["eval_nav_mean_min"]))
     if "eval_nav_median_min" in gates:
-        obs = sorted(navs)[len(navs) // 2] if navs else None
+        obs = float(statistics.median(navs)) if navs else None
         _check("eval_nav_median_min", None if obs is None else obs >= float(gates["eval_nav_median_min"]),
                obs, float(gates["eval_nav_median_min"]))
     if "eval_nav_spread_max_frac" in gates:
         if len(navs) >= 2:
-            med = sorted(navs)[len(navs) // 2]
+            med = float(statistics.median(navs))
             obs = (max(navs) - min(navs)) / max(abs(med), 1e-9)
             _check("eval_nav_spread_max_frac", obs <= float(gates["eval_nav_spread_max_frac"]),
                    obs, float(gates["eval_nav_spread_max_frac"]))
         else:
             _check("eval_nav_spread_max_frac", None, None, float(gates["eval_nav_spread_max_frac"]))
     oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
-    for key, field, cmp_ge in (
-        ("oos_sharpe_min", "oos_sharpe", True),
-        ("oos_max_drawdown_floor", "oos_max_drawdown", True),
-        ("deflated_sharpe_min", "oos_deflated_sharpe", True),
+    for key, field in (
+        ("oos_sharpe_min", "oos_sharpe"),
+        ("oos_max_drawdown_floor", "oos_max_drawdown"),  # floor: dd (negative) >= x
+        ("deflated_sharpe_min", "oos_deflated_sharpe"),
     ):
         if key not in gates:
             continue
@@ -179,7 +192,6 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
         if not vals:
             _check(key, None, None, float(gates[key]))
             continue
-        obs = sorted(vals)[len(vals) // 2]
-        _check(key, obs >= float(gates[key]) if cmp_ge else obs <= float(gates[key]),
-               obs, float(gates[key]))
+        obs = float(statistics.median(vals))
+        _check(key, obs >= float(gates[key]), obs, float(gates[key]))
     return {"verdict": verdict, "checks": checks}

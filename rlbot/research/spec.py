@@ -177,6 +177,17 @@ class ExperimentSpec:
         if any(int(x) < 0 for x in self.seeds):
             raise ValueError(f"seeds must be non-negative ints, got {self.seeds}")
         assert_patch_allowed(self.patch, self.grid)
+        if self.success_gates:
+            # Validate pre-registered gate keys NOW — a typo'd gate that first raises
+            # at collect (after the compute is spent) defeats pre-registration.
+            from rlbot.research.gates import SUPPORTED_SUCCESS_GATES
+
+            unknown = set(self.success_gates) - SUPPORTED_SUCCESS_GATES
+            if unknown:
+                raise ValueError(
+                    f"unknown success_gates key(s) {sorted(unknown)}; "
+                    f"supported: {sorted(SUPPORTED_SUCCESS_GATES)}"
+                )
         if self.base_config != CANONICAL_BASE_CONFIG:
             raise PermissionError(
                 f"base_config must be {CANONICAL_BASE_CONFIG!r} (got {self.base_config!r}); "
