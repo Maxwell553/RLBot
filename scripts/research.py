@@ -61,9 +61,30 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _materialize(spec: ExperimentSpec) -> dict:
-    """Write per-variant config files + a cohort manifest. Returns the cohort manifest."""
+    """Write per-variant config files + a cohort manifest. Returns the cohort manifest.
+
+    Refuses to overwrite a cohort whose registry already holds records when the spec
+    file has changed since the original materialization — re-planning an edited spec
+    over trained runs would silently relabel the plan of record (and refresh the
+    spec_sha256 that promote's edit guard checks). Register a new spec id instead.
+    """
     cohort = spec.id
     cdir = _cohort_dir(cohort)
+    prior = _read_json(cdir / "cohort.json")
+    if prior:
+        prior_sha = prior.get("spec_sha256")
+        if (
+            prior_sha
+            and spec.source_sha256
+            and prior_sha != spec.source_sha256
+            and registry.read_records(_registry_path(cohort))
+        ):
+            raise SystemExit(
+                f"Cohort {cohort!r} already has registry records trained under a "
+                f"different spec (sha {str(prior_sha)[:12]} != {str(spec.source_sha256)[:12]}). "
+                "Re-planning an edited spec over trained runs would relabel the plan of "
+                "record — register a NEW spec id for the changed experiment."
+            )
     (cdir / "configs").mkdir(parents=True, exist_ok=True)
     base_path = (REPO / spec.base_config) if not Path(spec.base_config).is_absolute() else Path(spec.base_config)
     base_sha = hashlib.sha256(base_path.read_bytes()).hexdigest()

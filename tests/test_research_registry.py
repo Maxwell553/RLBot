@@ -386,13 +386,33 @@ def test_gate_reads_fail_closed_on_corrupt_registry(tmp_path: Path) -> None:
 
 
 def test_registry_lock_serializes_check_then_append(tmp_path: Path) -> None:
+    import threading
+    import time
+
     from rlbot.research import registry
 
     reg = tmp_path / "registry.jsonl"
-    with registry.registry_lock(reg):
-        registry.append_record(reg, {"run_id": "a"})
-    assert (tmp_path / "registry.jsonl.lock").exists()
-    assert registry.read_records(reg)[0]["run_id"] == "a"
+    order: list[str] = []
+
+    def holder() -> None:
+        with registry.registry_lock(reg):
+            order.append("h_in")
+            registry.append_record(reg, {"run_id": "a"})
+            time.sleep(0.25)
+            order.append("h_out")
+
+    def contender() -> None:
+        time.sleep(0.05)  # let the holder acquire first
+        with registry.registry_lock(reg):
+            order.append("c_in")
+            registry.append_record(reg, {"run_id": "b"})
+
+    th, tc = threading.Thread(target=holder), threading.Thread(target=contender)
+    th.start(); tc.start(); th.join(timeout=10); tc.join(timeout=10)
+    # flock contention across separate open()s: the contender must enter only after
+    # the holder released — a regression to a no-op lock would interleave c_in first
+    assert order == ["h_in", "h_out", "c_in"], order
+    assert [r["run_id"] for r in registry.read_records(reg)] == ["a", "b"]
 
 
 def test_spec_rejects_seed_collision_hazards() -> None:
@@ -416,12 +436,45 @@ def test_resolve_variants_rejects_id_collisions_and_disambiguates_long_values() 
     )
     ids = [v.variant_id for v in resolve_variants(spec)]
     assert len(set(ids)) == 2, ids
-    # grid keys sharing a last segment must not produce the same tag
+    # grid keys SHARING a last segment must fall back to full dotted tags
     spec2 = ExperimentSpec(
         id="g2",
         evaluation_tier=1,
         seeds=[1],
-        grid={"reward.reward_scale": [1.0], "hyperparameters.n_steps": [4096]},
+        grid={"reward.participation_bonus": [1.0], "curriculum.participation_bonus": [2.0]},
     )
     v = resolve_variants(spec2)[0]
-    assert "reward_scale=" in v.variant_id and "n_steps=" in v.variant_id
+    assert "reward-participation_bonus=" in v.variant_id
+    assert "curriculum-participation_bonus=" in v.variant_id
+
+
+def test_materialize_refuses_edited_spec_over_trained_cohort(tmp_path: Path, monkeypatch) -> None:
+    """Re-planning an edited spec over a cohort with registry records must hard-fail
+    (it would relabel the plan of record and refresh promote's spec_sha256 guard)."""
+    import scripts.research as research
+    from rlbot.research import registry
+
+    monkeypatch.setattr(research, "RUNS_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(research, "_cohort_dir", lambda c: tmp_path / c)
+    monkeypatch.setattr(research, "_registry_path", lambda c: tmp_path / c / "registry.jsonl")
+    spec_path = tmp_path / "s.yaml"
+    spec_path.write_text(
+        "id: edited_spec_guard\nhypothesis: h\nevaluation_tier: 1\nseeds: [0]\n"
+        "patch:\n  reward.reward_scale: 1000.0\n",
+        encoding="utf-8",
+    )
+    spec = research.load_spec(spec_path)
+    research._materialize(spec)  # first plan: fine
+    research._materialize(spec)  # idempotent re-plan, same sha: fine
+    registry.append_record(
+        tmp_path / "edited_spec_guard" / "registry.jsonl",
+        {"run_id": "r", "status": "ok", "evaluation_tier": 1},
+    )
+    spec_path.write_text(
+        "id: edited_spec_guard\nhypothesis: h CHANGED\nevaluation_tier: 1\nseeds: [0]\n"
+        "patch:\n  reward.reward_scale: 500.0\n",
+        encoding="utf-8",
+    )
+    edited = research.load_spec(spec_path)
+    with pytest.raises(SystemExit, match="NEW spec id"):
+        research._materialize(edited)
