@@ -108,15 +108,20 @@ def test_published_metric_examples_use_best_checkpoint() -> None:
 
 
 def test_agent_docs_do_not_claim_untracked_execution_readme() -> None:
-    """CLAUDE/AGENTS once claimed execution/README.md is tracked (it is not) and that
-    paper_trade/ is absent (it is tracked)."""
+    """Agent docs must match git reality: no execution/ or paper_trade/ files are
+    tracked (paper_trade was removed on main), and the docs must not claim a tracked
+    execution/README.md or a live paper_trade tree."""
     import subprocess
 
     tracked = subprocess.run(
         ["git", "ls-files"], cwd=PROJECT_ROOT, capture_output=True, text=True
     ).stdout.splitlines()
-    assert "paper_trade/README.md" in tracked
     assert not any(p.startswith("execution/") for p in tracked)
+    assert not any(p.startswith("paper_trade/") for p in tracked)
+    assert "scripts/paper_trade.py" not in tracked
     for name in AGENT_DOCS:
         text = _doc_text(name)
         assert "except a tracked `execution/README.md`" not in text
+        assert "`paper_trade/` tree" not in text.replace(
+            "**no** `paper_trade/` tree", ""
+        ), f"{name} claims a live paper_trade tree"

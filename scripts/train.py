@@ -32,6 +32,7 @@ _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 
 import argparse
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,13 @@ def _startup_log(msg: str) -> None:
 
 
 _startup_log("[train] Starting (loading dependencies)...")
+
+# Fast-fail on contradictory flags before the expensive torch import (also keeps this
+# check testable without torch installed).
+if any(a == "--resume" or a.startswith("--resume=") for a in sys.argv[1:]) and any(
+    a == "--finetune" or a.startswith("--finetune=") for a in sys.argv[1:]
+):
+    raise SystemExit("Use only one of --resume or --finetune, not both.")
 
 import numpy as np
 

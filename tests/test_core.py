@@ -80,6 +80,7 @@ def test_benchmark_relative_max_share_validation() -> None:
         max_step_log_return_downside=-0.1,
         risk_window=10,
         sortino_min_steps=1,
+        sortino_downside_floor=1e-4,
         risk_bonus_scale=1.0,
         benchmark_cap_weights=(1.0,),
         benchmark_excess_scale=1.0,

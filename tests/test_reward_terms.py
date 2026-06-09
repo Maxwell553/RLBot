@@ -65,10 +65,18 @@ def test_inactivity_penalty_at_full_cash_matches_config() -> None:
     assert info["rew_decomp/inactivity"] == pytest.approx(
         -(rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90), abs=1e-6
     )
-    # flat prices, no positions: inactivity dominates the reward
+    # flat prices, no positions: reward = inactivity + participation + benchmark excess
+    # (the invested benchmark pays holding cost while the agent sits in cash; sortino is
+    # gated by sortino_min_steps and return/churn are exactly zero here)
     assert reward == pytest.approx(
-        info["rew_decomp/inactivity"] + info["rew_decomp/participation"], abs=1e-9
+        info["rew_decomp/inactivity"]
+        + info["rew_decomp/participation"]
+        + info["rew_decomp/benchmark"]
+        + info["rew_decomp/sortino"],
+        abs=1e-9,
     )
+    # ... and inactivity still dominates
+    assert abs(info["rew_decomp/benchmark"]) < 0.5 * abs(info["rew_decomp/inactivity"])
 
 
 def test_inactivity_scale_parameter_scales_linear_term() -> None:
@@ -118,7 +126,11 @@ def test_churn_equals_turnover_times_penalty_at_baseline_vix() -> None:
     assert info["rew_decomp/vix_churn_mult"] == pytest.approx(1.0)
     turnover = info["turnover"]
     assert turnover > 0.1  # the first rebalance buys ~N/(N+1) of NAV
-    assert info["rew_decomp/churn"] == pytest.approx(-turnover * rwd.churn_penalty, rel=1e-9)
+    tx = info["tx_cost_frac"]
+    assert tx > 0.0  # realized slippage + fees on the buys
+    assert info["rew_decomp/churn"] == pytest.approx(
+        -tx * rwd.churn_penalty * rwd.reward_scale, rel=1e-9
+    )
 
 
 def test_churn_scales_with_vix_multiplier_and_curriculum_scale() -> None:
@@ -129,7 +141,7 @@ def test_churn_scales_with_vix_multiplier_and_curriculum_scale() -> None:
     _, _, _, _, info = env.step(np.zeros(_N_ACT))
     assert info["rew_decomp/vix_churn_mult"] == pytest.approx(1.5)
     assert info["rew_decomp/churn"] == pytest.approx(
-        -info["turnover"] * 1.5 * rwd.churn_penalty, rel=1e-9
+        -info["tx_cost_frac"] * 1.5 * rwd.churn_penalty * rwd.reward_scale, rel=1e-9
     )
     # curriculum churn scale multiplies in
     env2 = _make_env(*_flat_panel(vix=VIX_CHURN_BASELINE))
@@ -137,10 +149,10 @@ def test_churn_scales_with_vix_multiplier_and_curriculum_scale() -> None:
     env2.reset()
     _, _, _, _, info2 = env2.step(np.zeros(_N_ACT))
     assert info2["rew_decomp/churn"] == pytest.approx(
-        -info2["turnover"] * 1.0 * 0.5 * rwd.churn_penalty, rel=1e-9
+        -info2["tx_cost_frac"] * 1.0 * 0.5 * rwd.churn_penalty * rwd.reward_scale, rel=1e-9
     )
-    # same turnover (identical action/prices) → churn strictly proportional to the scales
-    assert info["turnover"] == pytest.approx(info2["turnover"], rel=1e-9)
+    # same tx cost (identical action/prices) → churn strictly proportional to the scales
+    assert info["tx_cost_frac"] == pytest.approx(info2["tx_cost_frac"], rel=1e-9)
     assert info["rew_decomp/churn"] == pytest.approx(3.0 * info2["rew_decomp/churn"], rel=1e-9)
 
 
@@ -169,11 +181,11 @@ def test_compute_sortino_real_downside_ignores_floor() -> None:
 # ── (e) decomposition completeness ───────────────────────────────────────
 _DECOMP_KEYS = (
     "rew_decomp/return",
+    "rew_decomp/benchmark",
     "rew_decomp/sortino",
     "rew_decomp/inactivity",
     "rew_decomp/participation",
     "rew_decomp/churn",
-    "rew_decomp/drawdown",
 )
 
 
