@@ -171,7 +171,7 @@ For long runs on a cloud GPU with the same `Runs/<run_id>/` layout, see [MODAL.m
 Quick flow:
 
 1. `pip install -e ".[modal]"` and `modal setup`
-2. `modal run scripts/modal_app.py -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
+2. `modal run scripts/modal_app.py::train -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
 3. In another terminal: `python scripts/modal_app.py sync --run-id <RUN_ID> --watch` (open `Runs/<RUN_ID>/plots/training.png` in the IDE)
 4. After the job: `python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all` then backtest locally
 

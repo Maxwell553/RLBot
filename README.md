@@ -44,7 +44,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 pip install -e ".[modal]" && modal setup
 
 # Train on Modal (broker scales n_envs + batch_size; pass --run-id or use --window N)
-modal run scripts/modal_app.py -- \
+modal run scripts/modal_app.py::train -- \
   --modal-gpu H100 --window 2 --run-id <RUN_ID> --timesteps 65000000 \
   --refresh-data --since 2006-01-01 --train-end 2017-12-31 \
   --holdout-start 2018-01-01 --holdout-end 2019-12-31 --until 2019-12-31

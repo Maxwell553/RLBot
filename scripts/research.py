@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -136,9 +137,18 @@ def _train_cmd(
     modal_gpu: str | None = None,
     timesteps_override: int | None = None,
 ) -> list[str]:
+    cfg_path = Path(entry["config_path"])
+    # Repo-relative config path: subprocesses run with cwd=REPO locally, and the
+    # remote container mounts the runs volume at the same relative layout — an
+    # absolute local path would not exist inside the container.
+    if cfg_path.is_absolute():
+        try:
+            cfg_path = cfg_path.relative_to(REPO)
+        except ValueError:
+            pass  # outside the repo: leave absolute (local backend only)
     train_flags = [
         "--config",
-        entry["config_path"],
+        str(cfg_path),
         "--run-id",
         entry["run_id"],
         "--seed",
@@ -158,14 +168,13 @@ def _train_cmd(
         if w.get(key):
             train_flags += [flag, str(w[key])]
     if backend == "modal":
-        modal_bin = shutil.which("modal")
-        if not modal_bin:
-            raise SystemExit(
-                "--backend modal requires the modal CLI (pip install -e '.[modal]' "
-                "&& modal setup)."
-            )
+        from rlbot.modal_cloud import modal_cli
+
         gpu_flags = ["--modal-gpu", modal_gpu] if modal_gpu else []
-        return [modal_bin, "run", str(REPO / "scripts" / "modal_app.py"), "--",
+        # modal_app.py registers several local entrypoints; `modal run file.py` cannot
+        # dispatch among them — the ::train entrypoint must be named explicitly.
+        return [*modal_cli(), "run",
+                str(REPO / "scripts" / "modal_app.py") + "::train", "--",
                 *gpu_flags, *train_flags]
     return [sys.executable, str(REPO / "scripts" / "train.py"), *train_flags]
 
@@ -177,22 +186,36 @@ def _modal_pre_train(entry: dict) -> None:
 
     cfg = Path(entry["config_path"]).resolve()
     rel = cfg.relative_to((REPO / "Runs").resolve())
+    from rlbot.modal_cloud import modal_cli
+
     subprocess.run(
-        [shutil.which("modal") or "modal", "volume", "put", VOLUME_RUNS,
-         str(cfg), str(rel), "--force"],
+        [*modal_cli(), "volume", "put", VOLUME_RUNS, str(cfg), str(rel), "--force"],
         check=True,
         cwd=str(REPO),
     )
 
 
 def _modal_post_train(entry: dict) -> None:
-    """Pull the finished run tree from the Modal volume so collect/backtest see it."""
+    """Pull the finished run tree from the Modal volume so collect/backtest see it.
+
+    Verifies the pull actually produced the run's manifest + training summary —
+    a hollow sync followed by collect would append a scored-looking record with
+    null metrics and permanently block the relaunch."""
     subprocess.run(
         [sys.executable, str(REPO / "scripts" / "modal_app.py"), "sync",
          "--run-id", entry["run_id"], "--pull-all"],
         check=True,
         cwd=str(REPO),
     )
+    rp = RunPaths(entry["run_id"])
+    missing = [
+        str(p) for p in (rp.manifest_path, rp.run_meta_dir / "training_summary.json")
+        if not p.is_file()
+    ]
+    if missing:
+        raise subprocess.CalledProcessError(
+            1, "modal-sync-verify", output=f"pulled run is missing {missing}"
+        )
 
 
 def _oos_env(cohort: str, window_budget: int | None = None) -> dict:
@@ -275,9 +298,10 @@ def cmd_launch(args: argparse.Namespace) -> None:
     touches_oos = gates.tier_touches_oos(spec.evaluation_tier)
     tier = int(cm["evaluation_tier"])
     variants = cm["variants"]
-    if spec.budget:
-        print("[research] note: spec budget (e.g. max_modal_hours) is recorded in "
-              "cohort.json; wall-clock enforcement arrives with the modal backend.")
+    if (spec.budget or {}).get("max_modal_hours"):
+        print(f"[research] note: budget.max_modal_hours={spec.budget['max_modal_hours']} "
+              "is enforced as a per-variant wall-clock cap (local kill; on modal the "
+              "remote app must be stopped manually if the client dies).")
     if touches_oos:
         windowless = [
             e["variant_id"] for e in variants
@@ -323,11 +347,15 @@ def cmd_launch(args: argparse.Namespace) -> None:
             gates.assert_no_repeat_oos(existing, e["variant_id"])
         # A leftover run dir here means a prior attempt crashed or failed (scored
         # variants were skipped above) — retry must overwrite, not brick the relaunch.
-        stale_run_dir = RunPaths(e["run_id"]).manifest_path.is_file()
-        if stale_run_dir:
+        backend = getattr(args, "backend", "local")
+        # Local: a leftover manifest means a crashed/failed (never-scored) attempt.
+        # Modal: the stale dir lives on the VOLUME where we cannot cheaply look —
+        # any unscored variant retry must overwrite (train.py only acts on the flag
+        # when a manifest actually exists).
+        stale_run_dir = RunPaths(e["run_id"]).manifest_path.is_file() or backend == "modal"
+        if stale_run_dir and backend != "modal":
             print(f"[research] [{n}/{len(variants)}] {e['run_id']}: stale unscored run dir "
                   "from a previous attempt; retraining with --overwrite-run.")
-        backend = getattr(args, "backend", "local")
         train = _train_cmd(
             e, spec, overwrite_run=stale_run_dir, backend=backend,
             modal_gpu=getattr(args, "modal_gpu", None),
@@ -373,6 +401,13 @@ def cmd_launch(args: argparse.Namespace) -> None:
         except subprocess.TimeoutExpired:
             msg = f"wall-clock cap exceeded ({max_h}h, spec budget.max_modal_hours)"
             print(f"[research] ERROR: variant {e['run_id']} timed out: {msg}", file=sys.stderr)
+            if backend == "modal":
+                print(
+                    "[research] WARNING: the timeout killed only the LOCAL modal "
+                    "client — the remote app may still be running (and billing). "
+                    "Check `modal app list` and stop it manually.",
+                    file=sys.stderr,
+                )
             registry.append_record(
                 reg, _collect_one(cm, e, tier=tier, status="failed", failure=msg)
             )
@@ -544,11 +579,24 @@ def cmd_promote(args: argparse.Namespace) -> None:
           f"maxDD={record.get('oos_max_drawdown')}")
 
 
+def _queue_move(src: Path, dest_dir: Path) -> None:
+    """Move a queue spec without silently clobbering a same-named earlier outcome."""
+    dest = dest_dir / src.name
+    if dest.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = dest_dir / f"{src.stem}.{stamp}{src.suffix}"
+    shutil.move(str(src), dest)
+
+
 def cmd_run_queue(args: argparse.Namespace) -> None:
     """Process queued specs (Runs/queue/*.yaml) sequentially: launch → report, then
     move each spec to done/ or failed/. The queue is the substrate an autonomous
     proposer schedules onto; tier ≥ 4 specs are REFUSED here — promotion stays a
-    human action (run `promote` directly)."""
+    human action (run `promote` directly).
+
+    Single-drainer by design: run ONE run-queue process at a time (no claim locks;
+    two drains would double-launch). A spec moved to failed/ may have partially
+    succeeded — re-queueing it resumes, since launch skips already-scored variants."""
     qdir = Path(args.queue_dir)
     qdir.mkdir(parents=True, exist_ok=True)
     (qdir / "done").mkdir(exist_ok=True)
@@ -579,14 +627,37 @@ def cmd_run_queue(args: argparse.Namespace) -> None:
             # sweep — record and keep draining the queue.
             print(f"[research] queue: {spec_path.name} finished with failures: {exc}",
                   file=sys.stderr)
-            shutil.move(str(spec_path), qdir / "failed" / spec_path.name)
+            _queue_move(spec_path, qdir / "failed")
             continue
-        except (PermissionError, ValueError, KeyError) as exc:
+        except (PermissionError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+            # Machine-written specs fail in machine ways (bad YAML, wrong-typed
+            # fields) — a single bad file must not crash-loop the whole drain.
             print(f"[research] queue: {spec_path.name} rejected: {exc}", file=sys.stderr)
-            shutil.move(str(spec_path), qdir / "failed" / spec_path.name)
+            _queue_move(spec_path, qdir / "failed")
             continue
-        shutil.move(str(spec_path), qdir / "done" / spec_path.name)
+        _queue_move(spec_path, qdir / "done")
         print(f"[research] queue: {spec_path.name} → done/")
+
+
+def screen_ranking(records: list[dict], keep_top: float) -> tuple[list[tuple[str, float]], list[str]]:
+    """Rank seed-groups by median best_eval_nav (descending); return the ranking
+    and the advancing top fraction (always at least one group when any ranked)."""
+    import statistics as _st
+
+    by_group: dict[str, list[dict]] = {}
+    for r in records:
+        by_group.setdefault(str(r.get("group_id") or r.get("variant_id")), []).append(r)
+    ranked = sorted(
+        (
+            (gid, _st.median([float(r["best_eval_nav"]) for r in rows
+                              if r.get("best_eval_nav") is not None] or [float("-inf")]))
+            for gid, rows in by_group.items()
+        ),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    keep_n = max(1, int(round(len(ranked) * float(keep_top)))) if ranked else 0
+    return ranked, [g for g, _ in ranked[:keep_n]]
 
 
 def cmd_screen(args: argparse.Namespace) -> None:
@@ -600,27 +671,40 @@ def cmd_screen(args: argparse.Namespace) -> None:
     reg = _registry_path(spec.id)
     screen_tier = 1
     ts = int(args.screen_timesteps)
+    max_h = (spec.budget or {}).get("max_modal_hours")
+    timeout_s = float(max_h) * 3600.0 if max_h else None
     print(f"[research] screening {len(cm['variants'])} variant(s) at tier {screen_tier} "
           f"({ts:,} timesteps each)")
     failures = []
     for n, e in enumerate(cm["variants"], 1):
+        # Screen runs live under their own run ids: training the SAME id at a tiny
+        # budget would overwrite full-budget artifacts that registry records still
+        # point at, and a later `collect` would stamp screen runs at the full tier.
+        e = {**e, "run_id": e["run_id"] + "__screen"}
         existing = registry.read_records(reg)
         if (e["run_id"], screen_tier) in _scored_keys(existing):
             print(f"[research] [{n}/{len(cm['variants'])}] {e['run_id']} already screened; skipping.")
             continue
-        stale = RunPaths(e["run_id"]).manifest_path.is_file()
+        backend = getattr(args, "backend", "local")
+        stale = RunPaths(e["run_id"]).manifest_path.is_file() or backend == "modal"
         train = _train_cmd(
-            e, spec, overwrite_run=stale, backend=getattr(args, "backend", "local"),
+            e, spec, overwrite_run=stale, backend=backend,
             modal_gpu=getattr(args, "modal_gpu", None), timesteps_override=ts,
         )
         print(f"[research] [{n}/{len(cm['variants'])}] screen-train {e['run_id']} ...")
         try:
-            if getattr(args, "backend", "local") == "modal":
+            if backend == "modal":
                 _modal_pre_train(e)
-            subprocess.run(train, check=True, cwd=str(REPO))
-            if getattr(args, "backend", "local") == "modal":
+            subprocess.run(train, check=True, cwd=str(REPO), timeout=timeout_s)
+            if backend == "modal":
                 _modal_post_train(e)
             registry.append_record(reg, _collect_one(cm, e, tier=screen_tier))
+        except subprocess.TimeoutExpired:
+            msg = f"wall-clock cap exceeded ({max_h}h)"
+            registry.append_record(
+                reg, _collect_one(cm, e, tier=screen_tier, status="failed", failure=msg)
+            )
+            failures.append((e["run_id"], msg))
         except subprocess.CalledProcessError as exc:
             msg = f"exit {exc.returncode}"
             registry.append_record(
@@ -632,26 +716,13 @@ def cmd_screen(args: argparse.Namespace) -> None:
         if int(r.get("evaluation_tier", 0)) == screen_tier
         and str(r.get("status", "ok")) == "ok"
     ]
-    by_group: dict[str, list[dict]] = {}
-    for r in records:
-        by_group.setdefault(str(r.get("group_id") or r.get("variant_id")), []).append(r)
-    import statistics as _st
-
-    ranked = sorted(
-        (
-            (gid, _st.median([float(r["best_eval_nav"]) for r in rows
-                              if r.get("best_eval_nav") is not None] or [float("-inf")]))
-            for gid, rows in by_group.items()
-        ),
-        key=lambda kv: kv[1],
-        reverse=True,
-    )
-    keep_n = max(1, int(round(len(ranked) * float(args.keep_top))))
+    ranked, advance = screen_ranking(records, float(args.keep_top))
+    keep_n = len(advance)
     out = {
         "screen_timesteps": ts,
         "keep_top": float(args.keep_top),
         "ranking": [{"group_id": g, "median_best_eval_nav": v} for g, v in ranked],
-        "advance": [g for g, _ in ranked[:keep_n]],
+        "advance": advance,
     }
     out_path = _cohort_dir(spec.id) / "screen_ranking.json"
     out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")

@@ -259,31 +259,47 @@ def test_launch_runs_unscored_variant(harness) -> None:
 
 
 # ── Phase C: backend command construction, queue guardrail, screen ranking ──
-def test_train_cmd_modal_backend_constructs_modal_invocation(monkeypatch) -> None:
+def test_train_cmd_modal_backend_constructs_modal_invocation() -> None:
     import scripts.research as research
 
-    monkeypatch.setattr(research.shutil, "which", lambda b: f"/usr/bin/{b}")
-    entry = {"config_path": "Runs/c/configs/v.yaml", "run_id": "v", "seed": 7,
-             "window": {"train_end": "2021-12-31", "holdout_start": "2022-01-01",
-                        "holdout_end": "2023-12-31"}}
+    entry = {
+        # _materialize emits ABSOLUTE paths; the remote container needs repo-relative
+        "config_path": str(research.PROJECT_ROOT / "Runs" / "c" / "configs" / "v.yaml"),
+        "run_id": "v", "seed": 7,
+        "window": {"train_end": "2021-12-31", "holdout_start": "2022-01-01",
+                   "holdout_end": "2023-12-31"},
+    }
     spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
     cmd = research._train_cmd(entry, spec, backend="modal", modal_gpu="H100")
-    assert cmd[0].endswith("modal") and cmd[1] == "run"
-    assert "--" in cmd and "--modal-gpu" in cmd and "H100" in cmd
-    assert "--run-id" in cmd and "v" in cmd
+    # modal_app.py has several local entrypoints — the ::train one must be named,
+    # else `modal run` refuses to dispatch
+    runnable = next(a for a in cmd if a.endswith("modal_app.py::train"))
+    assert runnable
+    assert "run" in cmd and "--" in cmd
+    assert "--modal-gpu" in cmd and "H100" in cmd
+    # config path must be repo-relative so it resolves inside the container
+    cfg_i = cmd.index("--config") + 1
+    assert cmd[cfg_i] == "Runs/c/configs/v.yaml", cmd[cfg_i]
+    # --modal-gpu and train flags all come AFTER the `--` separator
+    sep = cmd.index("--")
+    assert cmd.index("--modal-gpu") > sep and cmd.index("--config") > sep
     # timesteps override beats spec timesteps
     cmd2 = research._train_cmd(entry, spec, timesteps_override=123)
     assert "123" in cmd2
 
 
-def test_train_cmd_modal_requires_cli(monkeypatch) -> None:
+def test_train_cmd_modal_never_hard_requires_path_binary(monkeypatch) -> None:
+    """modal_cli() degrades which() -> venv sibling -> python -m modal; _train_cmd
+    must never SystemExit just because `modal` is not on PATH."""
+    import rlbot.modal_cloud as mc
     import scripts.research as research
 
-    monkeypatch.setattr(research.shutil, "which", lambda b: None)
+    monkeypatch.setattr(mc.shutil, "which", lambda b: None)
     entry = {"config_path": "c.yaml", "run_id": "v", "seed": 1, "window": {}}
     spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
-    with pytest.raises(SystemExit, match="modal CLI"):
-        research._train_cmd(entry, spec, backend="modal")
+    cmd = research._train_cmd(entry, spec, backend="modal")
+    head = cmd[: cmd.index("run")]
+    assert head[-1].endswith("modal") or head[-2:] == ["-m", "modal"], head
 
 
 def test_run_queue_refuses_oos_tiers(harness, tmp_path) -> None:
@@ -297,3 +313,46 @@ def test_run_queue_refuses_oos_tiers(harness, tmp_path) -> None:
     assert not (qdir / "exp_q4.yaml").exists()
     assert (qdir / "failed" / "exp_q4.yaml").exists()
     assert state["calls"] == []  # nothing trained, nothing backtested
+
+
+def test_run_queue_survives_malformed_yaml(harness) -> None:
+    mod, tmp, state = harness
+    qdir = tmp / "queue"
+    qdir.mkdir()
+    (qdir / "bad.yaml").write_text("id: [unclosed\n  ::: not yaml", encoding="utf-8")
+    mod.cmd_run_queue(argparse.Namespace(queue_dir=str(qdir), backend="local",
+                                         modal_gpu=None, window_budget=None))
+    assert not (qdir / "bad.yaml").exists()
+    assert (qdir / "failed" / "bad.yaml").exists()
+
+
+def test_screen_ranking_orders_and_advances_top_fraction() -> None:
+    import scripts.research as research
+
+    records = [
+        {"group_id": "a", "best_eval_nav": 100.0},
+        {"group_id": "a", "best_eval_nav": 110.0},
+        {"group_id": "b", "best_eval_nav": 300.0},
+        {"group_id": "c", "best_eval_nav": 200.0},
+        {"group_id": "d", "best_eval_nav": None},  # never trained far enough
+    ]
+    ranked, advance = research.screen_ranking(records, keep_top=0.25)
+    assert [g for g, _ in ranked][:3] == ["b", "c", "a"]
+    assert advance == ["b"]  # round(4 * 0.25) = 1
+    assert ranked[-1][1] == float("-inf")  # nav-less group sinks to the bottom
+    # at least one group always advances
+    _, adv2 = research.screen_ranking(records[:2], keep_top=0.01)
+    assert adv2 == ["a"]
+    assert research.screen_ranking([], keep_top=0.5) == ([], [])
+
+
+def test_screen_uses_isolated_run_ids() -> None:
+    import scripts.research as research
+
+    src = (research.PROJECT_ROOT / "scripts" / "research.py").read_text(encoding="utf-8")
+    screen_body = src.split("def cmd_screen", 1)[1].split("\ndef ", 1)[0]
+    assert '"__screen"' in screen_body, (
+        "screen must train under <variant>__screen run ids — reusing the variant id "
+        "would overwrite full-budget artifacts and let collect stamp screen runs at "
+        "the full tier"
+    )

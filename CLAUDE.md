@@ -35,7 +35,7 @@ python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2> --checkpoint best  # 
 python scripts/backtest.py --ensemble-prefix my_cohort --detailed        # writes ensemble_summary.json
 
 # Cloud training (see docs/MODAL.md)
-modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID>
+modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 1 --run-id <RUN_ID>
 
 # Auto-research loop (spec → train/backtest → JSONL registry → report; OOS-gated)
 python scripts/research.py plan   specs/feature_split_ab.yaml   # materialize variant configs

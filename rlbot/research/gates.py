@@ -156,6 +156,10 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
         ):
             by_run[rid] = r
     rows = list(by_run.values())
+    # Tier-1 rows are smoke/screen evidence (tiny budgets) — never promotion
+    # evidence. A group with ONLY tier-1 rows has no decision evidence at all:
+    # every threshold check below goes inconclusive on the empty set.
+    rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 2]
 
     navs = [float(r["best_eval_nav"]) for r in rows if r.get("best_eval_nav") is not None]
     seeds = {r.get("seed") for r in rows if r.get("seed") is not None}

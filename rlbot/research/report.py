@@ -64,6 +64,11 @@ def _render(by_group: dict[str, list[Mapping]]) -> str:
             ):
                 by_run[rid] = r
         runs = list(by_run.values())
+        # Tier-1 rows are smoke/screen evidence (tiny budgets, e.g. `research.py
+        # screen` runs sharing this group_id) — they never feed decision metrics
+        # unless they are ALL the group has.
+        decision = [r for r in runs if int(r.get("evaluation_tier", 0)) >= 2] or runs
+        runs = decision
         tier = max(int(r.get("evaluation_tier", 0)) for r in runs)
         seeds = {r.get("seed") for r in runs if r.get("seed") is not None}
         n_seeds = len(seeds) if seeds else len(runs)
