@@ -5,9 +5,12 @@ Tradeable symbols come from ``config.yaml`` → ``universe.assets`` (via
 ``get_active_symbols()``). Macro context (DXY, TNX, VIX, HY OAS) is
 observation-only.
 
-Daily bars are outer-joined across assets with short forward-fill for
-holiday gaps. Pre-listing rows are dropped. The panel starts when all
-configured assets have real quotes.
+Daily bars are outer-joined across assets with short forward-fill for holiday
+gaps; there is **no global row drop**. Pre-listing rows are kept and live-masked
+(``asset_live`` = 0): prices are back-filled with the first listing print for
+continuity, per-asset features are neutralized on pre-live bars, and the env
+forces pre-live weights to zero. Post-delisting bars keep the last real price
+(unlimited forward-fill) so a dead position liquidates at its last real close.
 """
 
 from __future__ import annotations
@@ -325,7 +328,10 @@ def _attach_hy_oas_column(
         )
 
     merged[col] = fred_vals.where(fred_vals.notna(), proxy_cal)
-    merged[col] = merged[col].ffill().bfill().fillna(0.0)
+    # Forward-fill only — never bfill: a truncated FRED fetch would otherwise push a
+    # future calibrated spread level into pre-coverage bars. Leading NaNs → 0 (the env
+    # treats 0 as missing, same convention as the other macro series).
+    merged[col] = merged[col].ffill().fillna(0.0)
     return merged
 
 
@@ -409,8 +415,16 @@ def compute_feature_panel(
     macro: np.ndarray,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     lookback: int = 20,
+    asset_live: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """RSI, MACD, trend, fracdiff, and trailing realized vol panels on a contiguous slice."""
+    """RSI, MACD, trend, fracdiff, and trailing realized vol panels on a contiguous slice.
+
+    When ``asset_live`` (t, n_assets; 1 = real print) is given, per-asset features are
+    neutralized on pre-live/dead bars. Pre-IPO prices are back-filled with the first
+    listing price for continuity, and fracdiff of a *constant* log price is nonzero for
+    hundreds of bars — without this mask the observation would encode the future
+    listing price level before the asset exists.
+    """
     t, n_assets = ohlcv.shape[0], ohlcv.shape[1]
     rsi = np.zeros((t, n_assets), dtype=np.float64)
     macd = np.zeros((t, n_assets), dtype=np.float64)
@@ -422,6 +436,13 @@ def compute_feature_panel(
     trend_signals = compute_trend_signals(ohlcv)
     fracdiff, fracdiff_macro = compute_fracdiff_panel(ohlcv, macro, d=fracdiff_d)
     asset_vol, macro_vol = compute_realized_vol_panels(ohlcv, macro, lookback=lookback)
+    if asset_live is not None:
+        dead = np.asarray(asset_live, dtype=np.float64) < 0.5
+        rsi[dead] = 50.0
+        macd[dead] = 0.0
+        fracdiff[dead] = 0.0
+        trend_signals[dead] = 0.0
+        asset_vol[dead] = 0.0
     return rsi, macd, fracdiff, fracdiff_macro, trend_signals, asset_vol, macro_vol
 
 
@@ -463,7 +484,7 @@ def _indicators_from_merged(
     """Full-timeline features (OK for contiguous OOS backtest / cache)."""
     idx, ohlcv, macro, asset_live = _ohlcv_macro_from_merged(merged, active_tickers)
     rsi, macd, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol = compute_feature_panel(
-        ohlcv, macro, fracdiff_d=fracdiff_d
+        ohlcv, macro, fracdiff_d=fracdiff_d, asset_live=asset_live
     )
     return idx, ohlcv, rsi, macd, macro, fracdiff, fracdiff_macro, trend, asset_vol, macro_vol, asset_live
 
@@ -636,7 +657,16 @@ def fetch_aligned_daily(
     asset_fill_cols = []
     for ticker in active_tickers:
         asset_fill_cols.extend([f"{ticker}_{c}" for c in ("open", "high", "low", "close")])
-    # Back-fill pre-IPO rows with first listing price (flat returns → neutral RSI/MACD).
+    # Order matters and the live mask above is already frozen:
+    # 1. Unlimited ffill: post-delisting/halt bars keep the LAST REAL price, so a dead
+    #    position is force-liquidated at its last real close — not at a near-zero
+    #    filler (and a mid-history gap is never back-filled with the future
+    #    resumption price).
+    # 2. bfill: pre-IPO rows get the first listing price (flat returns → neutral
+    #    RSI/MACD; fracdiff/vol are neutralized on pre-live bars via asset_live in
+    #    compute_feature_panel, so the future listing level never reaches the obs).
+    # 3. 1e-8 only for assets with no data at all in the window.
+    merged[asset_fill_cols] = merged[asset_fill_cols].ffill()
     merged[asset_fill_cols] = merged[asset_fill_cols].bfill()
     merged[asset_fill_cols] = merged[asset_fill_cols].fillna(1e-8)
 
@@ -816,6 +846,7 @@ def train_test_split_alternating(
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     feature_purge_warmup: int = 25,
     feature_split_mode: str = "independent",
+    feature_preroll_bars: int = 252,
     *,
     rsi: np.ndarray | None = None,
     macd: np.ndarray | None = None,
@@ -835,11 +866,16 @@ def train_test_split_alternating(
     ``feature_split_mode`` controls how features reach the blocks:
 
     - ``"independent"`` (default): features are **recomputed per contiguous segment** via
-      ``compute_feature_panel`` on that segment's ``ohlcv`` + ``macro`` only, then the
-      first ``feature_purge_warmup`` bars of each segment are neutralized via
-      ``_neutralize_feature_warmup``. Any precomputed feature arrays passed in are ignored.
-      Use this so the in-training eval-selection signal is not feature-state-contaminated
-      by adjacent train blocks.
+      ``compute_feature_panel`` over the segment plus a causal preroll of up to
+      ``feature_preroll_bars`` earlier panel bars (sliced off after computation), so
+      slow indicators (EMA-100 trend, MACD, fracdiff) are warmed up with real history
+      instead of a truncation transient. Segment-head bars whose preroll is shorter
+      than ``feature_purge_warmup`` (the panel head) are neutralized via
+      ``_neutralize_feature_warmup``. Any precomputed feature arrays passed in are
+      ignored. Each segment's features depend only on a bounded, uniform history
+      window — train and eval feature distributions stay comparable, and eval blocks
+      do not share exact continuous-panel indicator state with the train blocks
+      around them.
     - ``"continuous"``: features are precomputed on the contiguous trainable
       timeline and **sliced** into blocks. Pass precomputed ``rsi`` / ``macd`` /
       ``fracdiff`` / ``fracdiff_macro`` / ``trend`` / ``asset_vol`` / ``macro_vol`` (e.g.
@@ -902,7 +938,7 @@ def train_test_split_alternating(
                     "fracdiff_macro, trend, asset_vol, macro_vol, or none to recompute"
                 )
             rsi_g, macd_g, fd_g, fdm_g, trend_g, avol_g, mvol_g = compute_feature_panel(
-                ohlcv, macro, fracdiff_d=fracdiff_d
+                ohlcv, macro, fracdiff_d=fracdiff_d, asset_live=asset_live
             )
 
     train_ranges: List[Tuple[int, int]] = []
@@ -951,8 +987,12 @@ def train_test_split_alternating(
 
         if independent:
             # Merge contiguous block ranges into segments, then recompute features per
-            # segment and neutralize the warmup so segment heads do not carry indicator
-            # state from blocks that were removed by the alternating split.
+            # segment over [seg_start - preroll, seg_end) and slice the preroll off.
+            # The causal preroll gives every indicator real warmup history (EMA-100,
+            # MACD, fracdiff transients decay over hundreds of bars — a 25-bar purge
+            # alone left every eval bar in a 126-bar block feature-distribution-shifted
+            # vs training). Only bars whose preroll is shorter than
+            # ``feature_purge_warmup`` (the panel head) are still neutralized.
             segments: List[List[int]] = []
             for s, e in ranges:
                 if segments and segments[-1][1] == s:
@@ -962,13 +1002,23 @@ def train_test_split_alternating(
             for k, (seg_start, seg_end) in enumerate(segments):
                 if k > 0:
                     boundaries.append(offset)
+                pre = min(max(int(feature_preroll_bars), 0), seg_start)
+                comp_start = seg_start - pre  # causal: earlier panel history only
                 ohlcv_chunk = ohlcv[seg_start:seg_end]
                 macro_chunk = macro[seg_start:seg_end]
                 rsi_c, macd_c, fd_c, fdm_c, trend_c, avol_c, mvol_c = compute_feature_panel(
-                    ohlcv_chunk, macro_chunk, fracdiff_d=fracdiff_d
+                    ohlcv[comp_start:seg_end],
+                    macro[comp_start:seg_end],
+                    fracdiff_d=fracdiff_d,
+                    asset_live=asset_live[comp_start:seg_end],
                 )
+                # Neutralize the computed window's warmup head; with pre >= warmup these
+                # bars all fall inside the preroll and are sliced away below.
                 _neutralize_feature_warmup(
                     rsi_c, macd_c, fd_c, fdm_c, feature_purge_warmup, trend=trend_c
+                )
+                rsi_c, macd_c, fd_c, fdm_c, trend_c, avol_c, mvol_c = (
+                    arr[pre:] for arr in (rsi_c, macd_c, fd_c, fdm_c, trend_c, avol_c, mvol_c)
                 )
                 idx_parts.append(index[seg_start:seg_end])
                 ohlcv_parts.append(ohlcv_chunk)
@@ -1134,6 +1184,7 @@ def save_cache(
 
 def load_cache(
     path: str,
+    expected_fracdiff_d: float | None = None,
 ) -> Tuple[
     pd.DatetimeIndex,
     np.ndarray,
@@ -1167,14 +1218,28 @@ def load_cache(
             f"({MACRO_TICKERS}). Rebuild: python scripts/train.py --refresh-data "
             "(writes .cache/data_cache.npz)"
         )
+    if "asset_live" in z.files:
+        asset_live = z["asset_live"]
+    else:
+        asset_live = np.ones((len(idx), ohlcv.shape[1]), dtype=np.float64)
     d = float(z["fracdiff_d"][0]) if "fracdiff_d" in z else DEFAULT_FRACDIFF_D
-    if "fracdiff" in z and "fracdiff_macro" in z:
+    recompute_fd = not ("fracdiff" in z.files and "fracdiff_macro" in z.files)
+    if not recompute_fd:
         fd = z["fracdiff"]
         fdm = z["fracdiff_macro"]
-        if fdm.shape[1] != N_MACRO:
-            fd, fdm = compute_fracdiff_panel(ohlcv, macro, d=d)
-    else:
+        recompute_fd = fdm.shape[1] != N_MACRO
+    if expected_fracdiff_d is not None and abs(float(expected_fracdiff_d) - d) > 1e-12:
+        # Without this check, changing data.fracdiff_d in config without --refresh-data
+        # would silently train on stale-d features while the manifest records the new d.
+        print(
+            f"[data] cache fracdiff_d={d} != config fracdiff_d={expected_fracdiff_d}; "
+            "recomputing the fracdiff panel from cached prices."
+        )
+        d = float(expected_fracdiff_d)
+        recompute_fd = True
+    if recompute_fd:
         fd, fdm = compute_fracdiff_panel(ohlcv, macro, d=d)
+        fd[np.asarray(asset_live, dtype=np.float64) < 0.5] = 0.0  # pre-live neutral
     if "trend" in z.files:
         trend = z["trend"]
     else:
@@ -1188,8 +1253,4 @@ def load_cache(
         raise ValueError(
             f"Cache ohlcv has {ohlcv.shape[1]} assets but tickers lists {len(tickers)}: {tickers}"
         )
-    if "asset_live" in z.files:
-        asset_live = z["asset_live"]
-    else:
-        asset_live = np.ones((len(idx), ohlcv.shape[1]), dtype=np.float64)
     return idx, ohlcv, z["rsi"], z["macd"], macro, fd, fdm, trend, asset_vol, macro_vol, asset_live, tickers

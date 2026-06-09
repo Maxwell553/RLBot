@@ -27,3 +27,9 @@ build/
 data_cache.npz
 Runs/
 
+# Local broker automation (not part of research training; removed from repo)
+ibkr_paper/
+
+# Broker credentials and local execution state (reserved for the tier-5 shadow
+# ledger and any future broker integration; never tracked)
+execution/**

@@ -5,6 +5,7 @@ an aggregator, not a new metric source)."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -57,6 +58,7 @@ def build_record(
         "evaluation_tier": int(evaluation_tier),
         "status": status,
         "failure": failure,
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         # provenance
         "git_commit": manifest.get("git_commit") or training_summary.get("git_commit"),
         "git_dirty": manifest.get("git_dirty"),

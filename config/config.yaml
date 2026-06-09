@@ -40,6 +40,10 @@ reward:
   max_step_log_return_downside: -0.12
   risk_window: 63
   sortino_min_steps: 20
+  # Floor on downside deviation in the Sortino ratio, in daily-return units (0.001 =
+  # 10 bp/day). The old 1e-4 floor let any no-loss window (e.g. ~90% cash + carry)
+  # saturate the ±3 clipped differential — a quasi-binary +risk_bonus_scale*3 exploit.
+  sortino_downside_floor: 0.001
   # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_relative_max_share).
   risk_bonus_scale: 2.5
   # Cap-weighted passive benchmark for Sortino differential + per-step excess return
@@ -138,9 +142,14 @@ curriculum:
 data:
   since: "2005-01-01"
   fracdiff_d: 0.4
-  feature_purge_warmup: 25  # neutralize first N bars at each joined train/eval segment
-  # "continuous": features precomputed on the contiguous panel then sliced into blocks
-  #   (matches continuous backtest memory; purge NOT applied).
-  # "independent" (default): recompute features per segment + apply feature_purge_warmup,
-  #   so the eval-selection signal is not feature-state-contaminated by adjacent train blocks.
+  feature_purge_warmup: 25  # neutralize first N bars only where preroll history is unavailable (panel head)
+  # Causal warmup history recomputed per segment in independent mode (sliced off after
+  # feature computation) so EMA-100/MACD/fracdiff are not dominated by truncation
+  # transients inside 126-bar eval blocks.
+  feature_preroll_bars: 252
+  # "continuous": features precomputed on the contiguous panel then sliced into
+  #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
+  # "independent" (default): recompute features per segment over a causal preroll
+  #   window, so the eval-selection signal is not feature-state-contaminated by
+  #   adjacent train blocks; only panel-head bars with insufficient preroll are purged.
   feature_split_mode: independent

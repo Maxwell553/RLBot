@@ -43,15 +43,58 @@ def assert_tier_allowed(tier: int, *, promoted: bool) -> None:
         )
 
 
+# Registry statuses that never gate: "failed" marks a variant whose train or backtest
+# subprocess crashed — informational only. The OOS read itself is marked by the
+# "oos_read_attempt" record written immediately BEFORE any backtest, so a pre-read
+# train crash (no attempt record) can never brick a relaunch.
+_UNSCORED_OOS_STATUSES = {"oos_read_attempt", "failed"}
+
+
 def assert_no_repeat_oos(
     records: Iterable[Mapping],
     variant_id: str,
+    *,
+    allow_failed_rescore: bool = False,
 ) -> None:
-    """Multiple-testing guard: refuse a second OOS (tier>=4) read for the same variant."""
-    for r in records:
-        if r.get("variant_id") == variant_id and int(r.get("evaluation_tier", 0)) >= 4:
-            raise PermissionError(
-                f"variant {variant_id!r} already has a tier-{r.get('evaluation_tier')} "
-                f"OOS result (run {r.get('run_id')!r}); refusing to re-read the holdout "
-                f"(multiple-testing). Register a new variant id to test again."
-            )
+    """Multiple-testing guard: refuse a second OOS (tier>=4) read for the same variant.
+
+    Scored results block permanently. ``oos_read_attempt`` records (a read that crashed
+    before scoring) block by default; ``allow_failed_rescore=True`` permits a retry only
+    when no scored tier>=4 result exists. ``failed`` records alone never block — when
+    the holdout was actually read, the preceding attempt record is what blocks.
+    """
+    relevant = [
+        r for r in records
+        if r.get("variant_id") == variant_id and int(r.get("evaluation_tier", 0)) >= 4
+    ]
+    scored = [r for r in relevant if str(r.get("status", "ok")) not in _UNSCORED_OOS_STATUSES]
+    if scored:
+        r = scored[0]
+        raise PermissionError(
+            f"variant {variant_id!r} already has a tier-{r.get('evaluation_tier')} "
+            f"OOS result (run {r.get('run_id')!r}); refusing to re-read the holdout "
+            f"(multiple-testing). Register a new variant id to test again."
+        )
+    attempts = [r for r in relevant if str(r.get("status", "ok")) == "oos_read_attempt"]
+    if attempts and not allow_failed_rescore:
+        r = attempts[0]
+        raise PermissionError(
+            f"variant {variant_id!r} has an unscored tier-{r.get('evaluation_tier')} OOS "
+            f"read on record (status {r.get('status')!r}, run {r.get('run_id')!r}); the "
+            "holdout may already have been read. Pass --allow-failed-rescore to retry."
+        )
+
+
+def assert_oos_budget(n_variants: int, budget: int) -> None:
+    """Refuse a tier>=4 launch whose variant count exceeds the explicit OOS-read budget.
+
+    Selecting the best of N grid cells *on the holdout* is the multiple-comparisons
+    failure the tier system exists to prevent; large-N reads must be deliberate.
+    """
+    if n_variants > budget:
+        raise PermissionError(
+            f"this launch would read the OOS holdout for {n_variants} variant(s), "
+            f"exceeding the OOS budget of {budget}. Selecting among many variants on "
+            "the holdout is multiple testing; promote a single pre-registered variant "
+            "instead, or raise --oos-budget explicitly if this is deliberate."
+        )

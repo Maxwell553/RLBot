@@ -75,6 +75,7 @@ class RewardConfig:
     max_step_log_return_downside: float
     risk_window: int
     sortino_min_steps: int
+    sortino_downside_floor: float
     risk_bonus_scale: float
     benchmark_cap_weights: list[float]
     benchmark_excess_scale: float
@@ -207,10 +208,12 @@ class DataConfig:
     feature_purge_warmup: int
     # "continuous": features precomputed on the contiguous panel then sliced into
     #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
-    # "independent": features recomputed per contiguous segment + first
-    #   feature_purge_warmup bars neutralized, so the eval-selection signal is not
-    #   feature-state-contaminated by adjacent train blocks.
+    # "independent" (default): features recomputed per segment over a causal preroll
+    #   window of feature_preroll_bars earlier bars (sliced off after computation) so
+    #   slow indicators get real warmup; only panel-head bars with insufficient preroll
+    #   are neutralized via feature_purge_warmup.
     feature_split_mode: str = "independent"
+    feature_preroll_bars: int = 252
 
 
 @dataclass(frozen=True)
@@ -384,6 +387,9 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             ),
             risk_window=int(_req(rew, "risk_window", "reward")),
             sortino_min_steps=int(rew.get("sortino_min_steps", 20)),
+            # Default preserves pre-2026-06 run snapshots (old floor 1e-4); the current
+            # config.yaml sets an economically meaningful floor (see config comment).
+            sortino_downside_floor=float(rew.get("sortino_downside_floor", 1e-4)),
             risk_bonus_scale=float(_req(rew, "risk_bonus_scale", "reward")),
             benchmark_cap_weights=_float_list(
                 _req(rew, "benchmark_cap_weights", "reward"),
@@ -497,6 +503,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             fracdiff_d=float(_req(dat, "fracdiff_d", "data")),
             feature_purge_warmup=int(_req(dat, "feature_purge_warmup", "data")),
             feature_split_mode=_feature_split_mode(dat.get("feature_split_mode", "independent")),
+            feature_preroll_bars=int(dat.get("feature_preroll_bars", 252)),
         ),
         raw=data,
     )

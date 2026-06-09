@@ -23,34 +23,74 @@ def _median(values: list) -> float | None:
     return statistics.median(vals) if vals else None
 
 
+# Statuses that mark an OOS read with no usable score (crash between read and scoring).
+_UNSCORED_STATUSES = {"oos_read_attempt", "failed"}
+
+
+def _is_scored(r: Mapping) -> bool:
+    return str(r.get("status", "ok")) not in _UNSCORED_STATUSES
+
+
+def _ci_cell(rows: list[Mapping]) -> str:
+    cis = [r.get("oos_sharpe_ci") for r in rows if r.get("oos_sharpe_ci")]
+    if not cis:
+        return "—"
+    lo = _median([c[0] for c in cis])
+    hi = _median([c[2] for c in cis])
+    return f"[{_fmt(lo)}, {_fmt(hi)}]"
+
+
 def _render(by_variant: dict[str, list[Mapping]]) -> str:
     lines = [
-        "| variant | tier | seeds | OOS return (med) | OOS Sharpe (med) | max DD (med) | split |",
-        "|---|---|---|---|---|---|---|",
+        "| variant | tier | seeds | OOS return (med) | OOS Sharpe (med) | Sharpe 95% CI | max DD (med) | split |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for variant_id in sorted(by_variant):
-        rows = by_variant[variant_id]
+        rows = [r for r in by_variant[variant_id] if _is_scored(r)]
+        if not rows:
+            rows = by_variant[variant_id]  # only attempt/failure records: still list the variant
+            tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
+            lines.append(f"| {variant_id} | {tier} | 0 | — | — | — | — | — |")
+            continue
         tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
-        ret = _median([r.get("oos_total_return") for r in rows])
-        sharpe = _median([r.get("oos_sharpe") for r in rows])
-        dd = _median([r.get("oos_max_drawdown") for r in rows])
+        # The OOS firewall: only promoted (tier >= 4) scored records may surface holdout
+        # metrics, regardless of what a hand-run backtest wrote into a low-tier summary.
+        oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
+        ret = _median([r.get("oos_total_return") for r in oos_rows])
+        sharpe = _median([r.get("oos_sharpe") for r in oos_rows])
+        dd = _median([r.get("oos_max_drawdown") for r in oos_rows])
         split = rows[0].get("feature_split_mode") or "—"
         lines.append(
             f"| {variant_id} | {tier} | {len(rows)} | {_fmt(ret, pct=True)} | "
-            f"{_fmt(sharpe)} | {_fmt(dd, pct=True)} | {split} |"
+            f"{_fmt(sharpe)} | {_ci_cell(oos_rows)} | {_fmt(dd, pct=True)} | {split} |"
         )
     return "\n".join(lines)
 
 
 def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "Research cohort") -> Path:
     records = list(records)
+    by_variant = _group(records)
+    n_variants = len(by_variant)
+    # One holdout read = one "oos_read_attempt" record (written before the backtest).
+    # Scored tier>=4 records without a matching attempt are legacy single-record reads.
+    tier4 = [r for r in records if int(r.get("evaluation_tier", 0)) >= 4]
+    attempts = [r for r in tier4 if str(r.get("status", "ok")) == "oos_read_attempt"]
+    attempted_runs = {str(r.get("run_id")) for r in attempts}
+    legacy_scored = [
+        r for r in tier4
+        if _is_scored(r) and str(r.get("run_id")) not in attempted_runs
+    ]
+    n_oos_reads = len(attempts) + len(legacy_scored)
     body = [
         f"# {title}",
         "",
-        f"{len(records)} run record(s). OOS metrics shown only for promoted (tier ≥ 4) runs; "
-        "checkpoint rule = eval-NAV-best. Generated from registry.jsonl — do not edit by hand.",
+        f"{len(records)} run record(s) across {n_variants} variant(s); "
+        f"{n_oos_reads} holdout read(s) recorded. OOS metrics shown only for promoted "
+        "(tier ≥ 4) runs; checkpoint rule = eval-NAV-best. Any OOS number below was "
+        f"selected from {n_variants} variant(s) — interpret with that multiplicity in mind. "
+        "Generated from registry.jsonl — do not edit by hand.",
         "",
-        _render(_group(records)),
+        _render(by_variant),
         "",
     ]
     out = Path(path)

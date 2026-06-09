@@ -89,6 +89,7 @@ from rlbot.run_artifacts import (
     config_sha256,
     git_provenance,
     new_run_id,
+    read_run_manifest,
     resolve_data_cache,
     sha256_file,
     merge_manifest,
@@ -108,8 +109,11 @@ DATA_CACHE = DEFAULT_DATA_CACHE
 def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path | None]:
     """Save end-of-run VecNormalize stats + final policy weights.
 
-    Does **not** overwrite ``best/vec_normalize.pkl`` — that file is written alongside
-    ``best_model.zip`` whenever eval NAV improves.
+    Writes ``Runs/<id>/models/vec_normalize.pkl``. ``models/best/vec_normalize.pkl`` is
+    written by ``EvalNavBestModelCallback`` at best-save time (stats the checkpoint was
+    actually selected under) and is **never** overwritten here — a run that never saved
+    a best model returns ``None`` for it rather than pairing best weights with
+    end-of-run stats.
     """
     root_vn = paths.models_dir / "vec_normalize.pkl"
     train_env.save(str(root_vn))
@@ -268,6 +272,8 @@ class EvalNavBestModelCallback(EvalCallback):
                         self._best_model_dir.mkdir(parents=True, exist_ok=True)
                         self.model.save(str(self._best_model_dir / "best_model"))
                         if self._train_vec_env is not None:
+                            # Pair the checkpoint with the normalization stats it was
+                            # selected under, not whatever exists at end of training.
                             self._train_vec_env.save(
                                 str(self._best_model_dir / "vec_normalize.pkl")
                             )
@@ -729,6 +735,12 @@ def main() -> None:
             "adaptive-entropy callbacks (experimental regime, not crash resume)."
         ),
     )
+    parser.add_argument(
+        "--overwrite-run", action="store_true",
+        help="Allow training into an existing Runs/<run-id>/ directory (overwrites its "
+             "manifest/models; refused by default — reuse also restores the old run's "
+             "best-eval threshold, which can suppress best_model saves).",
+    )
     args = parser.parse_args()
     if args.resume.strip() and args.finetune.strip():
         raise SystemExit("Use only one of --resume or --finetune, not both.")
@@ -755,7 +767,24 @@ def main() -> None:
             "Provide --run-id or --window (auto id: W{window}_<month><day>, e.g. W1_604)."
         )
     paths = RunPaths(run_id=run_id)
+    if (paths.run_meta_dir / "manifest.json").is_file() and not (
+        args.overwrite_run or args.resume
+    ):
+        raise SystemExit(
+            f"Run directory Runs/{run_id}/ already has a manifest. Refusing to overwrite "
+            "an existing run (its artifacts may be referenced by the research registry). "
+            "Pick a new --run-id, or pass --overwrite-run to retrain in place."
+        )
     paths.mkdirs()
+    if args.overwrite_run and not args.resume:
+        # A fresh retrain must not inherit the old run's best-eval threshold or its
+        # best-time normalization stats; stale ones suppress best_model saves.
+        for stale in (
+            paths.eval_nav_history,
+            paths.best_model_dir / "best_model.zip",
+            paths.best_model_dir / "vec_normalize.pkl",
+        ):
+            stale.unlink(missing_ok=True)
     if args.n_assets is not None:
         write_config_snapshot(cfg, paths.run_meta_dir / "config.yaml")
     else:
@@ -806,7 +835,7 @@ def main() -> None:
             macro_vol,
             asset_live,
             panel_tickers,
-        ) = load_cache(str(data_cache))
+        ) = load_cache(str(data_cache), expected_fracdiff_d=cfg.data.fracdiff_d)
 
     if list(panel_tickers) != cfg.universe.tickers:
         (
@@ -943,6 +972,7 @@ def main() -> None:
             fracdiff_d=cfg.data.fracdiff_d,
             feature_purge_warmup=purge,
             feature_split_mode=split_mode,
+            feature_preroll_bars=cfg.data.feature_preroll_bars,
             **feature_kwargs,
         )
     )
@@ -989,8 +1019,8 @@ def main() -> None:
                 "holdout_end": args.holdout_end or (str(idx_hold[-1]) if len(idx_hold) else None),
                 "trainable_end": str(idx_fit[-1]) if len(idx_fit) else None,
                 "holdout_bars": int(len(idx_hold)),
-                "date_start": str(idx_hold[0]),
-                "date_end": str(idx_hold[-1]),
+                "date_start": str(idx_hold[0]) if len(idx_hold) else None,
+                "date_end": str(idx_hold[-1]) if len(idx_hold) else None,
             },
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
@@ -1357,6 +1387,7 @@ def main() -> None:
     # ── train ────────────────────────────────────────────────────────────
     _startup_log(f"[train] Starting PPO learning ({args.timesteps:,} timesteps)...")
     learn_error: BaseException | None = None
+    interrupted = False
     try:
         model.learn(
             total_timesteps=args.timesteps,
@@ -1365,6 +1396,7 @@ def main() -> None:
             reset_num_timesteps=not bool(args.resume),
         )
     except KeyboardInterrupt:
+        interrupted = True
         print("\n\nCtrl+C detected — saving current weights before exit…")
     except BaseException as e:
         learn_error = e
@@ -1396,6 +1428,9 @@ def main() -> None:
             best_eval_step = int(eval_callback._nav_timesteps[i])
     early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
 
+    # Merge (never rebuild) the pre-training manifest: it carries the
+    # chronological_holdout block that defines what OOS is for this run; losing it
+    # would let a later backtest silently extend the holdout window.
     merge_manifest(
         paths.manifest_path,
         {
@@ -1408,6 +1443,7 @@ def main() -> None:
             "n_eval_bars": int(len(eval_idx)),
             "data_cache_snapshot": str(paths.data_snapshot),
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "training_status": "interrupted" if interrupted else "completed",
             "total_params": total_params,
             "trainable_params": trainable_params,
             "best_eval_nav": best_eval_nav,

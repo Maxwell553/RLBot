@@ -56,7 +56,16 @@ def main() -> None:
     parser.add_argument("--checkpoint", default="best", choices=("best", "final"))
     parser.add_argument("--as-of", default="", help="As-of date (default: last cache bar).")
     parser.add_argument("--warmup", type=int, default=252, help="Recurrent warmup bars.")
-    parser.add_argument("--obs-lag", type=int, default=1, help="Market feature lag (match training).")
+    parser.add_argument(
+        "--obs-lag", type=int, default=None,
+        help="Market feature lag (match training). Default: manifest args.obs_lag, "
+        "else the run config's environment.obs_lag_default.",
+    )
+    parser.add_argument(
+        "--allow-raw-obs", action="store_true",
+        help="Permit inference without VecNormalize stats even though the run trained "
+        "with norm_obs: true (refused by default).",
+    )
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "auto"))
     parser.add_argument("--data-cache", default="", metavar="PATH")
     parser.add_argument("--use-current-config", action="store_true")
@@ -83,7 +92,7 @@ def main() -> None:
 
     ensure_backtest_dependencies()
     (idx, ohlcv, rsi, macd, macro, fd, fdm, trend, avol, mvol, live, cache_tickers) = load_cache(
-        str(cache_path)
+        str(cache_path), expected_fracdiff_d=cfg.data.fracdiff_d
     )
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
 
@@ -94,7 +103,22 @@ def main() -> None:
     warm = int(min(max(args.warmup, 10), len(idx)))
     sl = slice(len(idx) - warm, len(idx))
 
+    obs_lag = args.obs_lag
+    if obs_lag is None:
+        margs = manifest.get("args") or {}
+        obs_lag = int(margs["obs_lag"]) if margs.get("obs_lag") is not None else int(
+            cfg.environment.obs_lag_default
+        )
+        print(f"[infer] obs_lag={obs_lag} (from manifest/run config)")
+    obs_lag = int(obs_lag)
+
     model_path, vn_path = _resolve_model_and_vecnorm(run_id, args.checkpoint)
+    if not vn_path.is_file() and cfg.vec_normalize.norm_obs and not args.allow_raw_obs:
+        raise FileNotFoundError(
+            f"No VecNormalize stats at {vn_path}, but this run trained with "
+            "vec_normalize.norm_obs: true — emitting weights from raw observations would "
+            "be meaningless. Restore the stats or pass --allow-raw-obs to override."
+        )
     t0 = time.perf_counter()
     model = load_recurrent_ppo_inference(model_path, device=args.device)
     print(f"[infer] loaded model {model_path.name} ({time.perf_counter() - t0:.1f}s)")
@@ -114,7 +138,7 @@ def main() -> None:
         test_asset_vol=avol[sl],
         test_macro_vol=mvol[sl],
         test_asset_live=live[sl],
-        obs_lag=args.obs_lag,
+        obs_lag=obs_lag,
         vec_norm_path=vn_path,
         use_vec_norm=vn_path.is_file(),
         deterministic=True,
@@ -134,7 +158,7 @@ def main() -> None:
         "vec_normalize_path": str(vn_path) if vn_path.is_file() else None,
         "feature_split_mode": cfg.data.feature_split_mode,
         "warmup_bars": warm,
-        "obs_lag": args.obs_lag,
+        "obs_lag": obs_lag,
         **git_provenance(),
     }
     payload = build_weights_payload(
