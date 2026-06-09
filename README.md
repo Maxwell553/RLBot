@@ -145,7 +145,7 @@ Logged per term in `info` / TensorBoard as `rew_decomp/*` (including `rew_decomp
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + extra linear ramp from 90%→100% cash | `1.35` + `0.9` tail (max **~2.25** at 100% cash) |
 | **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |
-| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_relative_max_share` of \|return\| + \|participation\| + \|inactivity\| + \|churn\| | `0.6` (`0` disables both) |
+| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant**, never a function of the other terms — a relative cap was reward-hackable) | `24.0` (`0` disables both) |
 
 `tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training and eval `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, fixed `obs_lag = 1`.
 

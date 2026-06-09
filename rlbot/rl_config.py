@@ -80,7 +80,7 @@ class RewardConfig:
     benchmark_cap_weights: list[float]
     benchmark_excess_scale: float
     benchmark_excess_clip: float
-    benchmark_relative_max_share: float
+    benchmark_combined_abs_cap: float
     churn_penalty: float
     drawdown_downside_gamma: float
     inactivity_penalty_over_50: float
@@ -307,11 +307,40 @@ def slice_config_to_n_assets(cfg: RLConfig, n_assets: int) -> RLConfig:
     return _parse_config(data, cfg.path)
 
 
-def _validate_reward_config(rew: RewardConfig) -> None:
-    share = float(rew.benchmark_relative_max_share)
+def _benchmark_combined_abs_cap(rew: dict) -> float:
+    """Resolve the constant cap on |sortino + benchmark| (reward units).
+
+    Old run snapshots carry the legacy ``benchmark_relative_max_share`` knob (a
+    relative cap that proved reward-hackable). For those, translate the share into
+    the constant cap the old code produced on a typical 1%-daily-move day:
+    ``share/(1-share) * reward_scale * 0.01``. New configs set
+    ``benchmark_combined_abs_cap`` directly; 0 disables both terms.
+    """
+    cap_raw = rew.get("benchmark_combined_abs_cap")
+    if cap_raw is not None:
+        return float(cap_raw)
+    legacy = rew.get("benchmark_relative_max_share")
+    if legacy is None:
+        raise ValueError(
+            "Missing required key 'benchmark_combined_abs_cap' in config section 'reward' "
+            "(or legacy 'benchmark_relative_max_share' for old run snapshots)"
+        )
+    share = float(legacy)
     if not (0.0 <= share < 1.0):
         raise ValueError(
-            f"reward.benchmark_relative_max_share must be in [0, 1), got {share}"
+            f"reward.benchmark_relative_max_share (legacy) must be in [0, 1), got {share}"
+        )
+    if share == 0.0:
+        return 0.0
+    return (share / (1.0 - share)) * float(_req(rew, "reward_scale", "reward")) * 0.01
+
+
+def _validate_reward_config(rew: RewardConfig) -> None:
+    cap = float(rew.benchmark_combined_abs_cap)
+    if not np.isfinite(cap) or cap < 0.0:
+        raise ValueError(
+            f"reward.benchmark_combined_abs_cap must be a finite value >= 0 "
+            f"(0 disables the Sortino + benchmark-excess terms), got {cap}"
         )
 
 
@@ -398,9 +427,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             ),
             benchmark_excess_scale=float(_req(rew, "benchmark_excess_scale", "reward")),
             benchmark_excess_clip=float(_req(rew, "benchmark_excess_clip", "reward")),
-            benchmark_relative_max_share=float(
-                _req(rew, "benchmark_relative_max_share", "reward")
-            ),
+            benchmark_combined_abs_cap=_benchmark_combined_abs_cap(rew),
             churn_penalty=_reward_churn_penalty(rew),
             drawdown_downside_gamma=float(_req(rew, "drawdown_downside_gamma", "reward")),
             inactivity_penalty_over_50=float(_req(rew, "inactivity_penalty_over_50", "reward")),
@@ -537,6 +564,27 @@ def set_config(cfg: RLConfig) -> None:
     """Install active config (e.g. after ``--config`` or ``--n-assets``)."""
     global _CONFIG
     _CONFIG = cfg
+
+
+class WorkerConfigInstaller:
+    """Picklable carrier that re-installs the active config inside a subprocess.
+
+    ``SubprocVecEnv`` workers start via spawn/forkserver, so they re-import every
+    module with ``_CONFIG = None`` — without this, ``get_config()`` inside a worker
+    silently falls back to the default ``config/config.yaml`` and any ``--config`` /
+    ``--n-assets`` override never reaches the training envs (reward, costs, cap, DR
+    bounds). Construct it from the effective config in the main process and call it
+    first thing inside the env factory.
+    """
+
+    def __init__(self, cfg: RLConfig) -> None:
+        self._raw = cfg.raw
+        self._path = str(cfg.path)
+
+    def __call__(self) -> RLConfig:
+        cfg = _parse_config(self._raw, Path(self._path))
+        set_config(cfg)
+        return cfg
 
 
 def write_config_snapshot(cfg: RLConfig, path: Path | str) -> None:

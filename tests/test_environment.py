@@ -428,39 +428,49 @@ def test_downside_return_amplified_when_in_drawdown() -> None:
     assert drawdown_seen
 
 
-def test_benchmark_relative_share_cap() -> None:
-    from rlbot.trading_env import _scale_benchmark_relative_components
+def test_benchmark_combined_abs_cap_scales_proportionally() -> None:
+    from rlbot.trading_env import _cap_benchmark_components
 
-    sortino, benchmark = _scale_benchmark_relative_components(
-        sortino=10.0,
-        benchmark=10.0,
-        return_component=5.0,
-        participation=1.0,
-        inactivity=0.5,
-        churn=0.2,
-        max_share=0.6,
-    )
-    other_abs = 5.0 + 1.0 + 0.5 + 0.2
-    bench_abs = abs(sortino + benchmark)
-    assert bench_abs <= (0.6 * other_abs) / 0.4 + 1e-9
-    total_abs = bench_abs + other_abs
-    assert bench_abs / total_abs <= 0.601
+    sortino, benchmark = _cap_benchmark_components(sortino=10.0, benchmark=10.0, cap_abs=12.0)
+    assert abs(sortino + benchmark) == pytest.approx(12.0)
+    assert sortino == pytest.approx(benchmark)  # proportional scaling
+    # under the cap → untouched
+    s2, b2 = _cap_benchmark_components(sortino=3.0, benchmark=4.0, cap_abs=12.0)
+    assert (s2, b2) == (3.0, 4.0)
 
 
-def test_benchmark_relative_max_share_zero_disables_terms() -> None:
-    from rlbot.trading_env import _scale_benchmark_relative_components
+def test_benchmark_combined_abs_cap_zero_disables_terms() -> None:
+    from rlbot.trading_env import _cap_benchmark_components
 
-    sortino, benchmark = _scale_benchmark_relative_components(
-        sortino=10.0,
-        benchmark=8.0,
-        return_component=5.0,
-        participation=1.0,
-        inactivity=0.5,
-        churn=0.2,
-        max_share=0.0,
-    )
+    sortino, benchmark = _cap_benchmark_components(sortino=10.0, benchmark=8.0, cap_abs=0.0)
     assert sortino == 0.0
     assert benchmark == 0.0
+
+
+def test_benchmark_cap_is_constant_no_reward_hacking_gradient() -> None:
+    """Regression for the relative-cap exploit: the cap must NOT be a function of the
+    other reward terms, so burning transaction costs / taking losses can never raise
+    the capped benchmark budget. Structurally: the cap function takes only the two
+    bench terms + a constant; behaviorally: total reward is strictly decreasing in
+    churn while the bench terms sit at the cap."""
+    import inspect
+
+    from rlbot.trading_env import _cap_benchmark_components
+
+    params = set(inspect.signature(_cap_benchmark_components).parameters)
+    assert params == {"sortino", "benchmark", "cap_abs"}, (
+        "cap function must not see other reward terms (relative-cap exploit)"
+    )
+
+    def total_reward(churn_cost: float) -> float:
+        s, b = _cap_benchmark_components(sortino=7.5, benchmark=24.0, cap_abs=24.0)
+        ret, participation, inactivity = -1.0, 1.0, 0.5
+        return ret + s + b + participation - inactivity - churn_cost
+
+    rewards = [total_reward(c) for c in (0.0, 1.0, 5.0, 20.0)]
+    assert all(a > b for a, b in zip(rewards, rewards[1:])), (
+        "reward must be strictly decreasing in churn at the cap"
+    )
 
 
 def test_episode_end_nav_recorder_importable() -> None:

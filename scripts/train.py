@@ -81,6 +81,7 @@ from rlbot.data_utils import (
 from rlbot.rl_config import (
     UNIVERSE_MAX_ASSETS,
     UNIVERSE_MIN_ASSETS,
+    WorkerConfigInstaller,
     apply_deterministic_seeds,
     get_config,
     load_config,
@@ -147,10 +148,19 @@ def _make_env_factory(
     domain_randomize: bool = True,
     inactivity_penalty_scale: float = 1.0,
     record_episode_nav: bool = False,
+    config_installer: WorkerConfigInstaller | None = None,
 ):
-    """Return a callable that creates and wraps a single environment."""
+    """Return a callable that creates and wraps a single environment.
+
+    ``config_installer`` MUST be passed for SubprocVecEnv use: workers are spawned
+    with a fresh interpreter where ``get_config()`` would otherwise fall back to the
+    default ``config/config.yaml``, silently discarding ``--config``/``--n-assets``
+    overrides for everything the env reads at construction (reward, costs, cap, DR).
+    """
 
     def _init():
+        if config_installer is not None:
+            config_installer()
         env = MultiAssetPortfolioEnv(
             **pack.env_kwargs(),
             random_start=random_start,
@@ -1079,7 +1089,7 @@ def main() -> None:
         f"  reward: return*{cfg.reward.reward_scale:g} (downside amp gamma={cfg.reward.drawdown_downside_gamma:g}) "
         f"+ bench_excess*{cfg.reward.benchmark_excess_scale:g} "
         f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
-        f"(combined cap {cfg.reward.benchmark_relative_max_share:.0%}) "
+        f"(combined abs cap {cfg.reward.benchmark_combined_abs_cap:g}) "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
         f"- inactivity - tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g}"
     )
@@ -1175,6 +1185,7 @@ def main() -> None:
             "[train] reproducible=True: deterministic per-env seed streams "
             "(seed + env index); same-seed runs reproduce."
         )
+    worker_config = WorkerConfigInstaller(cfg)
     train_env = SubprocVecEnv([
         _make_env_factory(
             train_pack,
@@ -1189,6 +1200,7 @@ def main() -> None:
             obs_lag_default=args.obs_lag,
             domain_randomize=True,
             inactivity_penalty_scale=1.0,
+            config_installer=worker_config,
         )
         for i in range(n_envs)
     ])
@@ -1214,6 +1226,7 @@ def main() -> None:
             domain_randomize=False,
             inactivity_penalty_scale=cfg.reward.eval_inactivity_penalty_scale,
             record_episode_nav=True,
+            config_installer=worker_config,
         )
     ])
     eval_env = VecNormalize(

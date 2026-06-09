@@ -2,7 +2,7 @@
 
 Methodology and walk-forward protocol for **RecurrentPPO** on a config-driven tradeable universe (**5–55** assets via `config/config.yaml` → `universe.assets`).
 
-> **No definitive published OOS results yet.** Current pipeline: **`feature_split_mode: independent`**, cap **`max_single_asset_weight: 0.25`**, benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_relative_max_share: 0.6`**), aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. Any interim probes must be interpreted through their snapshotted `Runs/<id>/config.yaml`.
+> **No definitive published OOS results yet.** Current pipeline: **`feature_split_mode: independent`**, cap **`max_single_asset_weight: 0.25`**, benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined constant cap **`benchmark_combined_abs_cap: 24.0`**), aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. Any interim probes must be interpreted through their snapshotted `Runs/<id>/config.yaml`.
 
 Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. When reported, OOS metrics will use **`Runs/<run_id>/models/best/best_model.zip`** (maximum mean in-training eval NAV **after full fees/churn on eval**), not holdout-tuned weights.
 
@@ -183,7 +183,7 @@ Per-step (before VecNormalize during training):
 | **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 5` |
 | **Benchmark excess** | + | `clip(agent_log_ret − bench_log_ret, ±clip) × benchmark_excess_scale` (same friction model as Sortino bench) | `benchmark_excess_scale: 600`; `benchmark_excess_clip: 0.04` |
 | **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window`, clipped ±3; downside deviation floored at `sortino_downside_floor: 0.001` (10 bp/day) | `risk_bonus_scale: 2.5` |
-| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_relative_max_share` of \|return\|+\|participation\|+\|inactivity\|+\|churn\| | **0.6** (`0` disables both) |
+| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant** — a relative cap was reward-hackable) | **24.0** (`0` disables both) |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.35** + **0.9** tail (max **~2.25** at 100% cash) |
 | **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |

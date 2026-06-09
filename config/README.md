@@ -62,7 +62,7 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 |-----|---------|
 | `risk_bonus_scale` | Sortino differential multiplier (default **2.5**) |
 | `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware cap-weighted benchmark |
-| `benchmark_relative_max_share` | Max combined \|sortino+benchmark\| abs share per step (default **0.6**; `0` disables both) |
+| `benchmark_combined_abs_cap` | Constant cap on combined \|sortino+benchmark\| per step in reward units (default **24.0**; `0` disables both; never relative to the other terms) |
 | `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 1.35 + 0.9 tail above 90% cash) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 5.0) |
 | `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 1.0) |

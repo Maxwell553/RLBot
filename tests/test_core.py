@@ -71,7 +71,7 @@ def test_validate_config_for_universe_mismatch() -> None:
         validate_config_for_universe(cfg, cfg.universe.n_assets + 1)
 
 
-def test_benchmark_relative_max_share_validation() -> None:
+def test_benchmark_combined_abs_cap_validation() -> None:
     from rlbot.rl_config import RewardConfig, _validate_reward_config
 
     base = dict(
@@ -85,7 +85,7 @@ def test_benchmark_relative_max_share_validation() -> None:
         benchmark_cap_weights=(1.0,),
         benchmark_excess_scale=1.0,
         benchmark_excess_clip=0.01,
-        benchmark_relative_max_share=0.6,
+        benchmark_combined_abs_cap=24.0,
         churn_penalty=1.0,
         drawdown_downside_gamma=1.0,
         inactivity_penalty_over_50=1.0,
@@ -95,8 +95,25 @@ def test_benchmark_relative_max_share_validation() -> None:
         participation_reward_scale=1.0,
     )
     _validate_reward_config(RewardConfig(**base))
-    with pytest.raises(ValueError, match="benchmark_relative_max_share"):
-        _validate_reward_config(RewardConfig(**{**base, "benchmark_relative_max_share": 1.0}))
+    _validate_reward_config(RewardConfig(**{**base, "benchmark_combined_abs_cap": 0.0}))
+    with pytest.raises(ValueError, match="benchmark_combined_abs_cap"):
+        _validate_reward_config(RewardConfig(**{**base, "benchmark_combined_abs_cap": -1.0}))
+
+
+def test_legacy_benchmark_relative_max_share_translates_to_constant_cap() -> None:
+    """Old run snapshots parse: share s → cap = s/(1-s) × reward_scale × 1%."""
+    import copy
+
+    from rlbot.rl_config import _parse_config
+
+    raw = copy.deepcopy(get_config().raw)
+    raw["reward"].pop("benchmark_combined_abs_cap", None)
+    raw["reward"]["benchmark_relative_max_share"] = 0.6
+    cfg = _parse_config(raw, get_config().path)
+    expected = (0.6 / 0.4) * raw["reward"]["reward_scale"] * 0.01
+    assert cfg.reward.benchmark_combined_abs_cap == pytest.approx(expected)
+    raw["reward"]["benchmark_relative_max_share"] = 0.0
+    assert _parse_config(raw, get_config().path).reward.benchmark_combined_abs_cap == 0.0
 
 
 def test_slice_config_to_n_assets() -> None:

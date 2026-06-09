@@ -6,7 +6,7 @@ Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
   - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
   - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
   - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
-  - Sortino + benchmark capped to benchmark_relative_max_share of per-step |reward| mass
+  - Sortino + benchmark capped at a constant |sortino+benchmark| <= benchmark_combined_abs_cap
   - inactivity: linear in cash fraction (plus extra ramp above 90%)
   - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
@@ -121,34 +121,29 @@ def portfolio_weights_from_action(
     return w
 
 
-def _scale_benchmark_relative_components(
+def _cap_benchmark_components(
     *,
     sortino: float,
     benchmark: float,
-    return_component: float,
-    participation: float,
-    inactivity: float,
-    churn: float,
-    max_share: float,
+    cap_abs: float,
 ) -> tuple[float, float]:
-    """Scale Sortino + benchmark excess so their combined |.| share ≤ ``max_share`` per step."""
-    if max_share <= 0.0:
+    """Scale Sortino + benchmark excess so |sortino + benchmark| ≤ ``cap_abs`` (constant).
+
+    The cap is deliberately a CONSTANT, never a function of the other reward terms.
+    The earlier relative cap (≤ share of |return|+|participation|+|inactivity|+|churn|)
+    created a verified reward-hacking gradient: while the combined benchmark term sat at
+    a positive cap, every other term's *magnitude* fed the reward with coefficient
+    share/(1−share) > 1 — burning transaction costs or taking losses *raised* total
+    reward. A constant cap keeps ∂reward/∂churn = −1 and ∂reward/∂|loss| < 0 always.
+
+    ``cap_abs <= 0`` disables both terms (ablation switch).
+    """
+    if cap_abs <= 0.0:
         return 0.0, 0.0
-    bench_sum = sortino + benchmark
-    bench_abs = abs(bench_sum)
-    if bench_abs < 1e-12:
+    bench_abs = abs(sortino + benchmark)
+    if bench_abs <= cap_abs or bench_abs < 1e-12:
         return sortino, benchmark
-    # ``return_component`` already includes drawdown amplification; do not add drawdown again.
-    other_abs = (
-        abs(return_component)
-        + abs(participation)
-        + abs(inactivity)
-        + abs(churn)
-    )
-    max_bench_abs = (max_share * other_abs) / max(1.0 - max_share, 1e-12)
-    if bench_abs <= max_bench_abs:
-        return sortino, benchmark
-    scale = max_bench_abs / bench_abs
+    scale = cap_abs / bench_abs
     return sortino * scale, benchmark * scale
 
 
@@ -970,14 +965,10 @@ class MultiAssetPortfolioEnv(gym.Env):
             tx_cost_frac * rwd.churn_penalty * rwd.reward_scale * active_churn_scale
         )
 
-        sortino_component, benchmark_component = _scale_benchmark_relative_components(
+        sortino_component, benchmark_component = _cap_benchmark_components(
             sortino=sortino_component,
             benchmark=benchmark_component,
-            return_component=return_component,
-            participation=participation_component,
-            inactivity=inactivity_component,
-            churn=churn_component,
-            max_share=rwd.benchmark_relative_max_share,
+            cap_abs=rwd.benchmark_combined_abs_cap,
         )
         reward = (
             return_component
