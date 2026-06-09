@@ -3,6 +3,7 @@ stops being hand-maintained."""
 
 from __future__ import annotations
 
+import re
 import statistics
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -40,19 +41,22 @@ def _ci_cell(rows: list[Mapping]) -> str:
     return f"[{_fmt(lo)}, {_fmt(hi)}]"
 
 
-def _render(by_variant: dict[str, list[Mapping]]) -> str:
+def _render(by_group: dict[str, list[Mapping]]) -> str:
     lines = [
-        "| variant | tier | seeds | OOS return (med) | OOS Sharpe (med) | Sharpe 95% CI | max DD (med) | split |",
-        "|---|---|---|---|---|---|---|---|",
+        "| variant (across seeds) | tier | seeds | best eval NAV (med) | OOS return (med) | OOS Sharpe (med) | Sharpe 95% CI | max DD (med) | split |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
-    for variant_id in sorted(by_variant):
-        rows = [r for r in by_variant[variant_id] if _is_scored(r)]
+    for group_id in sorted(by_group):
+        rows = [r for r in by_group[group_id] if _is_scored(r)]
         if not rows:
-            rows = by_variant[variant_id]  # only attempt/failure records: still list the variant
+            rows = by_group[group_id]  # only attempt/failure records: still list the group
             tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
-            lines.append(f"| {variant_id} | {tier} | 0 | — | — | — | — | — |")
+            lines.append(f"| {group_id} | {tier} | 0 | — | — | — | — | — | — |")
             continue
         tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
+        seeds = {r.get("seed") for r in rows if r.get("seed") is not None}
+        n_seeds = len(seeds) if seeds else len(rows)
+        eval_nav = _median([r.get("best_eval_nav") for r in rows])
         # The OOS firewall: only promoted (tier >= 4) scored records may surface holdout
         # metrics, regardless of what a hand-run backtest wrote into a low-tier summary.
         oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
@@ -61,7 +65,7 @@ def _render(by_variant: dict[str, list[Mapping]]) -> str:
         dd = _median([r.get("oos_max_drawdown") for r in oos_rows])
         split = rows[0].get("feature_split_mode") or "—"
         lines.append(
-            f"| {variant_id} | {tier} | {len(rows)} | {_fmt(ret, pct=True)} | "
+            f"| {group_id} | {tier} | {n_seeds} | {_fmt(eval_nav)} | {_fmt(ret, pct=True)} | "
             f"{_fmt(sharpe)} | {_ci_cell(oos_rows)} | {_fmt(dd, pct=True)} | {split} |"
         )
     return "\n".join(lines)
@@ -69,8 +73,9 @@ def _render(by_variant: dict[str, list[Mapping]]) -> str:
 
 def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "Research cohort") -> Path:
     records = list(records)
-    by_variant = _group(records)
-    n_variants = len(by_variant)
+    by_group = _group(records)
+    n_variants = len({str(r.get("variant_id")) for r in records})
+    n_groups = len(by_group)
     # One holdout read = one "oos_read_attempt" record (written before the backtest).
     # Scored tier>=4 records without a matching attempt are legacy single-record reads.
     tier4 = [r for r in records if int(r.get("evaluation_tier", 0)) >= 4]
@@ -84,13 +89,14 @@ def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "
     body = [
         f"# {title}",
         "",
-        f"{len(records)} run record(s) across {n_variants} variant(s); "
+        f"{len(records)} run record(s) across {n_variants} variant(s) "
+        f"({n_groups} seed-group(s)); "
         f"{n_oos_reads} holdout read(s) recorded. OOS metrics shown only for promoted "
         "(tier ≥ 4) runs; checkpoint rule = eval-NAV-best. Any OOS number below was "
         f"selected from {n_variants} variant(s) — interpret with that multiplicity in mind. "
         "Generated from registry.jsonl — do not edit by hand.",
         "",
-        _render(by_variant),
+        _render(by_group),
         "",
     ]
     out = Path(path)
@@ -99,8 +105,20 @@ def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "
     return out
 
 
+_SEED_PART = re.compile(r"__seed\d+")
+
+
+def _group_key(r: Mapping) -> str:
+    """Cross-seed aggregation key: explicit group_id, else variant_id minus its
+    __seedN component (legacy records predate group_id)."""
+    gid = r.get("group_id")
+    if gid:
+        return str(gid)
+    return _SEED_PART.sub("", str(r.get("variant_id")))
+
+
 def _group(records: Iterable[Mapping]) -> dict[str, list[Mapping]]:
-    by_variant: dict[str, list[Mapping]] = {}
+    by_group: dict[str, list[Mapping]] = {}
     for r in records:
-        by_variant.setdefault(str(r.get("variant_id")), []).append(r)
-    return by_variant
+        by_group.setdefault(_group_key(r), []).append(r)
+    return by_group

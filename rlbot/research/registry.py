@@ -5,6 +5,7 @@ an aggregator, not a new metric source)."""
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -13,19 +14,53 @@ from typing import Any, Mapping
 def append_record(path: str | Path, record: Mapping[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(dict(record), default=str) + "\n"
     with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(dict(record), default=str) + "\n")
+        try:  # advisory lock: concurrent launches must not interleave records
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass  # non-POSIX or locked-out FS: O_APPEND of one short line is still atomic-ish
+        try:
+            f.write(line)
+            f.flush()
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
 
 
 def read_records(path: str | Path) -> list[dict]:
+    """Parse the JSONL registry, skipping (with a loud warning) torn/corrupt lines —
+    a half-written trailing line from a crash must not brick collect/report/gates."""
     p = Path(path)
     if not p.is_file():
         return []
     out: list[dict] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
+    bad = 0
+    for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             out.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad += 1
+            print(
+                f"[registry] WARNING: skipping corrupt line {i} in {p} "
+                "(torn write from a crash?)",
+                file=sys.stderr,
+            )
+    if bad > 1:
+        print(
+            f"[registry] WARNING: {bad} corrupt lines in {p} — more than a torn tail; "
+            "inspect the file before trusting gates/reports.",
+            file=sys.stderr,
+        )
     return out
 
 
@@ -33,6 +68,7 @@ def build_record(
     *,
     cohort: str,
     variant_id: str,
+    group_id: str | None = None,
     hypothesis: str,
     run_id: str,
     evaluation_tier: int,
@@ -53,6 +89,7 @@ def build_record(
     return {
         "cohort": cohort,
         "variant_id": variant_id,
+        "group_id": group_id,
         "hypothesis": hypothesis,
         "run_id": run_id,
         "evaluation_tier": int(evaluation_tier),

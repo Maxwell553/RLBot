@@ -118,7 +118,7 @@ def test_report_renders_table(tmp_path: Path) -> None:
     ]
     out = report.write_report(records, tmp_path / "report.md", title="t")
     text = out.read_text(encoding="utf-8")
-    assert "| variant |" in text
+    assert "| variant (across seeds) |" in text
     assert "v1" in text
 
 
@@ -305,3 +305,60 @@ def test_report_header_states_variant_multiplicity(tmp_path: Path) -> None:
     assert "multiplicity" in text
     assert "1 holdout read(s)" not in text  # 3 tier>=4 records were recorded
     assert "3 holdout read(s)" in text
+
+
+def test_report_aggregates_across_seeds_via_group_id(tmp_path: Path) -> None:
+    """H5 regression: seed-bearing variant ids must aggregate into ONE group row with
+    a true cross-seed median, not one single-record row per seed."""
+    from rlbot.research import report
+
+    records = [
+        {"variant_id": "ab__x=1__seed42__W1", "group_id": "ab__x=1__W1", "seed": 42,
+         "evaluation_tier": 3, "best_eval_nav": 100.0},
+        {"variant_id": "ab__x=1__seed101__W1", "group_id": "ab__x=1__W1", "seed": 101,
+         "evaluation_tier": 3, "best_eval_nav": 120.0},
+        {"variant_id": "ab__x=1__seed777__W1", "group_id": "ab__x=1__W1", "seed": 777,
+         "evaluation_tier": 3, "best_eval_nav": 140.0},
+    ]
+    out = report.write_report(records, tmp_path / "r.md", title="t")
+    text = out.read_text(encoding="utf-8")
+    assert "| ab__x=1__W1 | 3 | 3 | 120.00 |" in text  # one row, 3 seeds, median NAV
+    assert "seed42" not in text.split("|---|")[1]  # no per-seed rows
+
+
+def test_report_group_key_strips_seed_for_legacy_records(tmp_path: Path) -> None:
+    from rlbot.research.report import _group_key
+
+    assert _group_key({"variant_id": "ab__x=1__seed42__W1"}) == "ab__x=1__W1"
+    assert _group_key({"variant_id": "ab__seed7"}) == "ab"
+    assert _group_key({"variant_id": "ab", "group_id": "g"}) == "g"
+
+
+def test_resolve_variants_sets_group_id() -> None:
+    from rlbot.research.spec import ExperimentSpec, resolve_variants
+
+    spec = ExperimentSpec(
+        id="ab",
+        hypothesis="h",
+        evaluation_tier=3,
+        seeds=[1, 2],
+        grid={"reward.reward_scale": [100, 200]},
+    )
+    variants = resolve_variants(spec)
+    groups = {v.group_id for v in variants}
+    assert len(variants) == 4 and len(groups) == 2
+    for v in variants:
+        assert f"seed{v.seed}" in v.variant_id
+        assert "seed" not in v.group_id
+
+
+def test_registry_read_skips_torn_lines(tmp_path: Path, capsys) -> None:
+    from rlbot.research import registry
+
+    reg = tmp_path / "registry.jsonl"
+    registry.append_record(reg, {"run_id": "a", "status": "ok"})
+    with reg.open("a", encoding="utf-8") as f:
+        f.write('{"run_id": "b", "status"')  # torn tail from a crash
+    records = registry.read_records(reg)
+    assert [r["run_id"] for r in records] == ["a"]
+    assert "corrupt line" in capsys.readouterr().err

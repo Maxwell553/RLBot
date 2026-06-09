@@ -173,6 +173,10 @@ class Variant:
     concrete_patch: dict
     seed: int
     window: dict
+    # variant_id minus the seed component — the cross-seed aggregation key. Without
+    # it, every report group held exactly one record and "median across seeds" was a
+    # median of one.
+    group_id: str = ""
 
 
 def _grid_combos(grid: dict) -> list[dict]:
@@ -201,6 +205,7 @@ def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
                 parts = [spec.id]
                 if grid_tag:
                     parts.append(grid_tag)
+                group_parts = list(parts) + ([wname] if wname else [])
                 parts.append(f"seed{seed}")
                 if wname:
                     parts.append(wname)
@@ -210,6 +215,7 @@ def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
                         concrete_patch=dict(concrete),
                         seed=int(seed),
                         window=dict(window),
+                        group_id="__".join(group_parts),
                     )
                 )
     return variants

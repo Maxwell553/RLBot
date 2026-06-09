@@ -78,6 +78,7 @@ def _materialize(spec: ExperimentSpec) -> dict:
         entries.append(
             {
                 "variant_id": v.variant_id,
+                "group_id": v.group_id,
                 "run_id": v.variant_id,
                 "config_path": str(cfg_path),
                 "seed": v.seed,
@@ -169,6 +170,7 @@ def _collect_one(cm: dict, entry: dict, *, tier: int, status: str = "ok",
     return registry.build_record(
         cohort=cm["cohort"],
         variant_id=entry["variant_id"],
+        group_id=entry.get("group_id") or None,
         hypothesis=cm.get("hypothesis", ""),
         run_id=run_id,
         evaluation_tier=tier,
