@@ -31,7 +31,20 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 
 Core hyperparameters live in `config/config.yaml` and are **copied to `Runs/<run_id>/config.yaml`** at train start. Walk-forward windows differ by **calendar flags** and **run id** only, not per-window YAML sweeps, unless a new study is intentional.
 
-After any change to universe, `asset_live` panel, `obs_dim`, or reward coefficients, run `--refresh-data` (if data/universe changed) and train with a **new** run id — old checkpoints and VecNormalize stats are incompatible. OOS backtest execution uses the **current** global config for env mechanics (fees, smoothing); only the policy weights come from the run artifact.
+After any change to universe, `asset_live` panel, `obs_dim`, or reward coefficients, run `--refresh-data` (if data/universe changed) and train with a **new** run id — old checkpoints and VecNormalize stats are incompatible. OOS backtest execution binds the **run-local snapshots** by default for reproducibility: `Runs/<run_id>/config.yaml` for env mechanics (fees, cap, smoothing) and `Runs/<run_id>/data_cache.npz` for the panel (`--use-current-config` / `--data-cache` override; the summary records config/data hashes and warns when they drift from the training manifest).
+
+### Auto-research loop (`scripts/research.py` + `specs/*.yaml`)
+
+Method experiments are pre-registered as specs (hypothesis + allow-listed config `patch`/`grid`; universe, costs, split, and holdout dates are not patchable, and `windows` must reference the canonical table below). The orchestrator shells out to the canonical `train.py`/`backtest.py` and records every run in `Runs/<cohort>/registry.jsonl`:
+
+```bash
+python scripts/research.py plan    specs/reward_ablation.yaml   # materialize variant configs
+python scripts/research.py launch  specs/reward_ablation.yaml   # tiers 1–3: train + in-training eval only
+python scripts/research.py report  reward_ablation              # registry → report.md (OOS shown for tier ≥ 4 only)
+python scripts/research.py promote specs/reward_ablation.yaml --variant <id> --promote
+```
+
+The OOS firewall: tiers 1–3 never touch the holdout; tier ≥ 4 requires `--promote`, is budgeted (`--oos-budget`, default 1 read per launch), and every holdout read is written to the registry **before** it happens — a variant with a recorded tier-4 read cannot be re-scored (`--allow-failed-rescore` only retries crashed, never-scored reads). Published OOS numbers carry the cohort's variant count; interpret them with that multiplicity in mind.
 
 ---
 
@@ -55,10 +68,12 @@ Use `--window N` on `train.py` (or `modal run scripts/modal_app.py -- …`) for 
 |--------|---------------|-------------------------------------------|-----------|------------------|----------|--------------|
 | 1 | 2015-12-31 | 2016-01-01 … 2017-12-31 | 2017-12-31 | `W1_604` / `W1_605` | W1_604 complete (local, legacy config); W1_605 Modal | W1_604: **+8.4%** / Sh 0.50 / DD −8.3% |
 | 2 | 2017-12-31 | 2018-01-01 … 2019-12-31 | 2019-12-31 | `W2_605` | Modal (current config) | — |
-| 3 | 2019-12-31 | 2020-01-01 … 2021-06-30 | 2021-06-30 | `W3_605` | Pending | — |
-| 4 | 2021-06-30 | 2021-07-01 … 2022-12-31 | 2022-12-31 | `W4_605` | Pending | — |
-| 5 | 2022-12-31 | 2023-01-01 … 2024-12-31 | 2024-12-31 | `W5_605` | Pending | — |
-| 6 | 2024-12-31 | 2025-01-01 … latest | (omit / latest bar) | `W6_605` | Pending | — |
+| 3 | 2019-12-31 | 2020-01-01 … 2021-12-31 | 2021-12-31 | `W3_605` | Pending | — |
+| 4 | 2021-12-31 | 2022-01-01 … 2023-12-31 | 2023-12-31 | `W4_605` | Pending | — |
+| 5 | 2023-12-31 | 2024-01-01 … 2025-12-31 | 2025-12-31 | `W5_605` | Pending | — |
+| 6 | 2025-12-31 | 2026-01-01 … 2027-12-31 | (omit / latest bar) | `W6_605` | Pending | — |
+
+Window *N* trains through Dec-31 of `2013 + 2N` with a two-year holdout. This table is canonical: research specs may only reference these windows (`rlbot/research/spec.py:CANONICAL_WINDOWS` rejects anything else — a spec that placed its own holdout would change what OOS *is*).
 
 **Local train example (window 1):**
 
@@ -138,7 +153,7 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 ## Data engineering & anti-leakage
 
 1. **Fractional differentiation** (default d = 0.4) on log prices.
-2. **Walk-forward blocks:** `train_test_split_alternating`, 126-bar blocks, every 4th block eval; features precomputed on the full trainable timeline, sliced per segment (`WalkforwardEnvPack` in `data_utils.py`) — no cross-block leakage.
+2. **Walk-forward blocks:** `train_test_split_alternating`, 126-bar blocks, every 4th block eval (`WalkforwardEnvPack` in `data_utils.py`). All features are strictly causal and the holdout is reserved first, so no OOS data leaks. `data.feature_split_mode` governs block features: `continuous` (default) slices a panel computed once on the contiguous timeline — eval-block indicator memory is continuous with adjacent train blocks, so in-training eval NAV is a model-*selection* signal, not an independent estimate; `independent` recomputes features per segment over a causal preroll window (`feature_preroll_bars: 252`).
 3. **Causal execution:** features at `t` use `close[t−obs_lag]`; fill `open[t+1]`; MTM `close[t+1]`; holding costs on pre-rebalance units at `close[t]`.
 4. **Chronological holdout:** removed before train/eval; only `scripts/backtest.py` uses OOS bars.
 5. **HY OAS macro:** causal expanding OLS calibration (no per-bar `polyfit` look-ahead).
@@ -157,7 +172,7 @@ All terms are in **reward units** (VecNormalize scales the sum during training).
 | Component | Implementation | Default coefficients |
 |-----------|----------------|-------------------|
 | **Return** | `clip(log_ret, max_step_log_return_downside, max_step_log_return) × reward_scale` | clip **−0.12 / +0.06**; scale **2000** |
-| **Sortino differential** | Agent vs cap-weighted benchmark Sortino over `risk_window` (min `sortino_min_steps` warmup), clipped ±3 | `risk_bonus_scale: 25` |
+| **Sortino differential** | Agent vs cap-weighted benchmark Sortino over `risk_window` (min `sortino_min_steps` warmup), clipped ±3; downside deviation floored at `sortino_downside_floor` so no-loss windows cannot saturate the clip | `risk_bonus_scale: 25`; floor `0.001` (10 bp/day) |
 | **Participation** | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | Linear in `cash_frac`: `cash_frac × inactivity_penalty_over_50`; extra ramp from 90%→100% cash | **10.0** base + **15.0** tail; **no 50% step cliff** |
 | **Churn** | `turnover_frac × churn_penalty × VIX_mult × curriculum_churn_scale` | `churn_penalty: 8.5` |

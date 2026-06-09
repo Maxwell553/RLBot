@@ -110,8 +110,8 @@ Backtest reads `manifest.universe.tickers` and checks observation dimension agai
 Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`.
 
 ```bash
-python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint both
-python scripts/backtest.py --run-id W1 --checkpoint both --detailed --stochastic-paths 30 --plot-tag best
+python scripts/backtest.py --run-ids W1,W2,W3,W4,W5,W6 --checkpoint best
+python scripts/backtest.py --run-id W1 --checkpoint best --detailed --stochastic-paths 30
 ```
 
 ---

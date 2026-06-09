@@ -115,17 +115,34 @@ def train_remote(
     os.environ[VOLUME_CACHE_ENV] = VOLUME_CACHE
     os.chdir(WORKSPACE)
 
+    # Broker values are *defaults*: prepend them so a user-passed --n-envs/--batch-size
+    # (argparse last-wins) overrides the GPU profile instead of being silently ignored.
+    def _user_passed(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in train_argv)
+
+    if _user_passed("--n-envs"):
+        n_envs_override = int(
+            train_argv[train_argv.index("--n-envs") + 1]
+            if "--n-envs" in train_argv
+            else next(a.split("=", 1)[1] for a in train_argv if a.startswith("--n-envs="))
+        )
+    if _user_passed("--batch-size"):
+        batch_size_override = int(
+            train_argv[train_argv.index("--batch-size") + 1]
+            if "--batch-size" in train_argv
+            else next(a.split("=", 1)[1] for a in train_argv if a.startswith("--batch-size="))
+        )
     cmd = [
         sys.executable,
         "scripts/train.py",
-        *train_argv,
         "--n-envs",
         str(n_envs_override),
         "--batch-size",
         str(batch_size_override),
+        *train_argv,
     ]
     rollout = N_STEPS * n_envs_override
-    minibatches = rollout // batch_size_override
+    minibatches = rollout // max(batch_size_override, 1)
     print(f"[modal] cwd={os.getcwd()}", flush=True)
     print(
         f"[modal] rollout={rollout:,}  batch_size={batch_size_override:,}  "

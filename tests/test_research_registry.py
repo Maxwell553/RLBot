@@ -10,10 +10,12 @@ import pytest
 from rlbot.rl_config import get_config, load_config
 from rlbot.research import gates, registry, report
 from rlbot.research.spec import (
+    CANONICAL_WINDOWS,
     ExperimentSpec,
     build_variant_config_dict,
     is_allowed_patch_key,
     load_spec,
+    normalize_window,
     resolve_variants,
 )
 from rlbot.run_artifacts import PROJECT_ROOT
@@ -138,3 +140,168 @@ def test_no_repeat_oos_read() -> None:
 def test_tier_oos_flags() -> None:
     assert not gates.tier_touches_oos(3)
     assert gates.tier_touches_oos(4)
+
+
+# ── canonical windows (normalize_window) ─────────────────────────────────
+def test_normalize_window_name_only_fills_canonical_dates() -> None:
+    w = normalize_window({"name": "W4"})
+    assert w == {
+        "name": "W4",
+        "train_end": "2021-12-31",
+        "holdout_start": "2022-01-01",
+        "holdout_end": "2023-12-31",
+    }
+    assert w == {"name": "W4", **CANONICAL_WINDOWS["W4"]}
+
+
+def test_normalize_window_name_is_case_insensitive() -> None:
+    assert normalize_window({"name": "w4"}) == normalize_window({"name": "W4"})
+
+
+def test_normalize_window_exact_canonical_dates_resolve_to_name() -> None:
+    w = normalize_window(dict(CANONICAL_WINDOWS["W2"]))
+    assert w["name"] == "W2"
+    assert w["train_end"] == CANONICAL_WINDOWS["W2"]["train_end"]
+
+
+def test_normalize_window_non_canonical_dates_rejected() -> None:
+    with pytest.raises(PermissionError, match="canonical"):
+        normalize_window(
+            {"train_end": "2021-06-30", "holdout_start": "2021-07-01",
+             "holdout_end": "2022-12-31"}
+        )
+
+
+def test_normalize_window_unknown_key_rejected() -> None:
+    # a typo'd date key must not be silently dropped (would change the holdout)
+    with pytest.raises(ValueError, match="unknown key"):
+        normalize_window({"name": "W4", "holdout_strt": "2022-01-01"})
+
+
+def test_normalize_window_unknown_name_rejected() -> None:
+    with pytest.raises(ValueError, match="not canonical"):
+        normalize_window({"name": "W99"})
+
+
+def test_normalize_window_name_date_mismatch_rejected() -> None:
+    with pytest.raises(ValueError, match="dates match"):
+        normalize_window({"name": "W1", **CANONICAL_WINDOWS["W3"]})
+
+
+def test_spec_windows_normalized_in_post_init() -> None:
+    spec = ExperimentSpec(id="x", windows=[{"name": "w4"}])
+    assert spec.windows[0]["holdout_start"] == "2022-01-01"
+    with pytest.raises(PermissionError):
+        ExperimentSpec(
+            id="x",
+            windows=[{"train_end": "2020-06-30", "holdout_start": "2020-07-01"}],
+        )
+
+
+# ── base_config pinning ──────────────────────────────────────────────────
+def test_spec_rejects_non_canonical_base_config() -> None:
+    with pytest.raises(PermissionError, match="base_config"):
+        ExperimentSpec(id="x", base_config="config/other.yaml")
+    with pytest.raises(PermissionError):
+        ExperimentSpec(id="x", base_config="/tmp/evil.yaml")
+    assert ExperimentSpec(id="x").base_config == "config/config.yaml"  # default ok
+
+
+# ── OOS budget gate ──────────────────────────────────────────────────────
+def test_assert_oos_budget() -> None:
+    gates.assert_oos_budget(1, 1)  # within budget ok
+    gates.assert_oos_budget(0, 1)
+    with pytest.raises(PermissionError, match="budget"):
+        gates.assert_oos_budget(2, 1)
+    with pytest.raises(PermissionError):
+        gates.assert_oos_budget(13, 12)
+
+
+# ── no-repeat OOS with attempt / failed records ──────────────────────────
+def test_attempt_records_block_by_default() -> None:
+    records = [
+        {"variant_id": "v1", "evaluation_tier": 4, "run_id": "r1", "status": "oos_read_attempt"}
+    ]
+    with pytest.raises(PermissionError, match="unscored"):
+        gates.assert_no_repeat_oos(records, "v1")
+    # the retry escape hatch works only while no scored result exists
+    gates.assert_no_repeat_oos(records, "v1", allow_failed_rescore=True)
+    gates.assert_no_repeat_oos(records, "v2")  # other variants unaffected
+
+
+def test_failed_record_alone_never_blocks() -> None:
+    """A tier-4 variant whose TRAIN crashed (no attempt record → holdout never read)
+    must not brick the relaunch; the attempt record is the only read marker."""
+    records = [
+        {"variant_id": "v1", "evaluation_tier": 4, "run_id": "r1", "status": "failed"}
+    ]
+    gates.assert_no_repeat_oos(records, "v1")
+    # failed AFTER an attempt: the attempt still blocks
+    records.append(
+        {"variant_id": "v1", "evaluation_tier": 4, "run_id": "r1", "status": "oos_read_attempt"}
+    )
+    with pytest.raises(PermissionError, match="unscored"):
+        gates.assert_no_repeat_oos(records, "v1")
+    gates.assert_no_repeat_oos(records, "v1", allow_failed_rescore=True)
+
+
+def test_scored_oos_record_blocks_even_with_rescore_flag() -> None:
+    records = [
+        {"variant_id": "v1", "evaluation_tier": 4, "run_id": "r1", "status": "oos_read_attempt"},
+        {"variant_id": "v1", "evaluation_tier": 4, "run_id": "r1", "status": "ok"},
+    ]
+    with pytest.raises(PermissionError, match="already has"):
+        gates.assert_no_repeat_oos(records, "v1")
+    with pytest.raises(PermissionError, match="already has"):
+        gates.assert_no_repeat_oos(records, "v1", allow_failed_rescore=True)
+
+
+def test_low_tier_records_never_block_oos() -> None:
+    records = [{"variant_id": "v1", "evaluation_tier": 3, "run_id": "r1", "status": "ok"}]
+    gates.assert_no_repeat_oos(records, "v1")  # tier < 4 is not a holdout read
+
+
+# ── report: OOS firewall + multiplicity header ───────────────────────────
+def _variant_row(text: str, variant_id: str) -> str:
+    rows = [l for l in text.splitlines() if l.startswith(f"| {variant_id} |")]
+    assert len(rows) == 1, f"expected one row for {variant_id}"
+    return rows[0]
+
+
+def test_report_hides_oos_metrics_from_low_tier_records(tmp_path: Path) -> None:
+    """A holdout number smuggled into a tier-3 record must not surface in the table."""
+    records = [
+        {"variant_id": "v3", "evaluation_tier": 3, "status": "ok",
+         "oos_sharpe": 2.5, "oos_total_return": 0.5, "oos_max_drawdown": -0.05},
+        {"variant_id": "v4", "evaluation_tier": 4, "status": "ok",
+         "oos_sharpe": 1.25, "oos_total_return": 0.10, "oos_max_drawdown": -0.08},
+    ]
+    text = report.write_report(records, tmp_path / "r.md").read_text(encoding="utf-8")
+    row3 = _variant_row(text, "v3")
+    assert "2.50" not in row3 and "50.00%" not in row3  # tier-3 OOS values suppressed
+    row4 = _variant_row(text, "v4")
+    assert "1.25" in row4 and "10.00%" in row4  # tier-4 scored values surface
+
+
+def test_report_ignores_unscored_oos_records(tmp_path: Path) -> None:
+    records = [
+        {"variant_id": "v1", "evaluation_tier": 4, "status": "oos_read_attempt",
+         "oos_sharpe": 9.9},
+        {"variant_id": "v1", "evaluation_tier": 4, "status": "failed", "oos_sharpe": 9.9},
+    ]
+    text = report.write_report(records, tmp_path / "r.md").read_text(encoding="utf-8")
+    row = _variant_row(text, "v1")
+    assert "9.90" not in row
+    assert "| 0 |" in row  # zero scored seeds, variant still listed
+
+
+def test_report_header_states_variant_multiplicity(tmp_path: Path) -> None:
+    records = [
+        {"variant_id": f"v{i}", "evaluation_tier": 4, "status": "ok", "oos_sharpe": 1.0}
+        for i in range(3)
+    ]
+    text = report.write_report(records, tmp_path / "r.md").read_text(encoding="utf-8")
+    assert "selected from 3 variant(s)" in text
+    assert "multiplicity" in text
+    assert "1 holdout read(s)" not in text  # 3 tier>=4 records were recorded
+    assert "3 holdout read(s)" in text

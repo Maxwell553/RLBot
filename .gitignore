@@ -36,6 +36,6 @@ plots/
 # Local broker automation (not part of research training; removed from repo)
 ibkr_paper/
 
-# Broker credentials and local execution state (keep execution/README.md tracked)
+# Broker credentials and local execution state (no execution/ dir is tracked today;
+# reserved for a future broker integration)
 execution/**
-!execution/README.md

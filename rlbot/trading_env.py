@@ -620,11 +620,16 @@ class MultiAssetPortfolioEnv(gym.Env):
 
     # ── execution ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _compute_sortino(rets: np.ndarray) -> float:
+    def _compute_sortino(self, rets: np.ndarray) -> float:
         m = float(rets.mean())
         downside_elements = np.minimum(rets, 0.0) ** 2
-        dv = max(float(np.sqrt(downside_elements.mean())), 1e-4)
+        # The floor is the economic resolution of "downside": without it, any no-loss
+        # window (cash returns are exactly 0) divides by ~0 and saturates the clipped
+        # Sortino differential, turning the risk bonus into a binary exploit.
+        dv = max(
+            float(np.sqrt(downside_elements.mean())),
+            float(self._reward_cfg.sortino_downside_floor),
+        )
         return m / dv
 
     def _benchmark_weights_live(self, live: np.ndarray) -> np.ndarray:

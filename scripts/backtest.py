@@ -133,7 +133,7 @@ def _get_shared_panel(cache_path: str | Path | None = None) -> tuple:
     if key not in _PANEL_CACHE:
         _bt_log(f"[backtest] Loading market cache (once per path): {key}")
         t0 = time.perf_counter()
-        _PANEL_CACHE[key] = load_cache(key)
+        _PANEL_CACHE[key] = load_cache(key, expected_fracdiff_d=get_config().data.fracdiff_d)
         _bt_log(f"[backtest] Cache loaded ({time.perf_counter() - t0:.1f}s).")
     return _PANEL_CACHE[key]
 
@@ -435,18 +435,34 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     # regardless of the current global config / cache (override with flags).
     _maybe_load_run_config(run_id, args)
     cache_path = _resolve_run_data_cache(run_id, args)
+    if not (getattr(args, "data_cache", "") or "").strip() and not RunPaths(
+        run_id
+    ).data_snapshot.is_file():
+        print(
+            f"[backtest] WARNING: run-local data snapshot Runs/{run_id}/data_cache.npz is "
+            f"missing; falling back to {cache_path}. If that cache has newer bars and the "
+            "manifest lacks an explicit holdout_end, the OOS window may extend past what "
+            "training reserved — results may not be reproducible."
+        )
     model_path = _resolve_model_path_for_run(
         run_id,
         allow_latest_checkpoint=args.allow_latest_checkpoint,
         model_override=Path(args.model) if args.model.strip() else None,
     )
-    tag = (getattr(args, "plot_tag", None) or "").strip()
-    if tag:
-        ckpt_label = tag
-    elif model_path.name == "best_model.zip":
+    # OOS provenance: the label is derived from the weights actually evaluated, never
+    # from --plot-tag (a tag once mislabeled final-model OOS numbers as "best").
+    if model_path.name == "best_model.zip":
         ckpt_label = "best"
+    elif model_path == RunPaths(run_id).final_model:
+        ckpt_label = "final"
     else:
         ckpt_label = "latest"
+    tag = (getattr(args, "plot_tag", None) or "").strip()
+    if tag and tag != ckpt_label:
+        print(
+            f"[backtest] NOTE: --plot-tag {tag!r} names the plot only; metrics are "
+            f"labeled by the evaluated checkpoint ({ckpt_label!r})."
+        )
     _bt_log(f"[backtest] Checkpoint: {model_path} ({ckpt_label})")
 
     if getattr(args, "reuse_panel", False):
@@ -479,7 +495,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             macro_vol,
             asset_live,
             cache_tickers,
-        ) = load_cache(str(cache_path))
+        ) = load_cache(str(cache_path), expected_fracdiff_d=get_config().data.fracdiff_d)
     panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     n_assets = int(ohlcv.shape[1])
     _assert_manifest_panel_compatible(manifest, panel_tickers, n_assets)
@@ -539,6 +555,16 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         f"({len(test_idx)} bars, setup {time.perf_counter() - t_phase:.1f}s)"
     )
 
+    obs_lag = args.obs_lag
+    if obs_lag is None:
+        margs = manifest.get("args") or {}
+        if margs.get("obs_lag") is not None:
+            obs_lag = int(margs["obs_lag"])
+        else:
+            obs_lag = int(get_config().environment.obs_lag_default)
+        _bt_log(f"[backtest] obs_lag={obs_lag} (from manifest/run config)")
+    obs_lag = int(obs_lag)
+
     device = getattr(args, "device", "cpu") or "cpu"
     full_reload = bool(getattr(args, "full_policy_load", False))
     model = _load_inference_policy(model_path, device=device, full_reload=full_reload)
@@ -546,8 +572,22 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     explicit_vn = Path(args.vec_normalize).expanduser().resolve() if args.vec_normalize.strip() else None
     vec_norm_path = _find_vec_normalize(model_path, run_id, explicit=explicit_vn)
     use_vec_norm = vec_norm_path.is_file()
-    if not use_vec_norm and args.require_vec_normalize:
-        raise FileNotFoundError(f"No VecNormalize stats at {vec_norm_path}")
+    if not use_vec_norm:
+        if args.require_vec_normalize:
+            raise FileNotFoundError(f"No VecNormalize stats at {vec_norm_path}")
+        if get_config().vec_normalize.norm_obs and not getattr(args, "allow_raw_obs", False):
+            raise FileNotFoundError(
+                f"No VecNormalize stats at {vec_norm_path}, but this run trained with "
+                "vec_normalize.norm_obs: true — rolling out on raw observations would "
+                "produce plausible-looking but meaningless metrics. Restore "
+                "models/vec_normalize.pkl (or pass --vec-normalize PATH); "
+                "--allow-raw-obs overrides this check explicitly."
+            )
+        if getattr(args, "allow_raw_obs", False):
+            print(
+                "[backtest] WARNING: no VecNormalize stats found — rolling out on RAW "
+                "observations (--allow-raw-obs). Metrics are not comparable to training."
+            )
 
     _bt_log("[backtest] Deterministic OOS rollout...")
     t_roll = time.perf_counter()
@@ -564,7 +604,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         test_asset_vol=test_avol,
         test_macro_vol=test_mvol,
         test_asset_live=test_live,
-        obs_lag=args.obs_lag,
+        obs_lag=obs_lag,
         vec_norm_path=vec_norm_path,
         use_vec_norm=use_vec_norm,
         deterministic=True,
@@ -597,7 +637,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             test_asset_vol=test_avol,
             test_macro_vol=test_mvol,
             test_asset_live=test_live,
-            obs_lag=args.obs_lag,
+            obs_lag=obs_lag,
             vec_norm_path=vec_norm_path,
             use_vec_norm=use_vec_norm,
             progress=progress,
@@ -605,6 +645,11 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         _bt_log(f"[backtest] Stochastic paths done ({time.perf_counter() - t_stoch:.1f}s).")
         if nav_ensemble.shape[1] != len(navs):
             m = min(nav_ensemble.shape[1], len(navs))
+            print(
+                f"[backtest] WARNING: stochastic-path length ({nav_ensemble.shape[1]}) != "
+                f"deterministic NAV length ({len(navs)}); truncating BOTH to {m} bars — "
+                "the headline deterministic metrics below cover the truncated window."
+            )
             navs = navs[:m]
             nav_ensemble = nav_ensemble[:, :m]
 
@@ -671,7 +716,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             open_plot_file(out)
 
     detailed_stats: dict | None = None
-    if args.detailed and not getattr(args, "_ensemble_mode", False):
+    if args.detailed:
         _bt_log(
             f"[backtest] Detailed stats (bootstrap resamples={args.bootstrap_resamples})..."
         )
@@ -701,7 +746,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         n_bars=len(test_idx),
         seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
     )
-    _write_backtest_summary(result, args, detailed_stats, cache_path)
+    _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
     return result
 
 
@@ -710,19 +755,32 @@ def _write_backtest_summary(
     args: argparse.Namespace,
     detailed: dict | None,
     cache_path: Path,
+    manifest: dict | None = None,
 ) -> None:
-    """Write a machine-readable per-run backtest summary (skipped in ensemble mode)."""
-    if getattr(args, "_ensemble_mode", False):
-        return
+    """Write a machine-readable per-run backtest summary."""
     from dataclasses import asdict
 
     cfg = get_config()
+    config_hash = config_sha256(cfg.to_dict())
+    data_cache_hash = sha256_file(cache_path)
+    # Drift detection: hashes are not just recorded, they are compared to training.
+    hash_drift: dict[str, dict] = {}
+    for key, now in (("config_hash", config_hash), ("data_cache_hash", data_cache_hash)):
+        trained = (manifest or {}).get(key)
+        if trained and trained != now:
+            hash_drift[key] = {"training": trained, "backtest": now}
+            print(
+                f"[backtest] WARNING: {key} differs from the training manifest "
+                f"({trained[:12]}… → {now[:12]}…); this backtest does not bind the "
+                "exact training-time inputs and may not reproduce the run's OOS numbers."
+            )
     payload = {
         **asdict(result),
         "config_path": str(cfg.path),
-        "config_hash": config_sha256(cfg.to_dict()),
+        "config_hash": config_hash,
         "data_cache_path": str(cache_path),
-        "data_cache_hash": sha256_file(cache_path),
+        "data_cache_hash": data_cache_hash,
+        "hash_drift": hash_drift or None,
         "feature_split_mode": cfg.data.feature_split_mode,
         **git_provenance(),
         "detailed": detailed,
@@ -790,6 +848,8 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
         modes.append(("latest", True))
 
     args._ensemble_mode = True  # type: ignore[attr-defined]
+    if not args.no_viz:
+        _bt_log("[backtest] Ensemble mode: per-run plots are skipped (μ±σ table + ensemble_summary.json).")
     args.no_viz = True
 
     summary_root: dict[str, object] = {"prefix": prefix, "checkpoints": {}}
@@ -1376,7 +1436,11 @@ def main() -> None:
         metavar="YYYY-MM-DD",
         help="Last OOS day (must match training). Default: manifest or last bar.",
     )
-    parser.add_argument("--obs-lag", type=int, default=1, help="Market features lag (must match training)")
+    parser.add_argument(
+        "--obs-lag", type=int, default=None,
+        help="Market features lag (must match training). Default: manifest args.obs_lag, "
+        "else the run config's environment.obs_lag_default.",
+    )
     parser.add_argument(
         "--vec-normalize",
         type=str,
@@ -1388,6 +1452,12 @@ def main() -> None:
         "--require-vec-normalize",
         action="store_true",
         help="Exit with error if no VecNormalize stats file is found (strict trade validation)",
+    )
+    parser.add_argument(
+        "--allow-raw-obs",
+        action="store_true",
+        help="Permit a rollout without VecNormalize stats even though the run trained "
+        "with norm_obs: true (refused by default — raw-obs metrics are meaningless).",
     )
     parser.add_argument("--no-viz", action="store_true", help="Skip saving backtest plot PNG")
     parser.add_argument(

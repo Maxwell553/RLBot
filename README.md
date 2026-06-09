@@ -56,8 +56,10 @@ Use `--refresh-data` (or `modal run scripts/modal_app.py::upload_cache`) when a 
 **Walk-forward batch backtest:**
 
 ```bash
-python scripts/backtest.py --run-ids W1_604,W2_604 --checkpoint both
+python scripts/backtest.py --run-ids W1_604,W2_604 --checkpoint best
 ```
+
+(`--checkpoint latest|both` evaluates non-ex-ante weights on the holdout and prints an OOS-touch warning; `best` is the published metric.)
 
 **Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). Do not change core hyperparameters across walk-forward cohorts unless starting a new study.
 
@@ -108,7 +110,9 @@ flowchart TB
 2. Cache panel, `tickers`, and **`asset_live`** (1 = real print, 0 = pre-IPO / missing) in `.cache/data_cache.npz` — **no global `dropna`** on the calendar.
 3. Reserve chronological OOS holdout before any in-training split.
 4. Walk-forward alternating split (126-bar blocks; every 4th block eval); precomputed `WalkforwardEnvPack` panels aligned per segment.
-5. Per-segment features (RSI, MACD, fracdiff, trend) with join purge — no cross-block leakage.
+5. Features (RSI, MACD, fracdiff, trend) are strictly causal and the holdout is reserved first, so neither mode leaks OOS data. `data.feature_split_mode` controls how block features are built:
+   - `continuous` (default): features computed once on the contiguous panel and **sliced** into blocks. Eval-block indicator memory is continuous with adjacent train blocks (matches the continuous backtest) — treat in-training eval NAV as a model-*selection* signal, not an independent estimate.
+   - `independent`: features recomputed per segment over a causal preroll window (`data.feature_preroll_bars`, default 252) so slow indicators get real warmup; only panel-head bars without preroll history are neutralized (`data.feature_purge_warmup`).
 
 ### Environment (`rlbot/trading_env.py`)
 
@@ -124,7 +128,7 @@ Per-step reward is a sum of shaped terms (logged to TensorBoard as `rew_decomp/*
 | Term | Formula (reward units) | Config knobs |
 |------|------------------------|--------------|
 | **Return** | `clip(log_ret, −0.12, +0.06) × reward_scale` | `reward_scale: 2000` |
-| **Sortino diff** | `clip(agent_sortino − bench_sortino, ±3) × risk_bonus_scale` after `sortino_min_steps: 20` over `risk_window: 63` | vs `benchmark_cap_weights` passive book |
+| **Sortino diff** | `clip(agent_sortino − bench_sortino, ±3) × risk_bonus_scale` after `sortino_min_steps: 20` over `risk_window: 63`; downside deviation floored at `sortino_downside_floor: 0.001` (10 bp/day) so no-loss windows cannot saturate the clip | vs `benchmark_cap_weights` passive book |
 | **Participation** | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | `cash_frac × inactivity_penalty_over_50` + extra linear ramp above 90% cash | `10.0` base, `15.0` above 90%; eval uses `eval_inactivity_penalty_scale: 0.05` |
 | **Churn** | `turnover_frac × churn_penalty × VIX_mult × curriculum_churn_scale` | `churn_penalty: 8.5`; VIX mult clipped to **75–150%** of baseline 18 |
@@ -144,14 +148,19 @@ Per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists,
 - **TradingCurriculumCallback** — fee-free phase, fee ramp, churn ramp, progressive domain randomization (milestones from `config.yaml` → `curriculum`).
 - **AdaptiveEntropyCallback** — cosine entropy decay (not eval-gated).
 - **Cadence:** eval every **500k** global steps (`eval_freq = 500_000 // n_envs`); training plot refresh `viz_freq: 500_000`; weight checkpoints every **1M** steps.
-- Published OOS checkpoint rule: **eval-NAV-best only** (holdout never used to pick weights).
-- **Run ids:** `--window N` → `W{N}_<month><day>` (e.g. `W1_604`); collisions get `_a`, `_b`, …
+- Published OOS checkpoint rule: **eval-NAV-best only** (holdout never used to pick weights). `best_model.zip` is saved together with the VecNormalize stats it was selected under.
+- **Early stop (opt-in):** `training.early_stop_patience > 0` stops after K evals with no new best NAV once the curriculum completes; the reason lands in the manifest.
+- **Reproducibility (opt-in):** `training.reproducible: true` switches to deterministic per-env seed streams so same-seed runs reproduce (default keeps stochastic episode resets for diversity).
+- **Run ids:** `--window N` → `W{N}_<month><day>` (e.g. `W1_604`); auto-id collisions get `_a`, `_b`, … Reusing an explicit `--run-id` that already has a manifest is refused unless `--overwrite-run` (or `--resume`) is passed.
 
 ### Evaluation
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, stochastic-path fan plot |
+| `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, stochastic-path fan plot; writes `Runs/<id>/backtest_summary.json` with config/data hashes + drift warnings |
+| `scripts/research.py` | Auto-research loop: `plan`/`launch`/`collect`/`report`/`promote` over `specs/*.yaml`; OOS firewall via tiers + `Runs/<cohort>/registry.jsonl` |
+| `scripts/infer_weights.py` | Audited target weights for a run + as-of date (full provenance; no broker) |
+| `scripts/paper_trade.py` | Measurement-only paper-trading helper over `infer_weights` outputs |
 | `scripts/run_seed_ensemble.sh` | Multi-seed training + ensemble backtest |
 | `scripts/migrate_runs_layout.py` | Move legacy `models/`, `plots/`, … into `Runs/<id>/` |
 | `rlbot/baselines.py` | SPY B&H, equal-weight, 60/40, naive risk parity |
@@ -176,19 +185,21 @@ Passive benchmarks use **simple-return** cross-sectional aggregation, then compo
 
 Calendar flags are passed on `train.py` / `scripts/modal_app.py` and stored in `Runs/<run_id>/manifest.json`. Use `--window` or an explicit `--run-id` per cohort.
 
+The canonical window table (enforced for research specs by `rlbot/research/spec.py:CANONICAL_WINDOWS`): window *N* trains through Dec-31 of `2013 + 2N` and holds out the following two calendar years.
+
 | Window | Train through | OOS holdout | Example `run_id` |
 |--------|---------------|-------------|------------------|
 | 1 | 2015-12-31 | 2016–2017 | `W1_605` (current); `W1_604` (legacy local) |
 | 2 | 2017-12-31 | 2018–2019 | `W2_605` |
-| 3 | 2019-12-31 | 2020–H1 2021 | `W3_605` |
-| 4 | 2021-06-30 | 2021 H2–2022 | `W4_605` |
-| 5 | 2022-12-31 | 2023–2024 | `W5_605` |
-| 6 | 2024-12-31 | 2025–latest | `W6_605` |
+| 3 | 2019-12-31 | 2020–2021 | `W3_605` |
+| 4 | 2021-12-31 | 2022–2023 | `W4_605` |
+| 5 | 2023-12-31 | 2024–2025 | `W5_605` |
+| 6 | 2025-12-31 | 2026–2027 | `W6_605` |
 
 Exact `--train-end` / `--holdout-*` / `--until` lines, Modal commands, and OOS results: [docs/RESEARCH.md](docs/RESEARCH.md#walk-forward-registry).
 
 ```bash
-python scripts/backtest.py --run-id W1_604 --checkpoint both --detailed
+python scripts/backtest.py --run-id W1_604 --checkpoint best --detailed
 ```
 
 ---
@@ -198,14 +209,15 @@ python scripts/backtest.py --run-id W1_604 --checkpoint both --detailed
 | Path | Role |
 |------|------|
 | `config/config.yaml` | Universe, PPO, reward, costs, curriculum |
-| `rlbot/` | Library: `data_utils`, `trading_env`, `rl_config`, `run_artifacts`, `inference_load`, `visualize`, `baselines`, `modal_cloud` |
-| `scripts/` | `train.py`, `backtest.py`, `modal_app.py` (Modal train + sync), `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
+| `rlbot/` | Library: `data_utils`, `trading_env`, `rl_config`, `run_artifacts`, `inference_load`, `visualize`, `baselines`, `modal_cloud`, `research/` (spec/gates/registry/report) |
+| `scripts/` | `train.py`, `backtest.py`, `research.py`, `infer_weights.py`, `paper_trade.py`, `modal_app.py` (Modal train + sync), `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
+| `specs/` | Pre-registered experiment specs for the auto-research loop |
 | `Runs/<run_id>/` | `manifest.json`, `config.yaml`, `models/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/` |
+| `paper_trade/` | Measurement-only paper-trade docs (no broker integration) |
 | `docs/TRAINING.md` | Local operations guide |
 | `docs/MODAL.md` | Modal setup, GPU broker, watch/pull workflow |
 | `docs/RESEARCH.md` | Methodology + completed-run results |
 | `tests/` | `pytest` |
-| `execution/` | Reserved for future broker integration |
 
 **Modal artifacts:** During cloud training, the full run tree lives on the `rlbot-runs` volume. Local `Runs/<id>/` is populated by `python scripts/modal_app.py sync` (`--watch` for plots only; `--pull-all` for models and everything else).
 

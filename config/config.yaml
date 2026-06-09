@@ -40,6 +40,10 @@ reward:
   max_step_log_return_downside: -0.12
   risk_window: 63
   sortino_min_steps: 20
+  # Floor on downside deviation in the Sortino ratio, in daily-return units (0.001 =
+  # 10 bp/day). The old 1e-4 floor let any no-loss window (e.g. ~90% cash + carry)
+  # saturate the ±3 clipped differential — a quasi-binary +risk_bonus_scale*3 exploit.
+  sortino_downside_floor: 0.001
   risk_bonus_scale: 25.0
   # Cap-weighted passive benchmark for Sortino differential (same order as universe.assets keys)
   benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
@@ -132,7 +136,11 @@ curriculum:
 data:
   since: "2005-01-01"
   fracdiff_d: 0.4
-  feature_purge_warmup: 25  # neutralize first N bars at each joined train/eval segment
+  feature_purge_warmup: 25  # neutralize first N bars only where preroll history is unavailable (panel head)
+  # Causal warmup history recomputed per segment in independent mode (sliced off after
+  # feature computation) so EMA-100/MACD/fracdiff are not dominated by truncation
+  # transients inside 126-bar eval blocks.
+  feature_preroll_bars: 252
   # "continuous" (default): features precomputed on the contiguous panel then sliced
   #   into train/eval blocks (matches continuous backtest memory; purge NOT applied).
   # "independent": recompute features per segment + apply feature_purge_warmup, so the
