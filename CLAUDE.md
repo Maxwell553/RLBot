@@ -44,6 +44,7 @@ python scripts/research.py launch specs/x.yaml --backend modal --modal-gpu H100 
 python scripts/research.py screen specs/x.yaml --keep-top 0.25  # tier-1 grid screen (halving)
 python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (no tier ≥4)
 python scripts/research.py report feature_split_ab
+python scripts/research.py report --all                         # cross-cohort memory + knob sensitivity
 
 # Audited target weights for a run (provenance-rich; measurement only, no broker)
 python scripts/infer_weights.py --run-id <RUN_ID> --checkpoint best --as-of 2022-12-31

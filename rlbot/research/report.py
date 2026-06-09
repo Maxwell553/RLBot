@@ -140,3 +140,111 @@ def _group(records: Iterable[Mapping]) -> dict[str, list[Mapping]]:
     for r in records:
         by_group.setdefault(_group_key(r), []).append(r)
     return by_group
+
+
+# ── Cross-cohort memory: global aggregation + knob sensitivity ────────────
+
+
+def knob_sensitivity(records: Iterable[Mapping]) -> dict[str, list[dict]]:
+    """Per patched config key: how does eval NAV move with the knob's value?
+
+    Groups scored records by (cohort, key, value) using the concrete ``patch``
+    carried on each record, and reports the median best_eval_nav per value plus
+    its delta vs the cohort-wide median (a cheap normalization so cohorts trained
+    under different budgets/windows can sit in one table). This is the input a
+    hypothesis proposer reads: which knobs have moved the needle, where, and by
+    how much. Tier-1 (smoke/screen) rows are excluded.
+    """
+    scored = [
+        r for r in records
+        if _is_scored(r)
+        and int(r.get("evaluation_tier", 0)) >= 2
+        and r.get("best_eval_nav") is not None
+    ]
+    cohort_navs: dict[str, list[float]] = {}
+    for r in scored:
+        cohort_navs.setdefault(str(r.get("cohort")), []).append(float(r["best_eval_nav"]))
+    cohort_median = {c: statistics.median(v) for c, v in cohort_navs.items()}
+
+    cells: dict[tuple[str, str, str], list[float]] = {}
+    for r in scored:
+        patch = r.get("patch") or {}
+        if not isinstance(patch, Mapping):
+            continue
+        for key, value in patch.items():
+            cells.setdefault(
+                (str(key), str(r.get("cohort")), repr(value)), []
+            ).append(float(r["best_eval_nav"]))
+
+    out: dict[str, list[dict]] = {}
+    for (key, cohort, value), navs in sorted(cells.items()):
+        med = statistics.median(navs)
+        out.setdefault(key, []).append(
+            {
+                "cohort": cohort,
+                "value": value,
+                "n_runs": len(navs),
+                "median_best_eval_nav": med,
+                "delta_vs_cohort_median": med - cohort_median.get(cohort, med),
+            }
+        )
+    return out
+
+
+def write_global_report(
+    cohorts: Mapping[str, list[Mapping]],
+    cohort_meta: Mapping[str, Mapping],
+    path: str | Path,
+) -> Path:
+    """All-cohort view: per-cohort summary with parent lineage + the cross-cohort
+    knob-sensitivity table. ``cohorts`` maps cohort id → its registry records;
+    ``cohort_meta`` maps cohort id → its cohort.json dict (may be empty)."""
+    lines = [
+        "# Research memory — all cohorts",
+        "",
+        "Generated from Runs/*/registry.jsonl — do not edit by hand.",
+        "",
+        "| cohort | parent | hypothesis | records | groups | tier(max) | OOS reads |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    all_records: list[Mapping] = []
+    for cohort in sorted(cohorts):
+        records = cohorts[cohort]
+        all_records.extend(records)
+        meta = cohort_meta.get(cohort) or {}
+        groups = _group(records)
+        tiers = [int(r.get("evaluation_tier", 0)) for r in records] or [0]
+        oos_reads = sum(
+            1 for r in records
+            if int(r.get("evaluation_tier", 0)) >= 4
+            and str(r.get("status", "ok")) == "oos_read_attempt"
+        )
+        hyp = str(meta.get("hypothesis") or next(
+            (r.get("hypothesis") for r in records if r.get("hypothesis")), ""
+        ))[:60]
+        lines.append(
+            f"| {cohort} | {meta.get('parent') or '—'} | {hyp} | {len(records)} | "
+            f"{len(groups)} | {max(tiers)} | {oos_reads} |"
+        )
+
+    lines += ["", "## Knob sensitivity (median best_eval_nav by patched value)", ""]
+    sens = knob_sensitivity(all_records)
+    if not sens:
+        lines.append("_No scored records with patches yet._")
+    else:
+        lines += [
+            "| config key | cohort | value | runs | median NAV | Δ vs cohort median |",
+            "|---|---|---|---|---|---|",
+        ]
+        for key in sorted(sens):
+            for cell in sens[key]:
+                lines.append(
+                    f"| {key} | {cell['cohort']} | {cell['value']} | {cell['n_runs']} | "
+                    f"{_fmt(cell['median_best_eval_nav'])} | "
+                    f"{cell['delta_vs_cohort_median']:+.2f} |"
+                )
+    lines.append("")
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out

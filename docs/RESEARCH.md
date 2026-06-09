@@ -50,6 +50,8 @@ python scripts/research.py promote specs/reward_ablation.yaml --variant <id> --p
 
 **Backends & throughput:** `launch --backend modal --modal-gpu H100` trains each variant on Modal (variant config pushed to the runs volume first; run tree pulled back before collect); `spec.budget.max_modal_hours` is enforced as a per-variant wall-clock cap on both backends. `research.py run-queue` drains `Runs/queue/*.yaml` sequentially (launch → report → move to `done/`/`failed/`) and **refuses tier ≥ 4 specs** — promotion stays a human action. `research.py screen <spec> --screen-timesteps 2000000 --keep-top 0.25` runs every grid combo at tier 1 with a tiny budget and writes `screen_ranking.json` naming the top fraction to advance to a full-tier launch under a new spec id (successive halving; never touches the holdout).
 
+**Cross-cohort memory:** `research.py report --all` aggregates every `Runs/*/registry.jsonl` into `Runs/research_report_all.md`: per-cohort summaries with `parent` lineage, holdout-read counts, and a **knob-sensitivity table** (median best-eval-NAV per patched config value, normalized as a delta vs its cohort's median). This is the registry-as-memory view a hypothesis proposer reads before writing the next spec.
+
 The OOS firewall: tiers 1–3 never touch the holdout; tier ≥ 4 requires `--promote`, is budgeted (`--oos-budget`, default 1 read per launch), and every holdout read is written to the registry **before** it happens — a variant with a recorded tier-4 read cannot be re-scored (`--allow-failed-rescore` only retries crashed, never-scored reads). Published OOS numbers carry the cohort's variant count; interpret them with that multiplicity in mind.
 
 ---

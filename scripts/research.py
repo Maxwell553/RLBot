@@ -474,11 +474,33 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 def cmd_report(args: argparse.Namespace) -> None:
+    if getattr(args, "all", False) or args.cohort == "--all":
+        return cmd_report_all(args)
+    if not args.cohort:
+        raise SystemExit("report needs a cohort id or --all")
     cohort = args.cohort
     records = registry.read_records(_registry_path(cohort))
     out = _cohort_dir(cohort) / "report.md"
     report.write_report(records, out, title=f"Research cohort: {cohort}")
     print(f"[research] wrote {out} ({len(records)} records)")
+
+
+def cmd_report_all(args: argparse.Namespace) -> None:
+    """Cross-cohort memory: every Runs/*/registry.jsonl in one report, with parent
+    lineage and per-knob sensitivity — the input a hypothesis proposer reads."""
+    runs_root = PROJECT_ROOT / "Runs"
+    cohorts: dict[str, list[dict]] = {}
+    cohort_meta: dict[str, dict] = {}
+    for reg in sorted(runs_root.glob("*/registry.jsonl")):
+        cohort = reg.parent.name
+        cohorts[cohort] = registry.read_records(reg)
+        cohort_meta[cohort] = _read_json(reg.parent / "cohort.json") or {}
+    if not cohorts:
+        print(f"[research] no registries under {runs_root}")
+        return
+    out = report.write_global_report(cohorts, cohort_meta, runs_root / "research_report_all.md")
+    n = sum(len(v) for v in cohorts.values())
+    print(f"[research] wrote {out} ({len(cohorts)} cohort(s), {n} record(s))")
 
 
 def cmd_promote(args: argparse.Namespace) -> None:
@@ -776,7 +798,11 @@ def main() -> None:
     ss.add_argument("--backend", default="local", choices=("local", "modal"))
     ss.add_argument("--modal-gpu", default=None)
     ss.set_defaults(func=cmd_screen)
-    sr = sub.add_parser("report"); sr.add_argument("cohort"); sr.set_defaults(func=cmd_report)
+    sr = sub.add_parser("report")
+    sr.add_argument("cohort", nargs="?", default="")
+    sr.add_argument("--all", action="store_true",
+                    help="aggregate every Runs/*/registry.jsonl: lineage + knob sensitivity")
+    sr.set_defaults(func=cmd_report)
     spm = sub.add_parser("promote")
     spm.add_argument("spec")
     spm.add_argument("--variant", required=True)

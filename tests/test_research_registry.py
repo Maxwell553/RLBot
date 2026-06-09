@@ -478,3 +478,60 @@ def test_materialize_refuses_edited_spec_over_trained_cohort(tmp_path: Path, mon
     edited = research.load_spec(spec_path)
     with pytest.raises(SystemExit, match="NEW spec id"):
         research._materialize(edited)
+
+
+# ── Phase D: cross-cohort memory ─────────────────────────────────────────
+def test_knob_sensitivity_groups_by_key_and_value() -> None:
+    from rlbot.research.report import knob_sensitivity
+
+    records = [
+        {"cohort": "c1", "status": "ok", "evaluation_tier": 3, "best_eval_nav": 100.0,
+         "patch": {"reward.reward_scale": 1000}},
+        {"cohort": "c1", "status": "ok", "evaluation_tier": 3, "best_eval_nav": 140.0,
+         "patch": {"reward.reward_scale": 2000}},
+        {"cohort": "c2", "status": "ok", "evaluation_tier": 3, "best_eval_nav": 90.0,
+         "patch": {"reward.reward_scale": 2000}},
+        # tier-1 screen evidence and unscored rows never enter sensitivity
+        {"cohort": "c1", "status": "ok", "evaluation_tier": 1, "best_eval_nav": 999.0,
+         "patch": {"reward.reward_scale": 1000}},
+        {"cohort": "c1", "status": "failed", "evaluation_tier": 3, "best_eval_nav": 0.0,
+         "patch": {"reward.reward_scale": 1000}},
+    ]
+    sens = knob_sensitivity(records)
+    cells = sens["reward.reward_scale"]
+    assert {(c["cohort"], c["value"]) for c in cells} == {
+        ("c1", "1000"), ("c1", "2000"), ("c2", "2000")
+    }
+    c1_2000 = next(c for c in cells if c["cohort"] == "c1" and c["value"] == "2000")
+    # c1 cohort median = median(100, 140) = 120 → delta +20
+    assert c1_2000["delta_vs_cohort_median"] == pytest.approx(20.0)
+
+
+def test_global_report_lists_lineage_and_sensitivity(tmp_path: Path) -> None:
+    from rlbot.research.report import write_global_report
+
+    cohorts = {
+        "child": [
+            {"cohort": "child", "variant_id": "child__seed1", "group_id": "child",
+             "run_id": "child__seed1", "seed": 1, "status": "ok",
+             "evaluation_tier": 3, "best_eval_nav": 110.0,
+             "patch": {"reward.churn_penalty": 0.5}, "hypothesis": "less churn helps"},
+        ],
+        "base": [
+            {"cohort": "base", "variant_id": "base__seed1", "group_id": "base",
+             "run_id": "base__seed1", "seed": 1, "status": "ok",
+             "evaluation_tier": 4, "best_eval_nav": 100.0, "patch": {},
+             "hypothesis": "baseline"},
+            {"cohort": "base", "variant_id": "base__seed1", "group_id": "base",
+             "run_id": "base__seed1", "seed": 1, "status": "oos_read_attempt",
+             "evaluation_tier": 4, "best_eval_nav": None, "patch": {}},
+        ],
+    }
+    meta = {"child": {"parent": "base", "hypothesis": "less churn helps"},
+            "base": {"parent": None, "hypothesis": "baseline"}}
+    out = write_global_report(cohorts, meta, tmp_path / "all.md")
+    text = out.read_text(encoding="utf-8")
+    assert "| child | base |" in text          # lineage column
+    assert "| base | — |" in text
+    assert "reward.churn_penalty" in text      # sensitivity table
+    assert "| base | — | baseline | 2 | 1 | 4 | 1 |" in text  # OOS read counted
