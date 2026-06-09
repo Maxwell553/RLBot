@@ -208,10 +208,13 @@ class DataConfig:
     feature_purge_warmup: int
     # "continuous": features precomputed on the contiguous panel then sliced into
     #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
-    # "independent" (default): features recomputed per segment over a causal preroll
-    #   window of feature_preroll_bars earlier bars (sliced off after computation) so
-    #   slow indicators get real warmup; only panel-head bars with insufficient preroll
-    #   are neutralized via feature_purge_warmup.
+    # "independent" (default): features recomputed per segment over a BOUNDED causal
+    #   preroll window of feature_preroll_bars earlier bars (sliced off after
+    #   computation) so slow indicators get real warmup with uniform history depth at
+    #   every segment head. The preroll bars are the adjacent train blocks, so this is
+    #   NOT train/eval feature isolation — vs continuous it differs mainly in
+    #   fracdiff's long tail. Panel-head bars with insufficient preroll are
+    #   neutralized via feature_purge_warmup.
     feature_split_mode: str = "independent"
     feature_preroll_bars: int = 252
 

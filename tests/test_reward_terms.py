@@ -61,7 +61,7 @@ def test_inactivity_penalty_at_full_cash_matches_config() -> None:
     expected = cash_frac * rwd.inactivity_penalty_over_50
     expected += ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90
     assert info["rew_decomp/inactivity"] == pytest.approx(-expected, rel=1e-9)
-    # with the shipped config this is the full -(10 + 15) at 100% cash
+    # with the shipped config this is the full -(1.35 + 0.9) at 100% cash
     assert info["rew_decomp/inactivity"] == pytest.approx(
         -(rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90), abs=1e-6
     )

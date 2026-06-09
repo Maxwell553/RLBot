@@ -103,7 +103,7 @@ def _materialize(spec: ExperimentSpec) -> dict:
     return cohort_manifest
 
 
-def _train_cmd(entry: dict, spec: ExperimentSpec) -> list[str]:
+def _train_cmd(entry: dict, spec: ExperimentSpec, overwrite_run: bool = False) -> list[str]:
     cmd = [
         sys.executable,
         str(REPO / "scripts" / "train.py"),
@@ -115,6 +115,10 @@ def _train_cmd(entry: dict, spec: ExperimentSpec) -> list[str]:
         str(entry["seed"]),
         "--no-viz",
     ]
+    if overwrite_run:
+        # Deliberate retry of a crashed/failed (never-scored) variant: train.py's
+        # run-dir guard would otherwise refuse the deterministic run id forever.
+        cmd.append("--overwrite-run")
     if spec.timesteps:
         cmd += ["--timesteps", str(spec.timesteps)]
     w = entry.get("window") or {}
@@ -155,7 +159,13 @@ def _collect_one(cm: dict, entry: dict, *, tier: int, status: str = "ok",
     manifest = read_run_manifest(run_id)
     rp = RunPaths(run_id)
     training_summary = _read_json(rp.run_meta_dir / "training_summary.json")
-    backtest_summary = _read_json(rp.run_meta_dir / "backtest_summary.json")
+    # A pre-read attempt record must never look scored: a stale backtest_summary.json
+    # (e.g. a hand-run backtest) would otherwise flatten OOS metrics into a record
+    # whose status says the read has not happened yet.
+    backtest_summary = (
+        None if status == "oos_read_attempt"
+        else _read_json(rp.run_meta_dir / "backtest_summary.json")
+    )
     return registry.build_record(
         cohort=cm["cohort"],
         variant_id=entry["variant_id"],
@@ -206,7 +216,13 @@ def cmd_launch(args: argparse.Namespace) -> None:
             continue
         if touches_oos:
             gates.assert_no_repeat_oos(existing, e["variant_id"])
-        train = _train_cmd(e, spec)
+        # A leftover run dir here means a prior attempt crashed or failed (scored
+        # variants were skipped above) — retry must overwrite, not brick the relaunch.
+        stale_run_dir = RunPaths(e["run_id"]).manifest_path.is_file()
+        if stale_run_dir:
+            print(f"[research] [{n}/{len(variants)}] {e['run_id']}: stale unscored run dir "
+                  "from a previous attempt; retraining with --overwrite-run.")
+        train = _train_cmd(e, spec, overwrite_run=stale_run_dir)
         bt = _backtest_cmd(e) if touches_oos else None
         if args.dry_run:
             print("DRY-RUN train:", " ".join(train))

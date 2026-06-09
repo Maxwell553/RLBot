@@ -35,10 +35,20 @@ done
 
 for SEED in $SEEDS; do
   RUN_ID="${COHORT}_seed_${SEED}"
+  if [[ -f "Runs/${RUN_ID}/training_summary.json" ]]; then
+    echo "========== seed ${SEED} | run-id ${RUN_ID} already trained; skipping =========="
+    continue
+  fi
+  EXTRA_FLAGS=()
+  if [[ -f "Runs/${RUN_ID}/manifest.json" ]]; then
+    echo "(stale crashed run dir for ${RUN_ID} — retraining with --overwrite-run)"
+    EXTRA_FLAGS+=(--overwrite-run)
+  fi
   echo "========== seed ${SEED} | run-id ${RUN_ID} =========="
   "$PY" scripts/train.py \
     --seed "$SEED" \
     --run-id "$RUN_ID" \
+    ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     "${EXTRA[@]}"
 done
 

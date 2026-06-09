@@ -28,7 +28,7 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 | In-training eval | One deterministic rollout **per eval segment** (~# of 126-bar eval blocks) |
 | Reward logging | `RewardDecompCallback` → TB `rew_decomp/*` + `eval_logs/reward_decomp.json` |
 | Early stop | Optional `training.early_stop_patience` (after curriculum completes) |
-| OOS backtest | `obs_lag = 1`, full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
+| OOS backtest | `obs_lag` from the run manifest (else run config default), full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
 | Checkpoint rule | Eval-NAV-best only (`models/best/best_model.zip` + matched `best/vec_normalize.pkl`) |
 
 ### Hyperparameter protocol
@@ -170,7 +170,7 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 **Episodes:** `max_episode_steps: 252` (train); eval = full segment. Early stop if NAV ≤ `stop_loss_fraction` (0.45) × episode-start NAV.
 
-**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. **Eval:** mirrors train fee/churn curriculum (linear ramp); fixed `obs_lag = 1`, no DR. OOS backtest: `obs_lag = 1`, `fee_scale = 1`.
+**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. **Eval:** mirrors train fee/churn curriculum (linear ramp); fixed `obs_lag` (config default), no DR. OOS backtest: `obs_lag` from the run manifest, `fee_scale = 1`.
 
 ### Reward decomposition
 

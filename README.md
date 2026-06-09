@@ -127,7 +127,7 @@ flowchart TB
 - **Observation:** `obs_dim = 10×N + 28` = per-asset market block (fracdiff horizons, vol, RSI, MACD, trend) + **live mask** + portfolio weights + drawdown/progress + 4 macro series (DXY, TNX, VIX, HY OAS; macro is observe-only).
 - **Execution:** features at `t` use `close[t−obs_lag]`; holding cost on pre-rebalance units at `close[t]`; rebalance fill `open[t+1]`; MTM `close[t+1]`.
 - **Episodes:** `max_episode_steps: 252` on training envs; eval uses the full walk-forward segment. Terminates early if NAV ≤ `stop_loss_fraction` (0.45) × episode-start NAV.
-- **Domain randomization (training):** after the fee curriculum releases, each episode resamples `obs_lag` ∈ {0,1,2} and `fee_scale` (Beta-mapped bell around 1.0); bounds widen progressively through the DR phase. **Eval:** mirrors train **fee/churn curriculum** (linear ramp, no DR); OOS backtest: fixed `obs_lag = 1`, `fee_scale = 1`.
+- **Domain randomization (training):** after the fee curriculum releases, each episode resamples `obs_lag` ∈ {0,1,2} and `fee_scale` (Beta-mapped bell around 1.0); bounds widen progressively through the DR phase. **Eval:** mirrors train **fee/churn curriculum** (linear ramp, no DR); OOS backtest: `obs_lag` defaults from the run manifest (`args.obs_lag`, else the run config's `environment.obs_lag_default`), `fee_scale = 1`.
 
 #### Reward & penalties (`config.yaml` → `reward`)
 
@@ -147,7 +147,7 @@ Logged per term in `info` / TensorBoard as `rew_decomp/*` (including `rew_decomp
 | **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |
 | **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant**, never a function of the other terms — a relative cap was reward-hackable) | `24.0` (`0` disables both) |
 
-`tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training and eval `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, fixed `obs_lag = 1`.
+`tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training and eval `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, `obs_lag` defaulted from the run manifest.
 
 #### Transaction costs (`config.yaml` → `transaction_costs`)
 

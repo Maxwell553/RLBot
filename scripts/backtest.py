@@ -44,6 +44,7 @@ from rlbot.data_utils import (
     reserve_chronological_holdout,
 )
 from rlbot.run_artifacts import (
+    check_holdout_window_against_manifest,
     PROJECT_ROOT,
     RUNS_ROOT,
     RunPaths,
@@ -410,34 +411,18 @@ def resolve_oos_holdout(
     )
     test_idx = holdout[0]
 
-    # Cross-check the realized window against what training recorded. For tail-based
-    # (holdout_days) runs especially, the window is recomputed from the CURRENT cache's
-    # last bar — a refreshed/extended cache would silently shift the OOS window away
-    # from what training reserved. Explicit CLI window flags (the documented
-    # cross-window check) downgrade the failure to a loud warning.
-    rec_start_raw, rec_end_raw = ch.get("date_start"), ch.get("date_end")
-    if rec_start_raw and rec_end_raw:
-        rec_start = pd.Timestamp(rec_start_raw).date()
-        rec_end = pd.Timestamp(rec_end_raw).date()
-        got_start, got_end = test_idx[0].date(), test_idx[-1].date()
-        cli_override = any(
-            v is not None
-            for v in (args.train_end, args.holdout_start, args.holdout_end, args.holdout_days)
-        )
-        if (got_start, got_end) != (rec_start, rec_end):
-            msg = (
-                f"OOS window mismatch: training recorded {rec_start}..{rec_end} but this "
-                f"backtest resolved {got_start}..{got_end}. The evaluated holdout is NOT "
-                "the one training reserved (refreshed cache or window overrides)."
-            )
-            if cli_override:
-                print(f"[backtest] WARNING: {msg} (explicit CLI window flags — proceeding)")
-            else:
-                raise ValueError(
-                    msg + " Re-run with the run-local data snapshot, or pass explicit "
-                    "--train-end/--holdout-start/--holdout-end to acknowledge a "
-                    "deliberate cross-window evaluation."
-                )
+    # Cross-check the realized window against what training recorded (see
+    # rlbot.run_artifacts.check_holdout_window_against_manifest). Explicit CLI window
+    # flags (the documented cross-window check) downgrade the failure to a loud warning.
+    cli_override = any(
+        v is not None
+        for v in (args.train_end, args.holdout_start, args.holdout_end, args.holdout_days)
+    ) or bool((getattr(args, "until", "") or "").strip())
+    warn = check_holdout_window_against_manifest(
+        test_idx[0], test_idx[-1], ch, cli_override=cli_override
+    )
+    if warn:
+        print(f"[backtest] WARNING: {warn} (explicit CLI window flags — proceeding)")
 
     if train_end and holdout_start:
         print(
@@ -529,9 +514,11 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             asset_live,
             cache_tickers,
         ) = load_cache(str(cache_path), expected_fracdiff_d=get_config().data.fracdiff_d)
-    panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     n_assets = int(ohlcv.shape[1])
-    _assert_manifest_panel_compatible(manifest, panel_tickers, n_assets)
+    # Compare the manifest against the RAW cache tickers — resolve_panel_tickers
+    # prefers the manifest's own list, which would make the order check tautological.
+    _assert_manifest_panel_compatible(manifest, cache_tickers, n_assets)
+    panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     until = args.until
     if until is None and manifest:
         until = manifest.get("args", {}).get("until")
@@ -824,6 +811,10 @@ def _write_backtest_summary(
     override = (getattr(args, "summary_json", "") or "").strip()
     if override:
         out = Path(override)
+        if getattr(args, "_multi_run_summary", False):
+            # Batch/ensemble: one fixed path would be silently clobbered per run.
+            out = out.with_name(f"{out.stem}_{result.run_id}{out.suffix or '.json'}")
+            print(f"[backtest] NOTE: --summary-json with multiple runs → per-run file {out.name}")
     else:
         label = result.checkpoint_label
         name = "backtest_summary.json" if label == "best" else f"backtest_summary_{label}.json"
@@ -881,9 +872,15 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     if ck in ("best", "both"):
         modes.append(("best", False))
     if ck in ("latest", "both"):
-        modes.append(("latest", True))
+        # Ensemble 'latest' resolves ppo_portfolio_final.zip (run-level final weights),
+        # not the newest step checkpoint like single-run --checkpoint latest — label
+        # the rows by what is actually evaluated.
+        print("[backtest] NOTE: ensemble 'latest' evaluates each run's FINAL model "
+              "(end-of-run weights); rows are labeled 'final'.")
+        modes.append(("final", True))
 
     args._ensemble_mode = True  # type: ignore[attr-defined]
+    args._multi_run_summary = True  # type: ignore[attr-defined]
     if not args.no_viz:
         _bt_log("[backtest] Ensemble mode: per-run plots are skipped (μ±σ table + ensemble_summary.json).")
     args.no_viz = True
@@ -1596,6 +1593,7 @@ def main() -> None:
         run_ids = _parse_run_id_list(args.run_ids)
         if not run_ids:
             raise SystemExit("--run-ids is empty")
+        args._multi_run_summary = len(run_ids) > 1  # type: ignore[attr-defined]
         full_batch = args.detailed or int(args.stochastic_paths) > 0
         if not full_batch:
             args.no_viz = True

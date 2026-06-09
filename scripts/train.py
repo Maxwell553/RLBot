@@ -175,6 +175,15 @@ def _make_env_factory(
             domain_randomize=domain_randomize,
             inactivity_penalty_scale=inactivity_penalty_scale,
         )
+        if domain_randomize:
+            # SB3 resets envs in _setup_learn BEFORE the curriculum callback applies
+            # its pinned pre-ramp bounds, so without this the very first episode per
+            # worker samples fee/lag from the full config DR range. Pin at
+            # construction; the curriculum widens from fee_ramp_end onward.
+            from rlbot.rl_config import get_config as _gc
+
+            _lag = _gc().environment.obs_lag_default
+            env.set_randomization_bounds(1.0, 1.0, _lag, _lag)
         if record_episode_nav:
             return EpisodeEndNavRecorder(env)
         log_dir.mkdir(parents=True, exist_ok=True)

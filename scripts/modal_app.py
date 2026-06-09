@@ -127,11 +127,7 @@ def train_remote(
             else next(a.split("=", 1)[1] for a in train_argv if a.startswith("--n-envs="))
         )
     if _user_passed("--batch-size"):
-        batch_size_override = int(
-            train_argv[train_argv.index("--batch-size") + 1]
-            if "--batch-size" in train_argv
-            else next(a.split("=", 1)[1] for a in train_argv if a.startswith("--batch-size="))
-        )
+        batch_size_override = int(_flag_value("--batch-size"))
     cmd = [
         sys.executable,
         "scripts/train.py",

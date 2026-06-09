@@ -153,7 +153,11 @@ data:
   feature_preroll_bars: 252
   # "continuous": features precomputed on the contiguous panel then sliced into
   #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
-  # "independent" (default): recompute features per segment over a causal preroll
-  #   window, so the eval-selection signal is not feature-state-contaminated by
-  #   adjacent train blocks; only panel-head bars with insufficient preroll are purged.
+  # "independent" (default): recompute features per segment over a BOUNDED causal
+  #   preroll window (uniform history depth at every segment head, vs continuous's
+  #   unbounded panel memory). NOTE: the preroll bars ARE the adjacent train blocks,
+  #   so short-memory indicators (RSI-14/MACD-26/EMA-100/vol-20) match continuous
+  #   bit-for-bit once preroll covers their memory — the modes differ mainly in
+  #   fracdiff's long tail and in head-of-panel handling, not in train/eval isolation.
+  #   Only panel-head bars with insufficient preroll are purged.
   feature_split_mode: independent

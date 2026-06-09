@@ -4,6 +4,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:  # manual trigger for the torch job below
+  schedule:
+    - cron: "17 6 * * 1"  # weekly torch job (Mondays 06:17 UTC)
 
 jobs:
   torch-free-tests:

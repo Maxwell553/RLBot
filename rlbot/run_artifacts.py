@@ -276,3 +276,48 @@ def git_provenance(root: Path = PROJECT_ROOT) -> dict[str, Any]:
         "git_commit": commit,
         "git_dirty": bool(status) if status is not None else None,
     }
+
+
+def check_holdout_window_against_manifest(
+    got_start,
+    got_end,
+    chronological_holdout: dict | None,
+    *,
+    cli_override: bool = False,
+) -> str | None:
+    """Cross-check a resolved OOS window against the training manifest's recorded one.
+
+    ``got_start``/``got_end`` are the first/last resolved holdout timestamps (anything
+    ``pd.Timestamp`` accepts). Returns ``None`` when the windows match (or the manifest
+    recorded no dates). On mismatch: raises ``ValueError`` unless ``cli_override``
+    (explicit window flags = a deliberate cross-window evaluation), in which case the
+    warning text is returned for the caller to print.
+
+    Tail-based (``holdout_days``) runs recompute their window from the CURRENT cache's
+    last bar — a refreshed/extended cache silently shifts the OOS window away from
+    what training reserved; this check is what makes that loud.
+    """
+    import pandas as pd
+
+    ch = chronological_holdout or {}
+    rec_start_raw, rec_end_raw = ch.get("date_start"), ch.get("date_end")
+    if not rec_start_raw or not rec_end_raw:
+        return None
+    rec_start = pd.Timestamp(rec_start_raw).date()
+    rec_end = pd.Timestamp(rec_end_raw).date()
+    got_start_d = pd.Timestamp(got_start).date()
+    got_end_d = pd.Timestamp(got_end).date()
+    if (got_start_d, got_end_d) == (rec_start, rec_end):
+        return None
+    msg = (
+        f"OOS window mismatch: training recorded {rec_start}..{rec_end} but this "
+        f"backtest resolved {got_start_d}..{got_end_d}. The evaluated holdout is NOT "
+        "the one training reserved (refreshed cache or window overrides)."
+    )
+    if cli_override:
+        return msg
+    raise ValueError(
+        msg + " Re-run with the run-local data snapshot, or pass explicit "
+        "--train-end/--holdout-start/--holdout-end to acknowledge a "
+        "deliberate cross-window evaluation."
+    )

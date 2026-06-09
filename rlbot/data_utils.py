@@ -1211,8 +1211,9 @@ def load_cache(
     if "prices_adjusted" not in z.files or not bool(np.asarray(z["prices_adjusted"]).ravel()[0]):
         print(
             f"[data] WARNING: cache {path} predates the total-return switch "
-            "(price-return OHLC: ETF dividends/coupons missing). Rebuild with "
-            "--refresh-data before training or publishing numbers."
+            "(price-return OHLC: ETF dividends/coupons missing). For NEW training or "
+            "published numbers, rebuild with --refresh-data; for reproducing an old "
+            "run's OOS numbers from its snapshot this is expected — do not rebuild."
         )
     if "tickers" in z.files:
         tickers = [str(x) for x in z["tickers"].tolist()]
