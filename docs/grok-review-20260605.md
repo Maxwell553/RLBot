@@ -1,6 +1,6 @@
 # Grok Review: RLBot / MarketTrainer — 2026-06-05
 
-> **Status (2026-06-08):** Historical snapshot. Agent docs refreshed; `infer_weights.py` + auto-research loop shipped; `paper_trade/` removed. See [README.md](../README.md) and [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md).
+> **Status (2026-06-09):** Historical snapshot. Agent docs refreshed; `infer_weights.py` + auto-research loop shipped; `paper_trade/` removed. **Current pipeline:** `independent` features (default), benchmark excess + Sortino cap, cap **0.25**, aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. See [README.md](../README.md) and [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md).
 
 **Reviewer:** Grok 4.3 (xAI)  
 **Date:** 2026-06-05  

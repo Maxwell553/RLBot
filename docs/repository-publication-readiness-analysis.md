@@ -1,20 +1,22 @@
 # Repository Analysis and Publication Readiness Audit
 
-Date: 2026-06-08
+Date: 2026-06-08 (updated 2026-06-09 for current benchmark-relative reward pipeline)
 
 Scope: this audit reviewed the repository code, tests, `README.md`, `config/README.md`, `docs/MODAL.md`, `docs/RESEARCH.md`, and `docs/TRAINING.md`. It intentionally did not use prior model review documents in `docs/`.
+
+> **Pipeline update (2026-06-09):** Default `feature_split_mode: independent`; cap **`max_single_asset_weight: 0.25`**; benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_relative_max_share: 0.6`**); train **and eval** share the fee/churn curriculum; `models/best/` saves are gated until `fee_ramp_end`. Runs are comparable only after checking their snapshotted `Runs/<id>/config.yaml`.
 
 ## Executive Summary
 
 MarketTrainer/RLBot is a serious research codebase rather than a toy trading environment. Its strongest properties are the config-driven environment, explicit chronological OOS separation, run-local config/cache snapshots, dynamic universe sizing, asset live masks, frozen inference normalization, and a growing test suite around the most important invariants. The repository is already much closer to a paper-supporting experimental platform than most reinforcement-learning trading projects.
 
-It is not publication ready yet. The most important blockers are not just missing OOS results. There are several validity and reproducibility issues that should be fixed before any results are trusted:
+It is not publication ready yet, but the original validity blockers from this audit have mostly been fixed. Current blockers are now methodological rather than basic plumbing:
 
-- The eval-selected `best_model.zip` is paired with end-of-training `VecNormalize` statistics rather than the observation statistics from the best-eval step.
-- Backtest and inference weight collection ignore action smoothing, so plotted weights and `infer_weights.py` target weights can differ from the actual executed policy.
-- `--n-assets` can train on a sliced universe while snapshotting an unsliced cache, causing backtest incompatibility unless data was refreshed under the sliced config.
-- Resume behavior is closer to fine-tuning than crash-resume because curriculum and adaptive entropy callbacks are skipped when `--resume` is set.
-- Verification could not be completed in the current shell because `gymnasium` is not installed.
+- no definitive, pre-registered OOS result table under the current config;
+- no full seed-cohort distribution across all walk-forward windows;
+- no paper-grade ablation table for benchmark excess, Sortino, feature split, action cap, transaction costs, and recurrent-vs-feed-forward policy;
+- no dependency lockfile or pinned container image for exact long-run reproduction;
+- no point-in-time institutional data or capacity/market-impact model.
 
 The environment-design paper is plausible, but it should be framed around the environment, leakage controls, reproducibility protocol, and benchmarked empirical behavior only after a fresh, pre-registered run set is completed under the current pipeline.
 
@@ -37,7 +39,7 @@ The core data design is thoughtful:
 
 - `reserve_chronological_holdout()` removes OOS data before in-training train/eval splitting.
 - Backtest requires a run manifest and defaults to the run-local config and cache snapshot.
-- Feature split modes are explicit: `continuous` for contiguous-memory eval and `independent` for per-segment recomputation plus warmup neutralization.
+- Feature split modes are explicit: **`independent`** (default — per-segment recompute + warmup purge) and `continuous` (contiguous-memory eval / backtest ablation).
 - The trading environment executes at `open[t+1]` after observing lagged market features, which avoids a common close-to-close look-ahead shortcut.
 - `VecNormalize` is frozen for inference through `rlbot.vecnorm_utils` and `rlbot.inference_load`.
 
@@ -85,93 +87,37 @@ The backtest script includes:
 
 Reward decomposition is also logged during training, which will be valuable for diagnosing whether reward shaping dominates real returns.
 
-## Critical Issues To Fix Before Trusting Results
+## Publication-Critical Implementation Status
 
-### 1. Best Model Uses Mismatched VecNormalize Statistics
+### 1. Best Model Uses Matched VecNormalize Statistics
 
-`EvalNavBestModelCallback` saves only the model weights when eval NAV improves. At training exit, `_persist_trade_artifacts()` saves the final `VecNormalize` state and copies that final state next to `best_model.zip`.
+**Status:** fixed. `EvalNavBestModelCallback` saves `best/vec_normalize.pkl` alongside `best_model.zip` whenever eval NAV improves after the best-model gate opens (`fee_ramp_end` by default). Backtest requires the matched pair by default.
 
-Relevant code:
+Historical note: the original audit described mismatched VecNormalize pairing at final save time; that path now saves matched pairs at each best-eval step.
 
-- `scripts/train.py`: eval callback saves best weights around lines 1185-1197.
-- `scripts/train.py`: final `VecNormalize` copied next to best around lines 1257-1262.
+### 2. Target Weight Inference Uses Executed Smoothed Weights
 
-Why this matters: the selected best weights may come from much earlier than the final training step. Pairing those weights with end-of-run observation normalization can change the policy input distribution at inference. This breaks the meaning of "eval-NAV-best" and can contaminate OOS metrics.
+**Status:** fixed. `MultiAssetPortfolioEnv.step()` emits `info["target_weights"]` after EMA smoothing, live masking, softmax, and cap projection. Backtest/inference collect those executed weights rather than mapping raw policy logits.
 
-Recommended fix:
+Regression coverage: `tests/test_publication_fixes.py` checks that reported weights differ from raw-logit mapping when smoothing is enabled and that backtest source collects `info.get("target_weights")`.
 
-- When a new best eval NAV is found, save both `best_model.zip` and a synchronized snapshot of the training `VecNormalize` stats at that exact step.
-- In backtest, require that `best_model.zip` and `best/vec_normalize.pkl` are a matched pair.
-- Add a test that a best-eval event writes both artifacts.
+### 3. `--n-assets` Snapshots The Effective Panel
 
-### 2. Target Weight Inference Ignores Action Smoothing
+**Status:** fixed for the current pipeline. Training writes the effective selected **N**-wide panel to `Runs/<run_id>/data_cache.npz`; backtest binds that run-local cache by default and checks manifest/cache compatibility.
 
-`rollout_policy_on_slice()` records weights by applying `portfolio_weights_from_action()` to the raw policy action before calling `raw_env.step(action)`. But `MultiAssetPortfolioEnv.step()` first applies EMA smoothing to the raw action and only then maps the smoothed logits to weights.
+Operational caveat: after changing `--n-assets` or editing `universe.assets`, still run `--refresh-data` for a clean global cache and a new run id. Run-local snapshots protect backtests, but stale global caches make experimentation harder to reason about.
 
-Relevant code:
+### 4. Crash Resume Is Separate From Fine-Tune
 
-- `scripts/backtest.py`: collected weights from raw action around lines 979-987.
-- `rlbot/trading_env.py`: smoothing occurs inside `step()` before weight construction.
+**Status:** fixed. `--resume` and `--finetune` are mutually exclusive. Crash resume restores weights + VecNormalize and continues curriculum/adaptive-entropy behavior from the checkpoint timestep; fine-tune is the explicit experimental mode with lower LR/entropy/clip and skipped curriculum callbacks.
 
-Why this matters: plotted weights and `scripts/infer_weights.py` target weights can be different from the actual weights traded by the environment. This is especially serious because `infer_weights.py` is presented as audited target-weight output.
+### 5. VecNormalize Required For Publication Backtests
 
-Recommended fix:
+**Status:** fixed. Run-id OOS backtests require VecNormalize stats by default. `--allow-missing-vec-normalize` is an explicit debug escape hatch.
 
-- Add executed target weights to `info`, for example `info["target_weights"] = w.copy()`.
-- In `rollout_policy_on_slice()`, collect `info["target_weights"]` after `step()`, not the raw pre-step mapping.
-- Add a regression test with `action_smoothing_alpha > 0` showing collected weights match executed weights.
+### 6. Manifest Holdout Metadata Is Preserved
 
-### 3. `--n-assets` Can Snapshot The Wrong Cache
-
-Training can slice a larger cached panel down to the first N configured assets, but `snapshot_data_cache(data_cache, paths.data_snapshot)` copies the original cache file rather than the selected/sliced arrays.
-
-Relevant code:
-
-- `scripts/train.py`: cache snapshot happens at line 789 after possible in-memory slicing.
-- `scripts/backtest.py`: backtest loads the run snapshot and checks `ohlcv.shape[1]` around lines 468-485.
-
-Failure mode: if a 10-asset cache exists and training is launched with `--n-assets 5` without `--refresh-data`, training can proceed on a 5-asset in-memory panel, but the run-local `data_cache.npz` remains 10 assets. Backtest then sees manifest `n_assets=5` and cache width 10, causing incompatibility.
-
-Recommended fix:
-
-- Save the effective selected panel as the run-local cache snapshot, not a byte copy of the source cache.
-- Alternatively, after loading a cache with a superset universe, backtest should select manifest tickers from cache tickers before compatibility checks.
-- Add a test for `--n-assets` with an existing superset cache.
-
-### 4. Crash Resume Skips Curriculum and Entropy Scheduling
-
-When `--resume` is set, training loads a checkpoint and changes LR, entropy, and clip range for fine-tuning. It also skips `TradingCurriculumCallback` and `AdaptiveEntropyCallback`.
-
-Relevant code:
-
-- `scripts/train.py`: resume branch around lines 1100-1125.
-- `scripts/train.py`: curriculum and adaptive entropy are only added when `not args.resume`, lines 1211-1231.
-
-Why this matters: `docs/MODAL.md` describes resume as a way to continue interrupted training. The implementation behaves more like a different fine-tuning mode. A Modal preemption resume may therefore change the training distribution and schedule.
-
-Recommended fix:
-
-- Split the concepts into `--resume` and `--finetune`.
-- For crash resume, restore timestep count, curriculum state, entropy schedule, and callback behavior.
-- For fine-tuning, keep the current behavior but document it as a separate experimental regime.
-
-### 5. Backtest Does Not Require VecNormalize By Default
-
-Backtest will proceed without `VecNormalize` stats unless `--require-vec-normalize` is passed. Since training uses observation normalization by default, missing stats should be a hard error for publication-grade OOS metrics.
-
-Recommended fix:
-
-- Make VecNormalize required by default for run-id backtests.
-- Provide an explicit escape hatch such as `--allow-missing-vec-normalize` only for debugging.
-
-### 6. Manifest Is Overwritten Without Full Holdout Metadata
-
-Training writes an initial manifest with `chronological_holdout` metadata before learning, then writes a final manifest after learning that omits that detailed holdout block. Backtest can still recover dates from `args`, but the manifest no longer contains all metadata advertised by the docs.
-
-Recommended fix:
-
-- Preserve the initial manifest fields when writing the final manifest.
-- Include holdout bars, date start/end, trainable end, and the effective `until`.
+**Status:** fixed. Final manifest writes merge with existing metadata, preserving `chronological_holdout` and run provenance.
 
 ## Other Weaknesses and Risks
 
@@ -193,7 +139,7 @@ Recommended publication stance:
 
 - Treat in-training eval as a checkpoint-selection metric, not an independent estimate.
 - Publish final claims only from chronological OOS windows.
-- Report sensitivity to `continuous` versus `independent` feature split mode.
+- Report sensitivity to `continuous` versus `independent` feature split mode (default is now **`independent`**).
 
 ### Reward Is Heavily Engineered
 
@@ -226,7 +172,7 @@ Recommended fix:
 
 - Implement Modal dispatch in `scripts/research.py`, or remove the backend flag until supported.
 
-### Test Coverage Is Good But Uneven
+### Test Coverage Is Good But Still Needs Long-Run Validation
 
 Strengths:
 
@@ -235,41 +181,42 @@ Strengths:
 - feature split behavior
 - artifact resolver behavior
 - target-weight payload validation
+- best-model VecNormalize pairing
+- executed smoothed target weights
+- effective run-local data snapshots
+- manifest merge/preservation
+- resume vs fine-tune argument separation
 - doc invariant checks
 - block bootstrap tests
 
 Gaps:
 
-- no end-to-end tiny train/backtest smoke test in an installed environment
-- no test for best-model VecNormalize pairing
-- no test for smoothed executed weights versus reported weights
-- no test for `--n-assets` cache snapshot behavior
-- no test for resume schedule continuity
+- no full-budget train/backtest/infer E2E in a pinned environment
+- no dependency lockfile or pinned Docker/Modal image digest for long studies
+- no automated test that a resumed long run exactly matches uninterrupted schedule state beyond the CLI/callback-path coverage
 - limited tests for data-cache migration and manifest finalization
 
 ## Publication Readiness Plan
 
-### Phase 1: Fix Validity Blockers
-
-1. Save matched `VecNormalize` stats whenever `best_model.zip` is saved.
-2. Make inference/backtest collected weights use executed smoothed weights.
-3. Fix run-local data snapshotting for sliced universes.
-4. Separate crash resume from fine-tuning and keep curriculum continuity for true resume.
-5. Require VecNormalize for publication backtests.
-6. Preserve full holdout metadata in final manifests.
-
-Exit criterion: tests cover all six issues, and a tiny train/backtest smoke run can complete in a clean environment.
-
-### Phase 2: Lock The Experimental Protocol
+### Phase 1: Freeze The Experimental Protocol
 
 1. Freeze a paper config and record its hash.
 2. Freeze the asset universe, dates, transaction costs, observation layout, reward formula, and checkpoint rule.
 3. Define walk-forward windows before training.
 4. Define how many seeds per window will be run.
 5. Define exactly which ablations are allowed before OOS reads.
-6. Decide whether the paper uses `continuous` or `independent` feature split mode as default.
+6. Decide whether the paper uses `independent` (current default) or `continuous` feature split mode as the primary result; keep the other as an ablation.
 
 Exit criterion: a pre-registration document exists in `docs/` or `specs/`, with no result-dependent edits.
+
+### Phase 2: Reproducibility Hardening
+
+1. Add a dependency lockfile or pinned container image for long studies.
+2. Run a tiny train/backtest/infer smoke in a clean installed environment.
+3. Document CPU/GPU, Python, torch, SB3, and data-source versions for every reported cohort.
+4. Keep `training.reproducible: false` for diversity studies unless exact replay is required; use `true` for deterministic debugging cohorts.
+
+Exit criterion: another machine can reproduce a small run and verify artifact hashes/metadata.
 
 ### Phase 3: Environment Validation
 
@@ -335,20 +282,15 @@ Suggested paper sections:
 
 ## Current Verification Status
 
-I attempted to run `pytest` in the current environment. Test collection failed because `gymnasium` is not installed:
+Current local verification under the project `.venv`:
 
 ```text
-ModuleNotFoundError: No module named 'gymnasium'
+110 passed
 ```
 
-No tests were executed successfully in this shell. Before publication work, run:
+This is necessary but not sufficient for publication. A fresh full-budget walk-forward cohort and the ablations above still need to be run under the frozen protocol.
 
-```bash
-pip install -e ".[dev]"
-pytest
-```
-
-Then run at least one tiny smoke training/backtest cycle after the validity blockers are fixed.
+Next verification step: run at least one tiny train → backtest → infer cycle in a clean installed environment or pinned container, then proceed to full-budget walk-forward cohorts.
 
 ## Bottom Line
 

@@ -815,7 +815,7 @@ def train_test_split_alternating(
     eval_stride: int = 4,
     fracdiff_d: float = DEFAULT_FRACDIFF_D,
     feature_purge_warmup: int = 25,
-    feature_split_mode: str = "continuous",
+    feature_split_mode: str = "independent",
     *,
     rsi: np.ndarray | None = None,
     macd: np.ndarray | None = None,
@@ -834,19 +834,19 @@ def train_test_split_alternating(
 
     ``feature_split_mode`` controls how features reach the blocks:
 
-    - ``"continuous"`` (default): features are precomputed on the contiguous trainable
+    - ``"independent"`` (default): features are **recomputed per contiguous segment** via
+      ``compute_feature_panel`` on that segment's ``ohlcv`` + ``macro`` only, then the
+      first ``feature_purge_warmup`` bars of each segment are neutralized via
+      ``_neutralize_feature_warmup``. Any precomputed feature arrays passed in are ignored.
+      Use this so the in-training eval-selection signal is not feature-state-contaminated
+      by adjacent train blocks.
+    - ``"continuous"``: features are precomputed on the contiguous trainable
       timeline and **sliced** into blocks. Pass precomputed ``rsi`` / ``macd`` /
       ``fracdiff`` / ``fracdiff_macro`` / ``trend`` / ``asset_vol`` / ``macro_vol`` (e.g.
       from ``load_cache``) to avoid recomputing on every launch; otherwise they are built
       once via ``compute_feature_panel``. This matches continuous backtest memory, so
       ``feature_purge_warmup`` is **not** applied (segment heads carry indicator state
       continuous with the original timeline).
-    - ``"independent"``: features are **recomputed per contiguous segment** via
-      ``compute_feature_panel`` on that segment's ``ohlcv`` + ``macro`` only, then the
-      first ``feature_purge_warmup`` bars of each segment are neutralized via
-      ``_neutralize_feature_warmup``. Any precomputed feature arrays passed in are ignored.
-      Use this so the in-training eval-selection signal is not feature-state-contaminated
-      by adjacent train blocks.
 
     Block joins still set ``block_boundaries`` so episodes do not cross calendar gaps.
 

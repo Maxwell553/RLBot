@@ -1,9 +1,12 @@
 """
 Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / config).
 
-Reward = return (with drawdown downside amp) + Sortino diff - inactivity - cost-linked churn
+Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
+  - inactivity - cost-linked churn
   - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
-  - sortino diff: benchmark-relative over last RISK_WINDOW steps (moving window within episode)
+  - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
+  - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
+  - Sortino + benchmark capped to benchmark_relative_max_share of per-step |reward| mass
   - inactivity: linear in cash fraction (plus extra ramp above 90%)
   - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
@@ -118,6 +121,37 @@ def portfolio_weights_from_action(
     return w
 
 
+def _scale_benchmark_relative_components(
+    *,
+    sortino: float,
+    benchmark: float,
+    return_component: float,
+    participation: float,
+    inactivity: float,
+    churn: float,
+    max_share: float,
+) -> tuple[float, float]:
+    """Scale Sortino + benchmark excess so their combined |.| share ≤ ``max_share`` per step."""
+    if max_share <= 0.0:
+        return 0.0, 0.0
+    bench_sum = sortino + benchmark
+    bench_abs = abs(bench_sum)
+    if bench_abs < 1e-12:
+        return sortino, benchmark
+    # ``return_component`` already includes drawdown amplification; do not add drawdown again.
+    other_abs = (
+        abs(return_component)
+        + abs(participation)
+        + abs(inactivity)
+        + abs(churn)
+    )
+    max_bench_abs = (max_share * other_abs) / max(1.0 - max_share, 1e-12)
+    if bench_abs <= max_bench_abs:
+        return sortino, benchmark
+    scale = max_bench_abs / bench_abs
+    return sortino * scale, benchmark * scale
+
+
 class EpisodeEndNavRecorder(gym.Wrapper):
     """Record terminal ``nav`` from each episode for eval NAV tracking (SB3 EvalCallback)."""
 
@@ -149,7 +183,8 @@ class MultiAssetPortfolioEnv(gym.Env):
 
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
-    Reward: return (drawdown-amplified downside) + Sortino_bonus + participation - inactivity - cost-linked churn.
+    Reward: return (drawdown-amplified downside) + benchmark excess + Sortino diff
+    + participation - inactivity - cost-linked churn.
     Per-step ``info`` includes ``rew_decomp/*`` for each component (see ``config.yaml`` reward section).
 
     Feature arrays after ``macd`` are keyword-only so walk-forward packs
@@ -377,7 +412,7 @@ class MultiAssetPortfolioEnv(gym.Env):
             self._noise_scale = None
 
     def set_curriculum_state(self, fee_override: Optional[float], churn_scale: float) -> None:
-        """Called by ``TradingCurriculumCallback`` on training envs only.
+        """Called by ``TradingCurriculumCallback`` on train and eval envs.
 
         ``fee_override``: fixed ``fee_scale`` until next reset when set (0 = frictionless).
         ``None`` = release to domain randomization (or default fee) on reset.
@@ -385,6 +420,11 @@ class MultiAssetPortfolioEnv(gym.Env):
         """
         self._curriculum_fee_override = fee_override
         self._churn_scale = float(churn_scale)
+        if not self.domain_randomize:
+            if fee_override is not None:
+                self.fee_scale = float(fee_override)
+            else:
+                self.fee_scale = self._fee_scale_default
 
     def set_randomization_bounds(
         self,
@@ -886,7 +926,6 @@ class MultiAssetPortfolioEnv(gym.Env):
         else:
             return_component = base_return
             drawdown_component = 0.0
-        reward = return_component
 
         sortino_component = 0.0
         available_steps = len(self._return_buffer)
@@ -900,7 +939,15 @@ class MultiAssetPortfolioEnv(gym.Env):
             )
             diff = float(np.clip(agent_s - market_s, -3.0, 3.0))
             sortino_component = diff * rwd.risk_bonus_scale
-            reward += sortino_component
+
+        excess_ret = float(
+            np.clip(
+                log_ret - market_ret,
+                -rwd.benchmark_excess_clip,
+                rwd.benchmark_excess_clip,
+            )
+        )
+        benchmark_component = excess_ret * rwd.benchmark_excess_scale
 
         cash_frac = self._cash / max(v_next, 1e-12)
         inact = self._inactivity_penalty_scale
@@ -909,18 +956,32 @@ class MultiAssetPortfolioEnv(gym.Env):
             inactivity_component += float(
                 ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90 * inact
             )
-        reward -= inactivity_component
-
         gross_exposure = float(np.sum(w[1:]))
         participation_component = (
             gross_exposure * rwd.participation_bonus * rwd.participation_reward_scale
         )
-        reward += participation_component
 
         churn_component = (
             tx_cost_frac * rwd.churn_penalty * rwd.reward_scale * active_churn_scale
         )
-        reward -= churn_component
+
+        sortino_component, benchmark_component = _scale_benchmark_relative_components(
+            sortino=sortino_component,
+            benchmark=benchmark_component,
+            return_component=return_component,
+            participation=participation_component,
+            inactivity=inactivity_component,
+            churn=churn_component,
+            max_share=rwd.benchmark_relative_max_share,
+        )
+        reward = (
+            return_component
+            + sortino_component
+            + benchmark_component
+            + participation_component
+            - inactivity_component
+            - churn_component
+        )
 
         self._episode_peak_nav = max(peak_before, v_next)
 
@@ -944,6 +1005,7 @@ class MultiAssetPortfolioEnv(gym.Env):
             "tx_cost_frac": tx_cost_frac,
             "log_ret": log_ret,
             "rew_decomp/return": return_component,
+            "rew_decomp/benchmark": benchmark_component,
             "rew_decomp/sortino": sortino_component,
             "rew_decomp/inactivity": -inactivity_component,
             "rew_decomp/participation": participation_component,

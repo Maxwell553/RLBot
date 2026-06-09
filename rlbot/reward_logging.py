@@ -12,7 +12,15 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
-REWARD_TERMS = ("return", "sortino", "inactivity", "participation", "churn", "drawdown")
+REWARD_TERMS = (
+    "return",
+    "benchmark",
+    "sortino",
+    "inactivity",
+    "participation",
+    "churn",
+    "drawdown",
+)
 
 
 class RewardDecompAccumulator:

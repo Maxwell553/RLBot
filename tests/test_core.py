@@ -71,6 +71,33 @@ def test_validate_config_for_universe_mismatch() -> None:
         validate_config_for_universe(cfg, cfg.universe.n_assets + 1)
 
 
+def test_benchmark_relative_max_share_validation() -> None:
+    from rlbot.rl_config import RewardConfig, _validate_reward_config
+
+    base = dict(
+        reward_scale=1.0,
+        max_step_log_return=0.1,
+        max_step_log_return_downside=-0.1,
+        risk_window=10,
+        sortino_min_steps=1,
+        risk_bonus_scale=1.0,
+        benchmark_cap_weights=(1.0,),
+        benchmark_excess_scale=1.0,
+        benchmark_excess_clip=0.01,
+        benchmark_relative_max_share=0.6,
+        churn_penalty=1.0,
+        drawdown_downside_gamma=1.0,
+        inactivity_penalty_over_50=1.0,
+        inactivity_penalty_over_90=1.0,
+        eval_inactivity_penalty_scale=1.0,
+        participation_bonus=0.0,
+        participation_reward_scale=1.0,
+    )
+    _validate_reward_config(RewardConfig(**base))
+    with pytest.raises(ValueError, match="benchmark_relative_max_share"):
+        _validate_reward_config(RewardConfig(**{**base, "benchmark_relative_max_share": 1.0}))
+
+
 def test_slice_config_to_n_assets() -> None:
     full = get_config()
     n = 7
@@ -302,6 +329,7 @@ def test_train_test_split_accepts_precomputed_features() -> None:
         asset_live=live,
         block_size=126,
         eval_stride=4,
+        feature_split_mode="continuous",
         rsi=sentinel,
         macd=sentinel,
         fracdiff=sentinel,
@@ -342,7 +370,8 @@ def test_train_test_split_slices_global_fracdiff_panel() -> None:
 
     _, _, fd_g, _, _, avol_g, _ = compute_feature_panel(ohlcv, macro)
     train_pack, _ = train_test_split_alternating(
-        idx, ohlcv, macro, asset_live=live, block_size=126, eval_stride=4
+        idx, ohlcv, macro, asset_live=live, block_size=126, eval_stride=4,
+        feature_split_mode="continuous",
     )
     tr_idx, tr_fd = train_pack[0], train_pack[5]
     assert len(tr_idx) > 126

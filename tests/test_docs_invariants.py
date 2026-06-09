@@ -25,8 +25,8 @@ def test_obs_dim_is_128_for_default_universe() -> None:
     assert observation_dim_for_universe(10) == 128
 
 
-def test_default_cap_is_035() -> None:
-    assert get_config().environment.max_single_asset_weight == 0.35
+def test_default_cap_is_025() -> None:
+    assert get_config().environment.max_single_asset_weight == 0.25
 
 
 def test_split_supports_feature_split_mode() -> None:

@@ -77,6 +77,9 @@ class RewardConfig:
     sortino_min_steps: int
     risk_bonus_scale: float
     benchmark_cap_weights: list[float]
+    benchmark_excess_scale: float
+    benchmark_excess_clip: float
+    benchmark_relative_max_share: float
     churn_penalty: float
     drawdown_downside_gamma: float
     inactivity_penalty_over_50: float
@@ -189,6 +192,9 @@ class CurriculumConfig:
     fee_free_long: int
     fee_ramp_end_long: int
     dr_widen_span_long: int
+    # Step before which eval NAV is logged but models/best/ is not updated.
+    # None → fee_ramp_end for the learn budget; 0 → disable gate.
+    best_model_min_step: int | None = None
 
 
 FEATURE_SPLIT_MODES = ("continuous", "independent")
@@ -204,7 +210,7 @@ class DataConfig:
     # "independent": features recomputed per contiguous segment + first
     #   feature_purge_warmup bars neutralized, so the eval-selection signal is not
     #   feature-state-contaminated by adjacent train blocks.
-    feature_split_mode: str = "continuous"
+    feature_split_mode: str = "independent"
 
 
 @dataclass(frozen=True)
@@ -298,6 +304,14 @@ def slice_config_to_n_assets(cfg: RLConfig, n_assets: int) -> RLConfig:
     return _parse_config(data, cfg.path)
 
 
+def _validate_reward_config(rew: RewardConfig) -> None:
+    share = float(rew.benchmark_relative_max_share)
+    if not (0.0 <= share < 1.0):
+        raise ValueError(
+            f"reward.benchmark_relative_max_share must be in [0, 1), got {share}"
+        )
+
+
 def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
     """Ensure per-asset config lists match the loaded OHLCV panel width."""
     validate_universe_asset_count(n_assets)
@@ -343,7 +357,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
     cur = _req(data, "curriculum", "root")
     dat = _req(data, "data", "root")
 
-    return RLConfig(
+    cfg = RLConfig(
         path=path.resolve(),
         universe=universe,
         environment=EnvironmentConfig(
@@ -375,6 +389,11 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
                 _req(rew, "benchmark_cap_weights", "reward"),
                 "benchmark_cap_weights",
                 expected_n=None,
+            ),
+            benchmark_excess_scale=float(_req(rew, "benchmark_excess_scale", "reward")),
+            benchmark_excess_clip=float(_req(rew, "benchmark_excess_clip", "reward")),
+            benchmark_relative_max_share=float(
+                _req(rew, "benchmark_relative_max_share", "reward")
             ),
             churn_penalty=_reward_churn_penalty(rew),
             drawdown_downside_gamma=float(_req(rew, "drawdown_downside_gamma", "reward")),
@@ -467,15 +486,22 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             fee_free_long=int(_req(cur, "fee_free_long", "curriculum")),
             fee_ramp_end_long=int(_req(cur, "fee_ramp_end_long", "curriculum")),
             dr_widen_span_long=int(_req(cur, "dr_widen_span_long", "curriculum")),
+            best_model_min_step=(
+                None
+                if cur.get("best_model_min_step") is None
+                else int(cur["best_model_min_step"])
+            ),
         ),
         data=DataConfig(
             since=str(_req(dat, "since", "data")),
             fracdiff_d=float(_req(dat, "fracdiff_d", "data")),
             feature_purge_warmup=int(_req(dat, "feature_purge_warmup", "data")),
-            feature_split_mode=_feature_split_mode(dat.get("feature_split_mode", "continuous")),
+            feature_split_mode=_feature_split_mode(dat.get("feature_split_mode", "independent")),
         ),
         raw=data,
     )
+    _validate_reward_config(cfg.reward)
+    return cfg
 
 
 _CONFIG: RLConfig | None = None

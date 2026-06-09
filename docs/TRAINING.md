@@ -105,7 +105,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and **requires** `models/best/vec_normalize.pkl` paired with `best_model.zip` (pass `--allow-missing-vec-normalize` only for debugging). Results land in `Runs/<id>/backtest_summary.json`.
 
-**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together whenever eval NAV improves. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
+**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when eval NAV improves **after `fee_ramp_end`** (full eval fees + churn). Eval NAV is logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
 
 ### 6. Target-weight inference (optional)
 
@@ -121,7 +121,7 @@ Writes audited JSON (executed target weights after action smoothing, live mask, 
 
 ## Walk-forward windows
 
-Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. **No OOS results are published yet** under the current pipeline — backtest only after a fresh `W*_605` run completes; record numbers in RESEARCH.md.
+Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. **No OOS results are published yet** under the current pipeline — backtest only after a fresh run under the current `config/config.yaml` completes; record numbers in RESEARCH.md with the actual `<RUN_ID>`.
 
 ```bash
 python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
@@ -155,7 +155,7 @@ Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 | `config.yaml` | Snapshot of training config |
 | `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
 | `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair) |
-| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (per-term: return, sortino, inactivity, churn, drawdown amp) |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (per-term: return, benchmark, sortino, participation, inactivity, churn, drawdown amp) |
 | `backtest_summary.json` | OOS metrics + config/data hashes (after backtest) |
 | `training_summary.json` | Training-end summary (after train completes) |
 

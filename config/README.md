@@ -53,14 +53,17 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 
 | Key | Purpose |
 |-----|---------|
-| `feature_split_mode` | `continuous` (default) or `independent` — how walk-forward blocks get RSI/MACD/fracdiff/trend/vol features |
+| `feature_split_mode` | `independent` (default) or `continuous` — how walk-forward blocks get RSI/MACD/fracdiff/trend/vol features |
 | `feature_purge_warmup` | Bars neutralized at segment starts in `independent` mode (default 25) |
 
 ## `reward` (key knobs)
 
 | Key | Purpose |
 |-----|---------|
-| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 1.5 + 1.0 tail above 90% cash) |
+| `risk_bonus_scale` | Sortino differential multiplier (default **2.5**) |
+| `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware cap-weighted benchmark |
+| `benchmark_relative_max_share` | Max combined \|sortino+benchmark\| abs share per step (default **0.6**; `0` disables both) |
+| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 1.35 + 0.9 tail above 90% cash) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 5.0) |
 | `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 1.0) |
 | `eval_inactivity_penalty_scale` | Eval env inactivity scale (default 1.0) |
@@ -70,6 +73,7 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 | Key | Purpose |
 |-----|---------|
 | `churn_ramp_floor` | Churn scale at fee-ramp start; ramps to 1.0 by `fee_ramp_fraction` (default 0.1) |
+| `best_model_min_step` | Gate `models/best/` saves until this step (`null` → `fee_ramp_end`; `0` → disable gate). Eval NAV always logged. |
 
 ## Other sections
 

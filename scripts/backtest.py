@@ -638,7 +638,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         nav_spy = benchmark_buyhold_nav(
             navs, test_ohlcv, start_bar, tickers=panel_tickers
         )
-        nav_ew = equal_weight_buyhold_nav(
+        nav_ew = equal_weight_daily_cost_aware_nav(
             navs, test_ohlcv, start_bar, asset_live=test_live
         )
         try:

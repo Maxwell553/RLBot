@@ -331,7 +331,8 @@ def plot_backtest_dashboard(
     timestamps : length len(nav)
     nav : model portfolio NAV
     nav_spy, nav_equal_weight, nav_balanced_6040, nav_risk_parity : passive benchmarks (same len as ``nav``)
-    weights : shape (n_steps, n_weights)
+    weights : shape (n_steps, n_weights) — executed post-rebalance targets from
+        ``info["target_weights"]`` (EMA-smoothed logits → softmax → cap), not raw policy logits.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,7 +409,9 @@ def plot_backtest_dashboard(
         axes[2].set_ylim(0.0, 1.0)
         ncol = min(4, max(1, len(plot_labels)))
         axes[2].legend(loc="upper left", fontsize=7, ncol=ncol, framealpha=0.9)
-        axes[2].set_title("Target portfolio weights (softmax of actions)")
+        axes[2].set_title(
+            "Executed target weights (EMA-smoothed logits → softmax → cap)"
+        )
     else:
         axes[2].text(0.5, 0.5, "No weight history", ha="center", va="center", transform=axes[2].transAxes)
 

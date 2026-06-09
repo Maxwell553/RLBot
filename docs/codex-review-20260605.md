@@ -1,6 +1,6 @@
 # Codex Repository Review - 2026-06-05
 
-> **Status (2026-06-08):** Historical snapshot. Post-review work documented in [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md).
+> **Status (2026-06-09):** Historical snapshot. Post-review harness work in [evolution-roadmap-progress-20260606.md](evolution-roadmap-progress-20260606.md). **Current pipeline:** default `independent` features, benchmark excess + Sortino cap, cap **0.25**, aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate.
 
 ## Scope
 

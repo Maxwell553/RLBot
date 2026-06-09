@@ -1,6 +1,6 @@
 # RLBot (MarketTrainer) — Design & Implementation Review
 
-> **Status (2026-06-08):** Historical snapshot (pre-evolution-roadmap). OOS figures cited below (e.g. W3 +37.7%) are **obsolete** — not valid under the current pipeline. See [RESEARCH.md](RESEARCH.md).
+> **Status (2026-06-09):** Historical snapshot (pre-evolution-roadmap). OOS figures cited below are **obsolete**. **Current pipeline:** `independent` feature split, benchmark excess + Sortino cap, cap **0.25**, aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. See [RESEARCH.md](RESEARCH.md).
 
 **Date:** 2026-05-31
 **Reviewer scope:** Full read of `trading_env.py`, `train.py`, `data_utils.py`, `backtest.py`, `backtest_sweep.py`, `rl_config.py`, `run_artifacts.py`, `vecnorm_utils.py`, `config.yaml`, `tests/`, `windows/`, `README.md`, `RESEARCH.md`.

@@ -5,12 +5,13 @@ This document captures the implementation of the roadmap in `docs/claude-review-
 auto-research capability, and the issues still open. The full plan lives at
 `.claude/plans/fuzzy-hatching-horizon.md`.
 
-**Branch:** `feat/evolution-roadmap`. **Tests:** 51 → **92 passing** (+1 torch-gated skip),
-all torch-free and wired into CI (`.github/workflows/ci.yml`).
+**Branch:** `feat/evolution-roadmap`. **Tests:** 51 → **110 passing**,
+including environment, feature-split, backtest-binding, reward-logging, inference-output,
+and publication-fix regression tests.
 
-> **Results status (2026-06-08):** Harness work shipped; **no definitive OOS numbers** under the
-> current config yet. Prior `W*_604` backtests used a different reward/cost/env stack and must not
-> be cited. See [RESEARCH.md](RESEARCH.md).
+> **Results status (2026-06-09):** Harness work shipped; **no definitive published OOS numbers**
+> under the current config yet. Interim probes must be interpreted through their run-local
+> `Runs/<id>/config.yaml`. See [RESEARCH.md](RESEARCH.md).
 
 ---
 
@@ -30,10 +31,7 @@ inference path. This round implements all five phases (with two honestly-scoped 
 ## 2. What shipped, by phase
 
 ### Phase 0 — Seal the harness
-- **`feature_split_mode`** (`config.yaml` → `DataConfig`): `continuous` (default, unchanged
-  behavior) vs `independent`, which **recomputes features per contiguous segment and applies
-  the `feature_purge_warmup`** (`rlbot/data_utils.py: train_test_split_alternating`). The
-  purge — previously retained but dead — is now functional in `independent` mode.
+- **`feature_split_mode`** (`config.yaml` → `DataConfig`): **`independent`** (default in config and `train_test_split_alternating`) vs `continuous` (ablation — matches contiguous backtest indicator memory). `independent` **recomputes features per contiguous segment and applies the `feature_purge_warmup`** (`rlbot/data_utils.py: train_test_split_alternating`).
 - **Backtest binds run-local snapshots by default** (`scripts/backtest.py`): loads
   `Runs/<id>/config.yaml` (`--use-current-config` to opt out) and prefers
   `Runs/<id>/data_cache.npz` (`--data-cache` override) via `resolve_run_data_cache`.
@@ -48,7 +46,7 @@ inference path. This round implements all five phases (with two honestly-scoped 
 ### Phase 1 — Measurement hardening
 - **Reward-decomposition logging** (`rlbot/reward_logging.py` + `RewardDecompCallback`):
   windowed per-term means and **share-of-absolute-reward** to TensorBoard +
-  `eval_logs/reward_decomp.json` — makes the review's reward asymmetry observable.
+  `eval_logs/reward_decomp.json`, including the current benchmark-excess term.
 - **Patience early-stop** (`EvalNavBestModelCallback`, gated on curriculum completion via
   `dr_widen_end_milestone`; `training.early_stop_patience`, default 0 = off).
 - **Eval effective-coverage reporting** (segments × scored bars) — the honest part of the
@@ -104,20 +102,18 @@ inference path. This round implements all five phases (with two honestly-scoped 
 | Auto-research | None | Spec → registry → report → gated orchestrator |
 | Inference | No audited in-tree path | `infer_weights.py` + `inference_output.py` |
 | Agent docs | Materially stale | Corrected + invariant test + CI |
-| Tests | 51 | 92 (+ torch-gated) |
+| Tests | 51 | 110 passing |
 
 ---
 
 ## 4. Verification status (honest)
 
-- **Verified:** 92 torch-free tests; every torch-importing module byte-compiles; the
+- **Verified:** 110 tests; every torch-importing module byte-compiles; the
   orchestrator was run end-to-end (`research.py plan` materialized + validated variant
   configs; `launch --dry-run` built correct CLIs with window dates) on this checkout.
-- **Not executed here (no torch / no yfinance data in this environment):** the actual
-  train → backtest → infer_weights smoke E2E, the training callbacks (reward-decomp,
-  patience early-stop), and the inference rollout. These were written to mirror existing
-  proven code and pass an independent skeptical review, but **should get a GPU/data smoke run
-  before being relied on.**
+- **Not executed here:** a full-budget train → backtest → infer_weights E2E on fresh market
+  data. Unit and smoke tests cover the core invariants, but long-run empirical behavior still
+  needs the documented walk-forward runs.
 - **Deferred (scoped out this round):**
   1. **Dependency lockfile** — needs `uv`/network to resolve the torch stack offline; the
      Modal image already pins Python 3.11.
@@ -149,9 +145,9 @@ Sharpe wrapper); and corrected the misleading 60/40 skip message.
    on a GPU/data box (tier 3, no OOS), then `report feature_split_ab`. This answers the
    review's central open question: does `independent` split + the purge change the validation
    cliff? Read `reward_decomp.json` alongside to see the term balance.
-2. **Reward rebalance.** `specs/reward_ablation.yaml` — use `rew_decomp/abs_share` to pick
-   coefficients where participation/churn are non-trivial at target behaviors, then re-test
-   the cliff.
+2. **Reward ablations.** `specs/reward_ablation.yaml` — use `rew_decomp/abs_share` to check
+   whether benchmark excess + Sortino stay within the intended balance and whether
+   participation/churn are non-trivial at target behaviors.
 
 **Near-term capability growth:**
 3. **Modal backend for `research.py launch`** (`--backend modal`): submit variants to Modal,
@@ -178,8 +174,8 @@ Sharpe wrapper); and corrected the misleading 60/40 skip message.
 ## 7. Remaining issues to address
 
 **Should fix before heavy use:**
-- **Smoke-run the torch paths** (training callbacks + inference rollout) on GPU/data — the
-  one real verification gap.
+- **Complete full-budget walk-forward runs** under the current snapshot before citing OOS
+  results.
 - **Dependency lockfile** (`uv.lock` or pinned image) for reproducible long studies.
 
 **Known latent issues (pre-existing, worth a follow-up):**

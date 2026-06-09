@@ -6,8 +6,9 @@ Universe size and symbols: ``config/config.yaml`` → ``universe.assets`` (5–5
 optional CLI ``--n-assets`` slices the first N keys.
 
 Artifacts for inference (backtest): ``Runs/<run_id>/models/best/best_model.zip`` paired
-with ``Runs/<run_id>/models/best/vec_normalize.pkl`` saved at the same eval step (end-of-run
-``models/vec_normalize.pkl`` is final-step stats only).
+with ``Runs/<run_id>/models/best/vec_normalize.pkl`` saved at the same eval step (after
+``fee_ramp_end`` when the best-model gate is on; end-of-run ``models/vec_normalize.pkl`` is
+final-step stats only).
 
 Anti-overfitting measures:
   - Fractionally differentiated price features (stationary + memory)
@@ -15,7 +16,7 @@ Anti-overfitting measures:
   - Seed shuffling: fresh OS entropy on every episode reset
   - VecNormalize + cosine LR decay with floor
   - Domain randomization: Beta-centered fee_scale + obs_lag, bounds widen 10M→40M (65M budget)
-  - Fee curriculum: frictionless → fee ramp → progressive DR release (see trade_curriculum_milestones)
+  - Fee curriculum (train + eval): frictionless → linear fee/churn ramp → progressive DR on train
 """
 
 from __future__ import annotations
@@ -165,6 +166,9 @@ class EvalNavBestModelCallback(EvalCallback):
 
     Still logs ``evaluations.npz`` (rewards) for entropy scheduling; deployment model
     is chosen by validation wealth, avoiding passive low-churn reward hacks.
+
+    When ``best_model_min_step`` > 0, eval NAV is logged from step 0 but ``models/best/``
+    updates only after that step (default: ``fee_ramp_end`` — full eval fees + churn).
     """
 
     def __init__(
@@ -175,6 +179,7 @@ class EvalNavBestModelCallback(EvalCallback):
         train_vec_env: VecNormalize | None = None,
         patience: int = 0,
         curriculum_end_step: int = 0,
+        best_model_min_step: int = 0,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
@@ -185,10 +190,25 @@ class EvalNavBestModelCallback(EvalCallback):
         self._train_vec_env = train_vec_env
         self.patience = int(patience)
         self.curriculum_end_step = int(curriculum_end_step)
+        self.best_model_min_step = int(best_model_min_step)
+        self._post_gate_tracking_started = False
         self._evals_since_best = 0
         self.early_stop_reason: str | None = None
         self._load_nav_history()
         super().__init__(eval_env, best_model_save_path=None, **kwargs)
+
+    def _best_model_gate_open(self) -> bool:
+        return self.best_model_min_step <= 0 or self.num_timesteps >= self.best_model_min_step
+
+    def _post_gate_best_nav(self) -> float:
+        if self.best_model_min_step <= 0:
+            return self.best_mean_nav
+        post = [
+            n
+            for t, n in zip(self._nav_timesteps, self._mean_ending_nav)
+            if t >= self.best_model_min_step
+        ]
+        return float(max(post)) if post else -np.inf
 
     def _load_nav_history(self) -> None:
         if not self.nav_history_path.is_file():
@@ -198,7 +218,13 @@ class EvalNavBestModelCallback(EvalCallback):
             self._nav_timesteps = list(np.asarray(z["timesteps"], dtype=np.int64))
             self._mean_ending_nav = list(np.asarray(z["mean_ending_nav"], dtype=np.float64))
             if self._mean_ending_nav:
-                self.best_mean_nav = float(max(self._mean_ending_nav))
+                if self.best_model_min_step > 0:
+                    self.best_mean_nav = self._post_gate_best_nav()
+                    self._post_gate_tracking_started = any(
+                        t >= self.best_model_min_step for t in self._nav_timesteps
+                    )
+                else:
+                    self.best_mean_nav = float(max(self._mean_ending_nav))
         except (OSError, ValueError, KeyError):
             pass
 
@@ -228,28 +254,34 @@ class EvalNavBestModelCallback(EvalCallback):
                 self._mean_ending_nav.append(mean_nav)
                 self._save_nav_history()
                 self.logger.record("eval/mean_ending_nav", mean_nav)
-                if mean_nav > self.best_mean_nav:
-                    self.best_mean_nav = mean_nav
-                    self._evals_since_best = 0
-                    if self.verbose >= 1:
-                        print(f"New best mean ending NAV: {mean_nav:,.0f}")
-                    self._best_model_dir.mkdir(parents=True, exist_ok=True)
-                    self.model.save(str(self._best_model_dir / "best_model"))
-                    if self._train_vec_env is not None:
-                        self._train_vec_env.save(
-                            str(self._best_model_dir / "vec_normalize.pkl")
-                        )
-                elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
-                    # Patience early-stop, but only after the curriculum has fully released.
-                    self._evals_since_best += 1
-                    self.logger.record("eval/evals_since_best", self._evals_since_best)
-                    if self._evals_since_best >= self.patience:
-                        self.early_stop_reason = (
-                            f"no new best mean ending NAV for {self.patience} evals after "
-                            f"curriculum (step {self.num_timesteps})"
-                        )
-                        print(f"[train] early stop: {self.early_stop_reason}")
-                        return False
+                gate_open = self._best_model_gate_open()
+                self.logger.record("eval/best_model_gate_open", float(gate_open))
+                if gate_open:
+                    if self.best_model_min_step > 0 and not self._post_gate_tracking_started:
+                        self._post_gate_tracking_started = True
+                        self.best_mean_nav = -np.inf
+                    if mean_nav > self.best_mean_nav:
+                        self.best_mean_nav = mean_nav
+                        self._evals_since_best = 0
+                        if self.verbose >= 1:
+                            print(f"New best mean ending NAV: {mean_nav:,.0f}")
+                        self._best_model_dir.mkdir(parents=True, exist_ok=True)
+                        self.model.save(str(self._best_model_dir / "best_model"))
+                        if self._train_vec_env is not None:
+                            self._train_vec_env.save(
+                                str(self._best_model_dir / "vec_normalize.pkl")
+                            )
+                    elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
+                        # Patience early-stop, but only after the curriculum has fully released.
+                        self._evals_since_best += 1
+                        self.logger.record("eval/evals_since_best", self._evals_since_best)
+                        if self._evals_since_best >= self.patience:
+                            self.early_stop_reason = (
+                                f"no new best mean ending NAV for {self.patience} evals after "
+                                f"curriculum (step {self.num_timesteps})"
+                            )
+                            print(f"[train] early stop: {self.early_stop_reason}")
+                            return False
 
         return continue_training
 
@@ -392,6 +424,18 @@ def fee_curriculum_milestones(learn_budget: int) -> tuple[int, int]:
     return ff, fr
 
 
+def resolve_best_model_min_step(learn_budget: int) -> int:
+    """Step before which ``models/best/`` is not updated (eval NAV still logged).
+
+    ``curriculum.best_model_min_step``: ``null`` → ``fee_ramp_end``; ``0`` → disable gate.
+    """
+    explicit = get_config().curriculum.best_model_min_step
+    if explicit is not None:
+        return max(0, int(explicit))
+    _, fee_ramp_end = trade_curriculum_milestones(learn_budget)
+    return fee_ramp_end
+
+
 def entropy_early_floor_milestones(learn_budget: int) -> int:
     """Entropy floor duration as a fraction of ``learn_budget`` (see config ``early_floor_fraction``)."""
     lb = max(1, int(learn_budget))
@@ -424,16 +468,17 @@ def entropy_dr_lock_milestones(learn_budget: int) -> int:
 
 
 class TradingCurriculumCallback(BaseCallback):
-    """Training-only schedule: fee ramp + churn scale (eval envs never see this).
+    """Fee/churn curriculum on train + eval; DR bounds on train only.
 
     Milestones from ``trade_curriculum_milestones(learn_budget)``.
 
     - Steps ``[0, fee_free_until)``: ``fee_scale = 0`` (frictionless).
     - Steps ``[fee_free_until, fee_ramp_end)``: linear ramp to ``fee_scale = 1.0``.
-    - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds.
-    - Steps ``>= dr_widen_end``: full DR (fee in config DR range, lag in {0, 1, 2}).
+    - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds (train).
+    - Steps ``>= dr_widen_end``: full DR on train (fee in config DR range, lag in {0, 1, 2}).
     - Churn: ``churn_scale = 0`` before ``fee_free_until``; then ``churn_ramp_floor`` → ``1``
-      linearly over the fee-ramp window (aligned with fee ramp).
+      linearly over the fee-ramp window (train + eval).
+    - Eval envs mirror the fee/churn schedule (no domain randomization).
     """
 
     def __init__(
@@ -441,9 +486,11 @@ class TradingCurriculumCallback(BaseCallback):
         vec_env: VecNormalize,
         learn_budget: int,
         update_freq: int = 50_000,
+        eval_vec_env: VecNormalize | None = None,
     ):
         super().__init__()
         self.vec_env = vec_env
+        self.eval_vec_env = eval_vec_env
         self.learn_budget = int(learn_budget)
         self.fee_free_until, self.fee_ramp_end = trade_curriculum_milestones(
             self.learn_budget
@@ -501,6 +548,8 @@ class TradingCurriculumCallback(BaseCallback):
             self.vec_env.env_method(
                 "set_randomization_bounds", fee_min, fee_max, lag_min, lag_max
             )
+            if self.eval_vec_env is not None:
+                self.eval_vec_env.env_method("set_curriculum_state", fee, churn)
             self._last_key = key
             self.logger.record("config/curriculum_fee_override", -1.0 if fee is None else float(fee))
             self.logger.record("config/curriculum_churn_scale", churn)
@@ -990,7 +1039,9 @@ def main() -> None:
     print(f"  execution=open[t+1] (realistic: decide after close[t-1], fill at next open)")
     print(
         f"  reward: return*{cfg.reward.reward_scale:g} (downside amp gamma={cfg.reward.drawdown_downside_gamma:g}) "
+        f"+ bench_excess*{cfg.reward.benchmark_excess_scale:g} "
         f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
+        f"(combined cap {cfg.reward.benchmark_relative_max_share:.0%}) "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
         f"- inactivity - tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g}"
     )
@@ -1015,10 +1066,19 @@ def main() -> None:
     _decay_frac = get_config().entropy_schedule.decay_start_fraction
     _decay_step = int(_decay_frac * args.timesteps)
     print(
-        f"  fee curriculum: fee=0 for {_ff:,} steps → ramp to 1.0 by {_fr:,} → "
-        f"progressive DR widen to {_dre:,} → full DR; "
+        f"  fee curriculum (train + eval): fee=0 for {_ff:,} steps → linear ramp to 1.0 by "
+        f"{_fr:,} → progressive DR widen to {_dre:,} → full DR (train only); "
         f"churn scale 0 → {cfg.curriculum.churn_ramp_floor:g} → 1.0 over same fee-ramp window"
     )
+    print(f"  feature_split_mode: {cfg.data.feature_split_mode}")
+    _bms = resolve_best_model_min_step(args.timesteps)
+    if _bms > 0:
+        print(
+            f"  best_model gate: eval NAV logged always; models/best/ updates from step "
+            f"{_bms:,} (fee_ramp_end; full eval fees + churn)"
+        )
+    else:
+        print("  best_model gate: off (eval NAV selects best from step 0)")
     print(
         f"  entropy: explore {ent_cfg.explore_ent} (floor 0.02 until {_edl:,} steps, "
         f"then 0.01 for {_ef:,}) → cosine decay to {ent_cfg.final_ent} from "
@@ -1232,9 +1292,10 @@ def main() -> None:
         f"(effective sample size of the deterministic eval-selection signal)"
     )
     # Patience early-stop is gated on curriculum completion (dr_widen_end); patience=0 keeps
-    # the full --timesteps budget (best_model still side-saved by eval NAV).
+    # the full --timesteps budget. best_model saves open after fee_ramp_end (full eval fees).
     curriculum_end_step = dr_widen_end_milestone(args.timesteps)
     early_stop_patience = int(tr_cfg.early_stop_patience)
+    best_model_min_step = resolve_best_model_min_step(args.timesteps)
     eval_callback = EvalNavBestModelCallback(
         eval_env,
         nav_history_path=paths.eval_nav_history,
@@ -1242,6 +1303,7 @@ def main() -> None:
         train_vec_env=train_env,
         patience=early_stop_patience,
         curriculum_end_step=curriculum_end_step,
+        best_model_min_step=best_model_min_step,
         log_path=str(paths.eval_log_dir),
         eval_freq=eval_freq,
         n_eval_episodes=n_validation_blocks,
@@ -1268,6 +1330,7 @@ def main() -> None:
                 train_env,
                 learn_budget=args.timesteps,
                 update_freq=tr_cfg.curriculum_update_freq,
+                eval_vec_env=eval_env,
             ),
         )
         callbacks.append(AdaptiveEntropyCallback(

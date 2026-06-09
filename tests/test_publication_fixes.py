@@ -143,12 +143,20 @@ def test_target_weights_match_smoothed_execution() -> None:
     raw = np.zeros(n_a + 1, dtype=np.float64)
     raw[0] = 1.0
     raw[1:] = np.linspace(-1.0, 3.0, n_a)
+    from rlbot.trading_env import portfolio_weights_from_action
+
     _, _, _, _, info1 = env.step(raw)
-    _, _, _, _, info2 = env.step(raw * 0.5)
+    raw2 = raw * 0.5
+    _, _, _, _, info2 = env.step(raw2)
     assert "target_weights" in info1
     assert info1["target_weights"].shape == (n_a + 1,)
     assert np.isclose(info1["target_weights"].sum(), 1.0)
     assert not np.allclose(info1["target_weights"], info2["target_weights"])
+    # Plot/backtest must not use raw-logit mapping when smoothing is enabled.
+    w_raw_step2 = portfolio_weights_from_action(
+        raw2, n_actions=n_a + 1, asset_live=live[env._t - 1]
+    )
+    assert not np.allclose(info2["target_weights"], w_raw_step2, atol=1e-4)
 
 
 def test_train_saves_paired_vecnormalize_on_best_eval() -> None:

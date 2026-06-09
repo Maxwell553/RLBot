@@ -2,9 +2,9 @@
 
 Methodology and walk-forward protocol for **RecurrentPPO** on a config-driven tradeable universe (**5–55** assets via `config/config.yaml` → `universe.assets`).
 
-> **No definitive OOS results yet.** The pipeline changed substantially since any prior backtests (dynamic **N**, `asset_live`, run-local config/cache binding, `feature_split_mode`, reward/cost refactor, eval-NAV-best default, stochastic-path stats, reward-decomp logging). Pre-refactor artifacts are **not comparable** to the current stack and must not be cited as findings. Fill the tables below only after training and backtesting under the **current** `config/config.yaml` with a fresh `<RUN_ID>`.
+> **No definitive published OOS results yet.** Current pipeline: **`feature_split_mode: independent`**, cap **`max_single_asset_weight: 0.25`**, benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_relative_max_share: 0.6`**), aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. Any interim probes must be interpreted through their snapshotted `Runs/<id>/config.yaml`.
 
-Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. When reported, OOS metrics will use **`Runs/<run_id>/models/best/best_model.zip`** (maximum mean in-training eval NAV), not holdout-tuned weights.
+Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. When reported, OOS metrics will use **`Runs/<run_id>/models/best/best_model.zip`** (maximum mean in-training eval NAV **after full fees/churn on eval**), not holdout-tuned weights.
 
 **Operations:** [TRAINING.md](TRAINING.md) · **Modal GPU:** [MODAL.md](MODAL.md) · **Implementation:** [README.md](../README.md)
 
@@ -19,7 +19,7 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 | Policy | RecurrentPPO `MlpLstmPolicy`, 2×64 LSTM, MLP [128,128] |
 | Tradeable **N** | `len(universe.assets)` (default example **N = 10**) |
 | Observation | `obs_dim = 10N + 28` (includes per-asset **live mask**) |
-| Action | `Box(−3,3)^(N+1)` → EMA logits → softmax (cash competes) → live mask → cap 0.35 → long-only simplex |
+| Action | `Box(−3,3)^(N+1)` → EMA logits → softmax (cash competes) → live mask → cap **0.25** → long-only simplex |
 | Training episodes | `max_episode_steps = 252` (train); eval = full walk-forward segment |
 | Training | 16 envs (local), `n_steps` 4096, `batch_size` 16384, `n_epochs` 3, `gamma` 0.975 → **12** backprop loops/pause; VecNormalize (obs on, reward norm train-only); cosine LR; fee/churn/DR curriculum |
 | Modal training | Optional H100/A100 via `scripts/modal_app.py`; broker overrides `n_envs` + `batch_size` at launch ([MODAL.md](MODAL.md)) |
@@ -136,7 +136,7 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 1. **Fractional differentiation** (`data.fracdiff_d: 0.4`) on log prices.
 2. **Walk-forward blocks:** `train_test_split_alternating`, `block_size` 126, `eval_stride` 4 (`WalkforwardEnvPack` in `data_utils.py`).
-3. **Feature split mode** (`data.feature_split_mode`): `continuous` (default — compute on full trainable panel, slice per block; eval carries indicator memory across adjacent blocks) vs `independent` (recompute per segment + neutralize first `feature_purge_warmup: 25` bars). Holdout reserved first in both modes.
+3. **Feature split mode** (`data.feature_split_mode`): **`independent`** (default — recompute per segment + neutralize first `feature_purge_warmup: 25` bars) vs `continuous` (compute on full trainable panel, slice per block; eval carries indicator memory across adjacent blocks). Holdout reserved first in both modes.
 4. **`asset_live` panel:** no global calendar `dropna`; missing pre-IPO bars filled; live mask gates allocation.
 5. **Causal execution:** features at `t` use `close[t−obs_lag]`; holding cost at `close[t]`; fill `open[t+1]`; MTM `close[t+1]`.
 6. **Chronological holdout:** removed before train/eval; only `scripts/backtest.py` uses OOS bars.
@@ -149,36 +149,38 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 **Policy:** `Box(−3, 3)^(N+1)` logits.
 
-**Action → weights:** EMA on logits (`action_smoothing_alpha: 0.15`, train + backtest) → **softmax** (cash competes with risky assets) → `asset_live` mask → per-asset cap (`max_single_asset_weight: 0.35`) with redistribute + final projection to cash → long-only simplex.
+**Action → weights:** EMA on logits (`action_smoothing_alpha: 0.15`, train + backtest) → **softmax** (cash competes with risky assets) → `asset_live` mask → per-asset cap (`max_single_asset_weight: 0.25`) with redistribute + final projection to cash → long-only simplex.
 
 **Observation:** `obs_dim = 10N + 28` — per-asset fracdiff/vol/RSI/MACD/trend, live mask, portfolio state, drawdown/progress, four macro series (not tradeable).
 
 **Episodes:** `max_episode_steps: 252` (train); eval = full segment. Early stop if NAV ≤ `stop_loss_fraction` (0.45) × episode-start NAV.
 
-**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. Eval/backtest: `obs_lag = 1`, `fee_scale = 1`.
+**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. **Eval:** mirrors train fee/churn curriculum (linear ramp); fixed `obs_lag = 1`, no DR. OOS backtest: `obs_lag = 1`, `fee_scale = 1`.
 
 ### Reward decomposition
 
 Per-step (before VecNormalize during training):
 
-`reward = return (with downside amp) + sortino_diff + participation − inactivity − churn`
+`reward = return (with downside amp) + benchmark_excess + sortino_diff + participation − inactivity − churn`
 
 | Component | Sign | Implementation | Default coefficients |
 |-----------|------|----------------|-------------------|
 | **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 5` |
-| **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window` (min `sortino_min_steps` warmup), clipped ±3; benchmark uses same friction model | `risk_bonus_scale: 25` |
+| **Benchmark excess** | + | `clip(agent_log_ret − bench_log_ret, ±clip) × benchmark_excess_scale` (same friction model as Sortino bench) | `benchmark_excess_scale: 600`; `benchmark_excess_clip: 0.04` |
+| **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window`, clipped ±3 | `risk_bonus_scale: 2.5` |
+| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_relative_max_share` of \|return\|+\|participation\|+\|inactivity\|+\|churn\| | **0.6** (`0` disables both) |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
-| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.5** + **1.0** tail (max **~2.5** at 100% cash) |
-| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` (multiplier on realized tx cost) |
+| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.35** + **0.9** tail (max **~2.25** at 100% cash) |
+| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |
 | **Drawdown amp** | (in return) | Extra negative return when underwater; logged as `rew_decomp/drawdown` | `drawdown_downside_gamma: 5` |
 
-`info` / TensorBoard: `rew_decomp/return`, `sortino`, `participation`, `inactivity`, `churn`, `drawdown`, `vix_churn_mult`.
+`info` / TensorBoard: `rew_decomp/return`, `benchmark`, `sortino`, `participation`, `inactivity`, `churn`, `drawdown`, `vix_churn_mult`.
 
-**Churn detail:** `tx_cost_frac` = realized slippage + fee dollars ÷ NAV (zero when `fee_scale = 0`). `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Training `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the fee ramp window. Eval/backtest: `churn_scale = 1`.
+**Churn detail:** `tx_cost_frac` = realized slippage + fee dollars ÷ NAV (zero when `fee_scale = 0`). `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Train **and eval** `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the fee ramp window. OOS backtest: `churn_scale = 1`.
 
 **Inactivity detail:** Training and eval envs use `eval_inactivity_penalty_scale: 1.0` (balanced with return term; cash can beat a −1% day).
 
-**Costs:** per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists in `transaction_costs`, keyed like `universe.assets`). Training curriculum: `fee_scale` **0** → linear ramp → **1.0**, then DR on fee/lag bounds. OOS backtest: `fee_scale = 1`.
+**Costs:** per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists in `transaction_costs`, keyed like `universe.assets`). **Train + eval** curriculum: `fee_scale` **0** → linear ramp → **1.0**; DR widening on train only after ramp. OOS backtest: `fee_scale = 1`.
 
 | Asset (example) | Slippage | Tx fee | Annual holding |
 |-----------------|----------|--------|----------------|
@@ -229,14 +231,15 @@ Default `--checkpoint` is **`best`** (eval-NAV-selected); `latest`/`both` print 
 
 ## Training loop & curriculum (65M timesteps)
 
-RecurrentPPO + VecNormalize (obs norm on; reward norm train-only) + `TradingCurriculumCallback` + `EvalNavBestModelCallback` + `AdaptiveEntropyCallback` + `RewardDecompCallback` + `TrainingVizCallback`. Cosine LR to `learning_rate_floor`. Optional patience early-stop via `training.early_stop_patience` (after `dr_widen_end` curriculum milestone). Milestones use `curriculum.budget_short` fractions in `config/config.yaml`:
+RecurrentPPO + VecNormalize (obs norm on; reward norm train-only) + `TradingCurriculumCallback` (fee/churn on **train + eval**) + `EvalNavBestModelCallback` (best saves gated until **`fee_ramp_end`**) + `AdaptiveEntropyCallback` + `RewardDecompCallback` + `TrainingVizCallback`. Cosine LR to `learning_rate_floor`. Optional patience early-stop via `training.early_stop_patience` (after `dr_widen_end` curriculum milestone). Milestones use `curriculum.budget_short` fractions in `config/config.yaml`:
 
 | Phase | Approx. step (65M run) | Effect |
 |-------|------------------------|--------|
-| Fee-free | 0 – 6.5M (`fee_free_fraction` 0.10) | `fee_scale = 0` |
-| Fee ramp | 6.5M – 29.25M (`fee_ramp_fraction` 0.45) | fees → full |
-| Churn ramp | 6.5M – 29.25M (aligned with fee ramp) | `curriculum_churn_scale` 0 → 0.1 → 1.0 (`churn_ramp_floor: 0.1`) |
-| DR widen | through ~42.25M (`dr_widen_span_fraction` 0.65) | fee/lag domain-randomization bounds widen |
+| Fee-free | 0 – 6.5M (`fee_free_fraction` 0.10) | `fee_scale = 0` (train + eval) |
+| Fee ramp | 6.5M – 29.25M (`fee_ramp_fraction` 0.45) | fees → full (train + eval, linear) |
+| Churn ramp | 6.5M – 29.25M (aligned with fee ramp) | `curriculum_churn_scale` 0 → 0.1 → 1.0 (train + eval) |
+| Best-model gate | opens at **29.25M** (`fee_ramp_end`; `best_model_min_step: null`) | eval NAV logged always; `models/best/` updates only after full eval fees + churn |
+| DR widen | through ~42.25M (`dr_widen_span_fraction` 0.65) | fee/lag domain-randomization bounds widen (**train only**) |
 | Entropy | cosine decay from `decay_start_fraction` 0.45 (~29.25M) | exploration → `final_ent` |
 | Eval / plot | every **500k** global steps | ~130 eval rollouts per 65M run (decoupled from `n_steps`) |
 | Checkpoints | every **1M** global steps | `models/checkpoints/ppo_*_steps.zip` |

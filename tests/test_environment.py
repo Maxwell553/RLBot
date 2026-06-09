@@ -31,8 +31,8 @@ def _assert_valid_weights(w: np.ndarray, n_actions: int = _N_ACTIONS) -> None:
     assert np.all(w[1:] <= cap + _CAP_TOL), f"max risky weight {w[1:].max():.6f} > cap {cap}"
 
 
-def test_config_cap_is_half() -> None:
-    assert _max_cap() == pytest.approx(0.35)
+def test_config_cap_matches_yaml() -> None:
+    assert _max_cap() == pytest.approx(0.25)
 
 
 def test_softmax_mean_decoupling() -> None:
@@ -360,10 +360,10 @@ def test_rebalance_tx_cost_scales_with_fee_scale() -> None:
 
 
 def test_inactivity_penalty_bounded_at_full_cash() -> None:
-    """100% cash inactivity penalty is ~2.5 with default config (1.5 + 1.0 tail)."""
+    """100% cash inactivity penalty matches config (over_50 + over_90 tail)."""
     rwd = get_config().reward
     expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    assert expected == pytest.approx(2.5)
+    assert expected == pytest.approx(2.25)
 
 
 def test_churn_penalty_uses_tx_cost_not_turnover() -> None:
@@ -426,3 +426,69 @@ def test_downside_return_amplified_when_in_drawdown() -> None:
             assert info["rew_decomp/return"] < 0.0
             break
     assert drawdown_seen
+
+
+def test_benchmark_relative_share_cap() -> None:
+    from rlbot.trading_env import _scale_benchmark_relative_components
+
+    sortino, benchmark = _scale_benchmark_relative_components(
+        sortino=10.0,
+        benchmark=10.0,
+        return_component=5.0,
+        participation=1.0,
+        inactivity=0.5,
+        churn=0.2,
+        max_share=0.6,
+    )
+    other_abs = 5.0 + 1.0 + 0.5 + 0.2
+    bench_abs = abs(sortino + benchmark)
+    assert bench_abs <= (0.6 * other_abs) / 0.4 + 1e-9
+    total_abs = bench_abs + other_abs
+    assert bench_abs / total_abs <= 0.601
+
+
+def test_benchmark_relative_max_share_zero_disables_terms() -> None:
+    from rlbot.trading_env import _scale_benchmark_relative_components
+
+    sortino, benchmark = _scale_benchmark_relative_components(
+        sortino=10.0,
+        benchmark=8.0,
+        return_component=5.0,
+        participation=1.0,
+        inactivity=0.5,
+        churn=0.2,
+        max_share=0.0,
+    )
+    assert sortino == 0.0
+    assert benchmark == 0.0
+
+
+def test_episode_end_nav_recorder_importable() -> None:
+    from rlbot.trading_env import EpisodeEndNavRecorder
+
+    assert EpisodeEndNavRecorder is not None
+
+
+def test_benchmark_excess_logged_in_step() -> None:
+    n_assets = _N_ASSETS
+    t = 120
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        max_episode_steps=200,
+    )
+    env.reset()
+    action = np.ones(env.n_actions)
+    for _ in range(25):
+        _, _, term, trunc, info = env.step(action)
+        if term or trunc:
+            break
+    assert "rew_decomp/benchmark" in info
