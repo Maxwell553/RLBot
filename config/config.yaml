@@ -105,7 +105,7 @@ training:
   eval_n_episodes: 1  # fallback if segment list empty; train.py sets n_eval = #eval blocks
   holdout_days: 365
   viz_freq: 500000
-  curriculum_update_freq: 50000
+  curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
   checkpoint_save_freq_steps: 1000000
   reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
   early_stop_patience: 0     # >0 → stop after K evals with no new best (after curriculum)

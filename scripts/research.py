@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -127,10 +128,15 @@ def _materialize(spec: ExperimentSpec) -> dict:
     return cohort_manifest
 
 
-def _train_cmd(entry: dict, spec: ExperimentSpec, overwrite_run: bool = False) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(REPO / "scripts" / "train.py"),
+def _train_cmd(
+    entry: dict,
+    spec: ExperimentSpec,
+    overwrite_run: bool = False,
+    backend: str = "local",
+    modal_gpu: str | None = None,
+    timesteps_override: int | None = None,
+) -> list[str]:
+    train_flags = [
         "--config",
         entry["config_path"],
         "--run-id",
@@ -142,15 +148,51 @@ def _train_cmd(entry: dict, spec: ExperimentSpec, overwrite_run: bool = False) -
     if overwrite_run:
         # Deliberate retry of a crashed/failed (never-scored) variant: train.py's
         # run-dir guard would otherwise refuse the deterministic run id forever.
-        cmd.append("--overwrite-run")
-    if spec.timesteps:
-        cmd += ["--timesteps", str(spec.timesteps)]
+        train_flags.append("--overwrite-run")
+    ts = timesteps_override if timesteps_override is not None else spec.timesteps
+    if ts:
+        train_flags += ["--timesteps", str(ts)]
     w = entry.get("window") or {}
     for flag, key in (("--train-end", "train_end"), ("--holdout-start", "holdout_start"),
                       ("--holdout-end", "holdout_end")):
         if w.get(key):
-            cmd += [flag, str(w[key])]
-    return cmd
+            train_flags += [flag, str(w[key])]
+    if backend == "modal":
+        modal_bin = shutil.which("modal")
+        if not modal_bin:
+            raise SystemExit(
+                "--backend modal requires the modal CLI (pip install -e '.[modal]' "
+                "&& modal setup)."
+            )
+        gpu_flags = ["--modal-gpu", modal_gpu] if modal_gpu else []
+        return [modal_bin, "run", str(REPO / "scripts" / "modal_app.py"), "--",
+                *gpu_flags, *train_flags]
+    return [sys.executable, str(REPO / "scripts" / "train.py"), *train_flags]
+
+
+def _modal_pre_train(entry: dict) -> None:
+    """Push the variant config to the Modal runs volume (the remote train reads the
+    same repo-relative Runs/<cohort>/configs/... path off the mounted volume)."""
+    from rlbot.modal_cloud import VOLUME_RUNS
+
+    cfg = Path(entry["config_path"]).resolve()
+    rel = cfg.relative_to((REPO / "Runs").resolve())
+    subprocess.run(
+        [shutil.which("modal") or "modal", "volume", "put", VOLUME_RUNS,
+         str(cfg), str(rel), "--force"],
+        check=True,
+        cwd=str(REPO),
+    )
+
+
+def _modal_post_train(entry: dict) -> None:
+    """Pull the finished run tree from the Modal volume so collect/backtest see it."""
+    subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "modal_app.py"), "sync",
+         "--run-id", entry["run_id"], "--pull-all"],
+        check=True,
+        cwd=str(REPO),
+    )
 
 
 def _oos_env(cohort: str, window_budget: int | None = None) -> dict:
@@ -285,7 +327,11 @@ def cmd_launch(args: argparse.Namespace) -> None:
         if stale_run_dir:
             print(f"[research] [{n}/{len(variants)}] {e['run_id']}: stale unscored run dir "
                   "from a previous attempt; retraining with --overwrite-run.")
-        train = _train_cmd(e, spec, overwrite_run=stale_run_dir)
+        backend = getattr(args, "backend", "local")
+        train = _train_cmd(
+            e, spec, overwrite_run=stale_run_dir, backend=backend,
+            modal_gpu=getattr(args, "modal_gpu", None),
+        )
         bt = _backtest_cmd(e) if touches_oos else None
         if args.dry_run:
             print("DRY-RUN train:", " ".join(train))
@@ -294,9 +340,20 @@ def cmd_launch(args: argparse.Namespace) -> None:
             continue
         # Per-variant resilience: a failed run is logged + recorded, the sweep continues.
         t0 = time.perf_counter()
-        print(f"[research] [{n}/{len(variants)}] training {e['run_id']} (cwd={REPO}) ...")
+        print(f"[research] [{n}/{len(variants)}] training {e['run_id']} "
+              f"(backend={backend}, cwd={REPO}) ...")
+        # spec.budget.max_modal_hours = per-variant wall-clock cap (enforced on both
+        # backends; a hung remote/local train must not stall the whole cohort).
+        timeout_s = None
+        max_h = (spec.budget or {}).get("max_modal_hours")
+        if max_h:
+            timeout_s = float(max_h) * 3600.0
         try:
-            subprocess.run(train, check=True, cwd=str(REPO))
+            if backend == "modal":
+                _modal_pre_train(e)
+            subprocess.run(train, check=True, cwd=str(REPO), timeout=timeout_s)
+            if backend == "modal":
+                _modal_post_train(e)
             if bt:
                 # Record the OOS read BEFORE it happens, so a crash between backtest and
                 # collect can never leave an unaccounted holdout read. Gate + append are
@@ -313,6 +370,14 @@ def cmd_launch(args: argparse.Namespace) -> None:
             registry.append_record(reg, _collect_one(cm, e, tier=tier))
             print(f"[research] [{n}/{len(variants)}] {e['run_id']} done "
                   f"({time.perf_counter() - t0:.0f}s)")
+        except subprocess.TimeoutExpired:
+            msg = f"wall-clock cap exceeded ({max_h}h, spec budget.max_modal_hours)"
+            print(f"[research] ERROR: variant {e['run_id']} timed out: {msg}", file=sys.stderr)
+            registry.append_record(
+                reg, _collect_one(cm, e, tier=tier, status="failed", failure=msg)
+            )
+            failures.append((e["run_id"], msg))
+            continue
         except subprocess.CalledProcessError as exc:
             msg = f"exit {exc.returncode} from {' '.join(exc.cmd[:3])}..."
             print(f"[research] ERROR: variant {e['run_id']} failed: {msg}", file=sys.stderr)
@@ -479,6 +544,128 @@ def cmd_promote(args: argparse.Namespace) -> None:
           f"maxDD={record.get('oos_max_drawdown')}")
 
 
+def cmd_run_queue(args: argparse.Namespace) -> None:
+    """Process queued specs (Runs/queue/*.yaml) sequentially: launch → report, then
+    move each spec to done/ or failed/. The queue is the substrate an autonomous
+    proposer schedules onto; tier ≥ 4 specs are REFUSED here — promotion stays a
+    human action (run `promote` directly)."""
+    qdir = Path(args.queue_dir)
+    qdir.mkdir(parents=True, exist_ok=True)
+    (qdir / "done").mkdir(exist_ok=True)
+    (qdir / "failed").mkdir(exist_ok=True)
+    pending = sorted(p for p in qdir.glob("*.yaml") if p.is_file())
+    if not pending:
+        print(f"[research] queue empty: {qdir}")
+        return
+    for spec_path in pending:
+        print(f"\n[research] ===== queue: {spec_path.name} =====")
+        try:
+            spec = load_spec(spec_path)
+            if gates.tier_touches_oos(spec.evaluation_tier):
+                raise PermissionError(
+                    f"tier {spec.evaluation_tier} touches the OOS holdout; the queue "
+                    "never promotes. Run `research.py promote` by hand."
+                )
+            sub = argparse.Namespace(
+                spec=str(spec_path), promote=False, dry_run=False,
+                oos_budget=1, window_budget=getattr(args, "window_budget", None),
+                backend=getattr(args, "backend", "local"),
+                modal_gpu=getattr(args, "modal_gpu", None),
+            )
+            cmd_launch(sub)
+            cmd_report(argparse.Namespace(cohort=spec.id))
+        except SystemExit as exc:
+            # cmd_launch exits non-zero on per-variant failures after finishing the
+            # sweep — record and keep draining the queue.
+            print(f"[research] queue: {spec_path.name} finished with failures: {exc}",
+                  file=sys.stderr)
+            shutil.move(str(spec_path), qdir / "failed" / spec_path.name)
+            continue
+        except (PermissionError, ValueError, KeyError) as exc:
+            print(f"[research] queue: {spec_path.name} rejected: {exc}", file=sys.stderr)
+            shutil.move(str(spec_path), qdir / "failed" / spec_path.name)
+            continue
+        shutil.move(str(spec_path), qdir / "done" / spec_path.name)
+        print(f"[research] queue: {spec_path.name} → done/")
+
+
+def cmd_screen(args: argparse.Namespace) -> None:
+    """Successive-halving screen: run EVERY grid combo at tier 1 with a tiny budget,
+    rank seed-groups by median best_eval_nav, and write screen_ranking.json naming
+    the top fraction to advance to a full-tier launch. Never touches the holdout."""
+    spec = load_spec(args.spec)
+    if not spec.grid:
+        raise SystemExit("screen requires a spec with a grid (nothing to halve).")
+    cm = _materialize(spec)
+    reg = _registry_path(spec.id)
+    screen_tier = 1
+    ts = int(args.screen_timesteps)
+    print(f"[research] screening {len(cm['variants'])} variant(s) at tier {screen_tier} "
+          f"({ts:,} timesteps each)")
+    failures = []
+    for n, e in enumerate(cm["variants"], 1):
+        existing = registry.read_records(reg)
+        if (e["run_id"], screen_tier) in _scored_keys(existing):
+            print(f"[research] [{n}/{len(cm['variants'])}] {e['run_id']} already screened; skipping.")
+            continue
+        stale = RunPaths(e["run_id"]).manifest_path.is_file()
+        train = _train_cmd(
+            e, spec, overwrite_run=stale, backend=getattr(args, "backend", "local"),
+            modal_gpu=getattr(args, "modal_gpu", None), timesteps_override=ts,
+        )
+        print(f"[research] [{n}/{len(cm['variants'])}] screen-train {e['run_id']} ...")
+        try:
+            if getattr(args, "backend", "local") == "modal":
+                _modal_pre_train(e)
+            subprocess.run(train, check=True, cwd=str(REPO))
+            if getattr(args, "backend", "local") == "modal":
+                _modal_post_train(e)
+            registry.append_record(reg, _collect_one(cm, e, tier=screen_tier))
+        except subprocess.CalledProcessError as exc:
+            msg = f"exit {exc.returncode}"
+            registry.append_record(
+                reg, _collect_one(cm, e, tier=screen_tier, status="failed", failure=msg)
+            )
+            failures.append((e["run_id"], msg))
+    records = [
+        r for r in registry.read_records(reg)
+        if int(r.get("evaluation_tier", 0)) == screen_tier
+        and str(r.get("status", "ok")) == "ok"
+    ]
+    by_group: dict[str, list[dict]] = {}
+    for r in records:
+        by_group.setdefault(str(r.get("group_id") or r.get("variant_id")), []).append(r)
+    import statistics as _st
+
+    ranked = sorted(
+        (
+            (gid, _st.median([float(r["best_eval_nav"]) for r in rows
+                              if r.get("best_eval_nav") is not None] or [float("-inf")]))
+            for gid, rows in by_group.items()
+        ),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    keep_n = max(1, int(round(len(ranked) * float(args.keep_top))))
+    out = {
+        "screen_timesteps": ts,
+        "keep_top": float(args.keep_top),
+        "ranking": [{"group_id": g, "median_best_eval_nav": v} for g, v in ranked],
+        "advance": [g for g, _ in ranked[:keep_n]],
+    }
+    out_path = _cohort_dir(spec.id) / "screen_ranking.json"
+    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"\n[research] screen ranking ({len(ranked)} group(s); advancing top {keep_n}):")
+    for g, v in ranked:
+        marker = "→ ADVANCE" if g in out["advance"] else ""
+        print(f"  {v:>14,.0f}  {g}  {marker}")
+    print(f"[research] wrote {out_path}")
+    print("[research] next: restrict the spec's grid to the advancing combos in a NEW "
+          "spec id and launch at the full tier/budget.")
+    if failures:
+        raise SystemExit(f"{len(failures)} screen variant(s) failed.")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -486,8 +673,12 @@ def main() -> None:
     sp = sub.add_parser("plan"); sp.add_argument("spec"); sp.set_defaults(func=cmd_plan)
     sl = sub.add_parser("launch")
     sl.add_argument("spec")
-    sl.add_argument("--backend", default="local", choices=("local",),
-                    help="execution backend (only 'local' is implemented)")
+    sl.add_argument("--backend", default="local", choices=("local", "modal"),
+                    help="execution backend: local subprocess or Modal cloud "
+                    "(pushes the variant config to the runs volume, trains remotely, "
+                    "pulls the run tree back before collect)")
+    sl.add_argument("--modal-gpu", default=None,
+                    help="GPU profile for --backend modal (e.g. A10G, H100)")
     sl.add_argument("--promote", action="store_true")
     sl.add_argument("--dry-run", action="store_true")
     sl.add_argument(
@@ -501,6 +692,19 @@ def main() -> None:
     )
     sl.set_defaults(func=cmd_launch)
     sc = sub.add_parser("collect"); sc.add_argument("cohort"); sc.set_defaults(func=cmd_collect, spec=None)
+    sq = sub.add_parser("run-queue", help="drain Runs/queue/*.yaml: launch+report each, move to done/failed")
+    sq.add_argument("--queue-dir", default=str(PROJECT_ROOT / "Runs" / "queue"))
+    sq.add_argument("--backend", default="local", choices=("local", "modal"))
+    sq.add_argument("--modal-gpu", default=None)
+    sq.add_argument("--window-budget", type=int, default=None)
+    sq.set_defaults(func=cmd_run_queue)
+    ss = sub.add_parser("screen", help="tier-1 successive-halving screen over a grid spec")
+    ss.add_argument("spec")
+    ss.add_argument("--screen-timesteps", type=int, default=2_000_000)
+    ss.add_argument("--keep-top", type=float, default=0.25)
+    ss.add_argument("--backend", default="local", choices=("local", "modal"))
+    ss.add_argument("--modal-gpu", default=None)
+    ss.set_defaults(func=cmd_screen)
     sr = sub.add_parser("report"); sr.add_argument("cohort"); sr.set_defaults(func=cmd_report)
     spm = sub.add_parser("promote")
     spm.add_argument("spec")

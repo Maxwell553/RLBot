@@ -28,7 +28,18 @@ WORKSPACE = "/workspace"
 DEFAULT_GPU = "A10G"
 MODAL_MAX_TIMEOUT_SEC = 86_400
 DEFAULT_TIMEOUT_SEC = MODAL_MAX_TIMEOUT_SEC
-N_STEPS = 4096
+def _config_n_steps() -> int:
+    """hyperparameters.n_steps from the active config; falls back to 4096 only if
+    the config cannot be parsed (keeps the broker usable in skeleton containers)."""
+    try:
+        from rlbot.rl_config import get_config
+
+        return int(get_config().hyperparameters.n_steps)
+    except Exception:
+        return 4096
+
+
+N_STEPS = _config_n_steps()
 TARGET_MINIBATCHES_PER_EPOCH = 4
 MODAL_GPU_FLAG = "--modal-gpu"
 

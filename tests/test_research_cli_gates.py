@@ -3,6 +3,7 @@ mocked out — no training, no torch. Proves the gate ordering and registry reco
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import shutil
@@ -255,3 +256,44 @@ def test_launch_runs_unscored_variant(harness) -> None:
     records = registry.read_records(reg)
     assert [r["status"] for r in records] == ["failed", "ok"]
     assert records[-1]["git_commit"] == "deadbeef"  # collected from fabricated manifest
+
+
+# ── Phase C: backend command construction, queue guardrail, screen ranking ──
+def test_train_cmd_modal_backend_constructs_modal_invocation(monkeypatch) -> None:
+    import scripts.research as research
+
+    monkeypatch.setattr(research.shutil, "which", lambda b: f"/usr/bin/{b}")
+    entry = {"config_path": "Runs/c/configs/v.yaml", "run_id": "v", "seed": 7,
+             "window": {"train_end": "2021-12-31", "holdout_start": "2022-01-01",
+                        "holdout_end": "2023-12-31"}}
+    spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
+    cmd = research._train_cmd(entry, spec, backend="modal", modal_gpu="H100")
+    assert cmd[0].endswith("modal") and cmd[1] == "run"
+    assert "--" in cmd and "--modal-gpu" in cmd and "H100" in cmd
+    assert "--run-id" in cmd and "v" in cmd
+    # timesteps override beats spec timesteps
+    cmd2 = research._train_cmd(entry, spec, timesteps_override=123)
+    assert "123" in cmd2
+
+
+def test_train_cmd_modal_requires_cli(monkeypatch) -> None:
+    import scripts.research as research
+
+    monkeypatch.setattr(research.shutil, "which", lambda b: None)
+    entry = {"config_path": "c.yaml", "run_id": "v", "seed": 1, "window": {}}
+    spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
+    with pytest.raises(SystemExit, match="modal CLI"):
+        research._train_cmd(entry, spec, backend="modal")
+
+
+def test_run_queue_refuses_oos_tiers(harness, tmp_path) -> None:
+    mod, tmp, state = harness
+    qdir = tmp / "queue"
+    qdir.mkdir()
+    spec_path = _write_spec(tmp, spec_id="exp_q4", tier=4, seeds=[0])
+    shutil.copy2(spec_path, qdir / "exp_q4.yaml")
+    mod.cmd_run_queue(argparse.Namespace(queue_dir=str(qdir), backend="local",
+                                         modal_gpu=None, window_budget=None))
+    assert not (qdir / "exp_q4.yaml").exists()
+    assert (qdir / "failed" / "exp_q4.yaml").exists()
+    assert state["calls"] == []  # nothing trained, nothing backtested

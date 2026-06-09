@@ -40,6 +40,9 @@ modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID>
 # Auto-research loop (spec → train/backtest → JSONL registry → report; OOS-gated)
 python scripts/research.py plan   specs/feature_split_ab.yaml   # materialize variant configs
 python scripts/research.py launch specs/feature_split_ab.yaml   # tiers 1–3; tier ≥4 needs --promote
+python scripts/research.py launch specs/x.yaml --backend modal --modal-gpu H100  # cloud variants
+python scripts/research.py screen specs/x.yaml --keep-top 0.25  # tier-1 grid screen (halving)
+python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (no tier ≥4)
 python scripts/research.py report feature_split_ab
 
 # Audited target weights for a run (provenance-rich; measurement only, no broker)

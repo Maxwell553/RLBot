@@ -1389,9 +1389,13 @@ def main() -> None:
         save_vecnormalize=True,
     )
 
+    # curriculum_update_freq is configured in GLOBAL timesteps; callbacks count
+    # vector steps (n_calls), so divide by n_envs — otherwise the ramp granularity
+    # (and thus training behavior) silently varies with the GPU profile's env count.
+    callback_update_freq = max(tr_cfg.curriculum_update_freq // n_envs, 1)
     reward_decomp_callback = RewardDecompCallback(
         json_path=paths.eval_log_dir / "reward_decomp.json",
-        log_freq=max(tr_cfg.curriculum_update_freq, 1),
+        log_freq=callback_update_freq,
     )
     callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
     if not finetune_mode:
@@ -1400,7 +1404,7 @@ def main() -> None:
             TradingCurriculumCallback(
                 train_env,
                 learn_budget=args.timesteps,
-                update_freq=tr_cfg.curriculum_update_freq,
+                update_freq=callback_update_freq,
                 eval_vec_env=eval_env,
             ),
         )
