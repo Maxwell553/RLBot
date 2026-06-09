@@ -53,19 +53,32 @@ def _render(by_group: dict[str, list[Mapping]]) -> str:
             tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
             lines.append(f"| {group_id} | {tier} | 0 | — | — | — | — | — | — |")
             continue
-        tier = max(int(r.get("evaluation_tier", 0)) for r in rows)
-        seeds = {r.get("seed") for r in rows if r.get("seed") is not None}
-        n_seeds = len(seeds) if seeds else len(rows)
-        eval_nav = _median([r.get("best_eval_nav") for r in rows])
+        # One run can hold several scored records (tier-3 launch + tier-4 promote).
+        # Dedupe per run_id keeping the highest-tier record — otherwise the promoted
+        # (best) seed enters every median twice, biasing best_eval_nav upward.
+        by_run: dict[str, Mapping] = {}
+        for i, r in enumerate(rows):
+            rid = str(r.get("run_id") or f"__row{i}")  # legacy records without run_id
+            if rid not in by_run or int(r.get("evaluation_tier", 0)) > int(
+                by_run[rid].get("evaluation_tier", 0)
+            ):
+                by_run[rid] = r
+        runs = list(by_run.values())
+        tier = max(int(r.get("evaluation_tier", 0)) for r in runs)
+        seeds = {r.get("seed") for r in runs if r.get("seed") is not None}
+        n_seeds = len(seeds) if seeds else len(runs)
+        eval_nav = _median([r.get("best_eval_nav") for r in runs])
         # The OOS firewall: only promoted (tier >= 4) scored records may surface holdout
         # metrics, regardless of what a hand-run backtest wrote into a low-tier summary.
-        oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
+        oos_rows = [r for r in runs if int(r.get("evaluation_tier", 0)) >= 4]
         ret = _median([r.get("oos_total_return") for r in oos_rows])
         sharpe = _median([r.get("oos_sharpe") for r in oos_rows])
         dd = _median([r.get("oos_max_drawdown") for r in oos_rows])
-        split = rows[0].get("feature_split_mode") or "—"
+        splits = sorted({str(r.get("feature_split_mode")) for r in runs if r.get("feature_split_mode")})
+        split = "/".join(splits) if splits else "—"
+        oos_n = f" (n={len(oos_rows)})" if oos_rows and len(oos_rows) < len(runs) else ""
         lines.append(
-            f"| {group_id} | {tier} | {n_seeds} | {_fmt(eval_nav)} | {_fmt(ret, pct=True)} | "
+            f"| {group_id} | {tier} | {n_seeds} | {_fmt(eval_nav)} | {_fmt(ret, pct=True)}{oos_n} | "
             f"{_fmt(sharpe)} | {_ci_cell(oos_rows)} | {_fmt(dd, pct=True)} | {split} |"
         )
     return "\n".join(lines)

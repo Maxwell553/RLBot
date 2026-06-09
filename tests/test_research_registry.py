@@ -314,15 +314,21 @@ def test_report_aggregates_across_seeds_via_group_id(tmp_path: Path) -> None:
 
     records = [
         {"variant_id": "ab__x=1__seed42__W1", "group_id": "ab__x=1__W1", "seed": 42,
-         "evaluation_tier": 3, "best_eval_nav": 100.0},
+         "run_id": "ab__x=1__seed42__W1", "evaluation_tier": 3, "best_eval_nav": 100.0},
         {"variant_id": "ab__x=1__seed101__W1", "group_id": "ab__x=1__W1", "seed": 101,
-         "evaluation_tier": 3, "best_eval_nav": 120.0},
+         "run_id": "ab__x=1__seed101__W1", "evaluation_tier": 3, "best_eval_nav": 120.0},
         {"variant_id": "ab__x=1__seed777__W1", "group_id": "ab__x=1__W1", "seed": 777,
-         "evaluation_tier": 3, "best_eval_nav": 140.0},
+         "run_id": "ab__x=1__seed777__W1", "evaluation_tier": 3, "best_eval_nav": 140.0},
+        # the promoted (best) seed gets a SECOND record at tier 4 — it must not be
+        # double-counted in the cross-seed medians
+        {"variant_id": "ab__x=1__seed777__W1", "group_id": "ab__x=1__W1", "seed": 777,
+         "run_id": "ab__x=1__seed777__W1", "evaluation_tier": 4, "best_eval_nav": 140.0,
+         "oos_total_return": 0.1, "oos_sharpe": 0.5, "oos_max_drawdown": -0.2},
     ]
     out = report.write_report(records, tmp_path / "r.md", title="t")
     text = out.read_text(encoding="utf-8")
-    assert "| ab__x=1__W1 | 3 | 3 | 120.00 |" in text  # one row, 3 seeds, median NAV
+    # one row, 3 seeds, true cross-seed median NAV (promoted run deduped), tier max 4
+    assert "| ab__x=1__W1 | 4 | 3 | 120.00 |" in text
     assert "seed42" not in text.split("|---|")[1]  # no per-seed rows
 
 
@@ -362,3 +368,60 @@ def test_registry_read_skips_torn_lines(tmp_path: Path, capsys) -> None:
     records = registry.read_records(reg)
     assert [r["run_id"] for r in records] == ["a"]
     assert "corrupt line" in capsys.readouterr().err
+
+
+def test_gate_reads_fail_closed_on_corrupt_registry(tmp_path: Path) -> None:
+    """A corrupt line must BLOCK gate reads (a skipped scored record would silently
+    permit a repeat holdout read); lenient reads remain available for reports."""
+    from rlbot.research import registry
+
+    reg = tmp_path / "registry.jsonl"
+    registry.append_record(reg, {"run_id": "a", "variant_id": "a", "status": "ok",
+                                 "evaluation_tier": 4})
+    with reg.open("a", encoding="utf-8") as f:
+        f.write('{"run_id": "b", "variant_id": "b", "status": "ok", "evaluation_tier": 4')
+    with pytest.raises(ValueError, match="fails closed"):
+        registry.read_records(reg, on_corrupt="raise")
+    assert len(registry.read_records(reg)) == 1  # lenient path still works
+
+
+def test_registry_lock_serializes_check_then_append(tmp_path: Path) -> None:
+    from rlbot.research import registry
+
+    reg = tmp_path / "registry.jsonl"
+    with registry.registry_lock(reg):
+        registry.append_record(reg, {"run_id": "a"})
+    assert (tmp_path / "registry.jsonl.lock").exists()
+    assert registry.read_records(reg)[0]["run_id"] == "a"
+
+
+def test_spec_rejects_seed_collision_hazards() -> None:
+    from rlbot.research.spec import ExperimentSpec
+
+    with pytest.raises(ValueError, match="__seed"):
+        ExperimentSpec(id="abl__seed42_test", evaluation_tier=1)
+    with pytest.raises(ValueError, match="non-negative"):
+        ExperimentSpec(id="ok", seeds=[-1], evaluation_tier=1)
+
+
+def test_resolve_variants_rejects_id_collisions_and_disambiguates_long_values() -> None:
+    from rlbot.research.spec import ExperimentSpec, resolve_variants
+
+    # long values that share a 16-char prefix must yield DISTINCT variant ids
+    spec = ExperimentSpec(
+        id="g",
+        evaluation_tier=1,
+        seeds=[1],
+        grid={"policy.net_arch_pi": [[1024, 1024, 1024, 128], [1024, 1024, 1024, 256]]},
+    )
+    ids = [v.variant_id for v in resolve_variants(spec)]
+    assert len(set(ids)) == 2, ids
+    # grid keys sharing a last segment must not produce the same tag
+    spec2 = ExperimentSpec(
+        id="g2",
+        evaluation_tier=1,
+        seeds=[1],
+        grid={"reward.reward_scale": [1.0], "hyperparameters.n_steps": [4096]},
+    )
+    v = resolve_variants(spec2)[0]
+    assert "reward_scale=" in v.variant_id and "n_steps=" in v.variant_id

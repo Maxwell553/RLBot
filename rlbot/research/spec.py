@@ -5,6 +5,8 @@ walk-forward split — those would change what OOS *is*."""
 from __future__ import annotations
 
 import copy
+import re
+import hashlib
 import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,10 +145,20 @@ class ExperimentSpec:
     evaluation_tier: int = 1
     success_gates: dict = field(default_factory=dict)
     budget: dict = field(default_factory=dict)
+    # sha256 of the spec file text, set by load_spec; cohort.json records it so
+    # promote can refuse a spec edited after launch.
+    source_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
             raise ValueError("ExperimentSpec.id is required")
+        if re.search(r"__seed\d", self.id):
+            raise ValueError(
+                f"spec id {self.id!r} must not contain '__seed<digits>' — it would "
+                "break the cross-seed report grouping of legacy records."
+            )
+        if any(int(x) < 0 for x in self.seeds):
+            raise ValueError(f"seeds must be non-negative ints, got {self.seeds}")
         assert_patch_allowed(self.patch, self.grid)
         if self.base_config != CANONICAL_BASE_CONFIG:
             raise PermissionError(
@@ -157,14 +169,18 @@ class ExperimentSpec:
 
 
 def load_spec(path: str | Path) -> ExperimentSpec:
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    raw = Path(path).read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
     if not isinstance(data, dict):
         raise ValueError(f"spec must be a mapping, got {type(data)}")
     known = ExperimentSpec.__dataclass_fields__.keys()
     unknown = set(data) - set(known)
     if unknown:
         raise ValueError(f"unknown spec keys: {sorted(unknown)}")
-    return ExperimentSpec(**data)
+    spec = ExperimentSpec(**data)
+    # Recorded in cohort.json so promote can refuse a spec edited after launch.
+    spec.source_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return spec
 
 
 @dataclass
@@ -189,7 +205,13 @@ def _grid_combos(grid: dict) -> list[dict]:
 
 def _short(value: Any) -> str:
     s = str(value).replace(" ", "")
-    return s[:16]
+    if len(s) <= 16:
+        return s
+    # Disambiguate truncated long values: a bare s[:16] collapsed distinct grid
+    # cells into ONE variant_id/run_id, silently overwriting configs and skipping
+    # cells at launch.
+    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:6]
+    return f"{s[:10]}~{digest}"
 
 
 def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
@@ -198,7 +220,14 @@ def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
     variants: list[Variant] = []
     for combo in _grid_combos(spec.grid):
         concrete = {**spec.patch, **combo}
-        grid_tag = "_".join(f"{k.split('.')[-1]}={_short(v)}" for k, v in combo.items())
+        last_segments = [k.split(".")[-1] for k in combo]
+        # Two grid keys sharing a last segment (reward.a vs curriculum.a) must not
+        # produce the same tag; fall back to the full dotted path in that case.
+        tag_key = {
+            k: (k.split(".")[-1] if last_segments.count(k.split(".")[-1]) == 1 else k.replace(".", "-"))
+            for k in combo
+        }
+        grid_tag = "_".join(f"{tag_key[k]}={_short(v)}" for k, v in combo.items())
         for seed in spec.seeds:
             for window in windows:
                 wname = window.get("name", "") if window else ""
@@ -218,6 +247,14 @@ def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
                         group_id="__".join(group_parts),
                     )
                 )
+    ids = [v.variant_id for v in variants]
+    if len(set(ids)) != len(ids):
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        raise ValueError(
+            f"Variant id collision in spec {spec.id!r}: {dupes}. Distinct grid cells "
+            "would overwrite each other's configs and be skipped at launch — make the "
+            "colliding grid values distinguishable."
+        )
     return variants
 
 

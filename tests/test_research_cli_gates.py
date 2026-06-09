@@ -171,6 +171,7 @@ def test_promote_records_attempt_then_score_and_blocks_repeat(harness) -> None:
     spec_path = _write_spec(tmp, spec_id="exp_c", tier=3, seeds=[0])
     variant = "exp_c__seed0__W4"
     _fabricate_manifest(tmp, variant)  # already trained at tier 3
+    mod._materialize(mod.load_spec(spec_path))  # promote loads cohort.json, never rewrites it
 
     mod.cmd_promote(_promote_args(spec_path, variant))
     assert [k for k, _ in state["calls"]] == ["backtest"]
@@ -178,6 +179,8 @@ def test_promote_records_attempt_then_score_and_blocks_repeat(harness) -> None:
     assert state["registry_status_at_backtest"] == ["oos_read_attempt"]
     records = registry.read_records(tmp / "Runs" / "exp_c" / "registry.jsonl")
     assert [r["status"] for r in records] == ["oos_read_attempt", "ok"]
+    # group_id threading: materialize → cohort entry → _collect_one → record
+    assert all(r.get("group_id") == "exp_c__W4" for r in records), records
     assert all(int(r["evaluation_tier"]) >= 4 for r in records)
 
     # a second promote of the same variant is refused (multiple-testing guard)
@@ -194,6 +197,7 @@ def test_promote_crash_fails_closed_and_rescore_needs_flag(harness) -> None:
     spec_path = _write_spec(tmp, spec_id="exp_d", tier=3, seeds=[0])
     variant = "exp_d__seed0__W4"
     _fabricate_manifest(tmp, variant)
+    mod._materialize(mod.load_spec(spec_path))
     reg = tmp / "Runs" / "exp_d" / "registry.jsonl"
 
     state["backtest_raises"] = True

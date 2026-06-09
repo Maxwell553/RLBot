@@ -98,6 +98,7 @@ def _materialize(spec: ExperimentSpec) -> dict:
         "timesteps": spec.timesteps,
         "base_config": spec.base_config,
         "base_config_sha256": base_sha,
+        "spec_sha256": getattr(spec, "source_sha256", None),
         "variants": entries,
     }
     (cdir / "cohort.json").write_text(json.dumps(cohort_manifest, indent=2), encoding="utf-8")
@@ -171,6 +172,7 @@ def _collect_one(cm: dict, entry: dict, *, tier: int, status: str = "ok",
         cohort=cm["cohort"],
         variant_id=entry["variant_id"],
         group_id=entry.get("group_id") or None,
+        patch=entry.get("patch") or None,
         hypothesis=cm.get("hypothesis", ""),
         run_id=run_id,
         evaluation_tier=tier,
@@ -203,15 +205,18 @@ def cmd_launch(args: argparse.Namespace) -> None:
         print("[research] note: spec success_gates/budget are recorded in cohort.json "
               "but not enforced by the orchestrator.")
     if touches_oos:
-        gates.assert_oos_budget(len(variants), args.oos_budget)
+        already = _scored_keys(registry.read_records(reg, on_corrupt="raise"))
+        pending = [e for e in variants if (e["run_id"], tier) not in already]
+        gates.assert_oos_budget(len(pending), args.oos_budget)
         print(f"[research] WARNING: this launch will read the OOS holdout for "
-              f"{len(variants)} variant(s) (budget {args.oos_budget}).")
+              f"{len(pending)} variant(s) (budget {args.oos_budget}; per-launch — "
+              "cumulative per-window accounting is the OOS ledger's job).")
     failures: list[tuple[str, str]] = []
     cohort_t0 = time.perf_counter()
     for n, e in enumerate(variants, 1):
         # Re-read per iteration: records appended during this sweep (or by a concurrent
-        # launch) must count. The gate stays a hard fail — never caught.
-        existing = registry.read_records(reg)
+        # launch) must count. Gate reads are STRICT (fail closed on corruption) — never caught.
+        existing = registry.read_records(reg, on_corrupt="raise" if touches_oos else "skip")
         if (e["run_id"], tier) in _scored_keys(existing):
             print(f"[research] [{n}/{len(variants)}] {e['run_id']} already collected at "
                   f"tier {tier}; skipping (resume).")
@@ -238,10 +243,15 @@ def cmd_launch(args: argparse.Namespace) -> None:
             subprocess.run(train, check=True, cwd=str(REPO))
             if bt:
                 # Record the OOS read BEFORE it happens, so a crash between backtest and
-                # collect can never leave an unaccounted holdout read.
-                registry.append_record(
-                    reg, _collect_one(cm, e, tier=tier, status="oos_read_attempt")
-                )
+                # collect can never leave an unaccounted holdout read. Gate + append are
+                # atomic under the registry lock (concurrent launches/promotes).
+                with registry.registry_lock(reg):
+                    gates.assert_no_repeat_oos(
+                        registry.read_records(reg, on_corrupt="raise"), e["variant_id"]
+                    )
+                    registry.append_record(
+                        reg, _collect_one(cm, e, tier=tier, status="oos_read_attempt")
+                    )
                 print(f"[research] [{n}/{len(variants)}] backtest (OOS) {e['run_id']} ...")
                 subprocess.run(bt, check=True, cwd=str(REPO))
             registry.append_record(reg, _collect_one(cm, e, tier=tier))
@@ -296,25 +306,46 @@ def cmd_promote(args: argparse.Namespace) -> None:
     spec = load_spec(args.spec)
     if not args.promote:
         raise SystemExit("promote requires --promote (it reads the OOS holdout).")
-    cm = _materialize(spec)
+    # Promote must NOT re-materialize: rewriting cohort.json + variant configs from
+    # the *current* spec/config would silently clobber the plan of record the runs
+    # actually trained under. Load the launch-time cohort manifest and verify the
+    # spec file is unchanged.
+    cm = _read_json(_cohort_dir(spec.id) / "cohort.json")
+    if not cm:
+        raise SystemExit(f"No cohort.json for {spec.id!r}; run `plan`/`launch` first.")
+    spec_now = hashlib.sha256(Path(args.spec).read_bytes()).hexdigest()
+    spec_then = cm.get("spec_sha256")
+    if spec_then and spec_now != spec_then:
+        raise SystemExit(
+            f"Spec file {args.spec} changed since the cohort was materialized "
+            f"(sha {spec_now[:12]} != {spec_then[:12]}). Promoting under an edited "
+            "spec would mislabel the result; re-plan as a NEW cohort instead."
+        )
     entry = next((e for e in cm["variants"] if e["variant_id"] == args.variant), None)
     if entry is None:
         raise SystemExit(f"variant {args.variant!r} not in cohort {spec.id!r}")
     reg = _registry_path(spec.id)
     promote_tier = max(4, int(cm.get("evaluation_tier", 1)))
-    existing = registry.read_records(reg)
-    gates.assert_no_repeat_oos(
-        existing, entry["variant_id"], allow_failed_rescore=args.allow_failed_rescore
-    )
     bt = _backtest_cmd(entry)
     if args.dry_run:
+        existing = registry.read_records(reg, on_corrupt="raise")
+        gates.assert_no_repeat_oos(
+            existing, entry["variant_id"], allow_failed_rescore=args.allow_failed_rescore
+        )
         print("DRY-RUN promote backtest:", " ".join(bt))
         return
-    # Record the OOS read BEFORE it happens: a crash below leaves an attempt record,
-    # so the no-repeat gate fails closed instead of allowing silent re-reads.
-    registry.append_record(
-        reg, _collect_one(cm, entry, tier=promote_tier, status="oos_read_attempt")
-    )
+    # Gate + attempt-append are atomic under the registry lock (two concurrent
+    # promotes must not both pass), and the gate read fails CLOSED on corruption.
+    with registry.registry_lock(reg):
+        existing = registry.read_records(reg, on_corrupt="raise")
+        gates.assert_no_repeat_oos(
+            existing, entry["variant_id"], allow_failed_rescore=args.allow_failed_rescore
+        )
+        # Record the OOS read BEFORE it happens: a crash below leaves an attempt
+        # record, so the no-repeat gate fails closed instead of allowing re-reads.
+        registry.append_record(
+            reg, _collect_one(cm, entry, tier=promote_tier, status="oos_read_attempt")
+        )
     try:
         subprocess.run(bt, check=True, cwd=str(REPO))
     except subprocess.CalledProcessError as exc:

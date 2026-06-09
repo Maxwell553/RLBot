@@ -6,9 +6,35 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
+
+try:  # POSIX only; on other platforms locking degrades to best-effort appends
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None  # type: ignore[assignment]
+
+
+@contextmanager
+def registry_lock(path: str | Path) -> Iterator[None]:
+    """Exclusive advisory lock for read-gate-append sequences.
+
+    The per-write flock in ``append_record`` only serializes bytes; the no-repeat-OOS
+    gate needs *check-then-append* atomicity (two concurrent promotes of the same
+    variant must not both pass the gate). Hold this around read → assert → append.
+    """
+    p = Path(str(path) + ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a+") as lf:
+        if _fcntl is not None:
+            _fcntl.flock(lf.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if _fcntl is not None:
+                _fcntl.flock(lf.fileno(), _fcntl.LOCK_UN)
 
 
 def append_record(path: str | Path, record: Mapping[str, Any]) -> None:
@@ -16,27 +42,30 @@ def append_record(path: str | Path, record: Mapping[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(dict(record), default=str) + "\n"
     with p.open("a", encoding="utf-8") as f:
-        try:  # advisory lock: concurrent launches must not interleave records
-            import fcntl
-
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass  # non-POSIX or locked-out FS: O_APPEND of one short line is still atomic-ish
+        locked = False
+        if _fcntl is not None:
+            try:  # serialize the write so two appends cannot interleave bytes
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
+                locked = True
+            except OSError:
+                pass
         try:
             f.write(line)
             f.flush()
         finally:
-            try:
-                import fcntl
-
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except (ImportError, OSError):
-                pass
+            if locked:
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
 
 
-def read_records(path: str | Path) -> list[dict]:
-    """Parse the JSONL registry, skipping (with a loud warning) torn/corrupt lines —
-    a half-written trailing line from a crash must not brick collect/report/gates."""
+def read_records(path: str | Path, *, on_corrupt: str = "skip") -> list[dict]:
+    """Parse the JSONL registry.
+
+    ``on_corrupt="skip"`` (default, for collect/report): torn/corrupt lines are
+    skipped with a loud warning so a crash's half-written tail cannot brick
+    reporting. ``on_corrupt="raise"`` (for OOS gates): any corrupt line raises —
+    the no-repeat-holdout gate must FAIL CLOSED, because a skipped scored record
+    would silently permit a repeat read.
+    """
     p = Path(path)
     if not p.is_file():
         return []
@@ -49,16 +78,22 @@ def read_records(path: str | Path) -> list[dict]:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
+            if on_corrupt == "raise":
+                raise ValueError(
+                    f"Corrupt registry line {i} in {p}. The OOS gate fails closed on "
+                    "corruption — inspect/repair the registry (each line is one JSON "
+                    "record) before retrying."
+                )
             bad += 1
             print(
                 f"[registry] WARNING: skipping corrupt line {i} in {p} "
                 "(torn write from a crash?)",
                 file=sys.stderr,
             )
-    if bad > 1:
+    if bad:
         print(
-            f"[registry] WARNING: {bad} corrupt lines in {p} — more than a torn tail; "
-            "inspect the file before trusting gates/reports.",
+            f"[registry] WARNING: {bad} corrupt line(s) in {p} skipped — reports may "
+            "undercount; OOS gates re-read strictly and will refuse.",
             file=sys.stderr,
         )
     return out
@@ -77,6 +112,7 @@ def build_record(
     backtest_summary: Mapping[str, Any] | None = None,
     status: str = "ok",
     failure: str | None = None,
+    patch: Mapping[str, Any] | None = None,
 ) -> dict:
     """Flatten the run's artifacts into a single registry record."""
     manifest = manifest or {}
@@ -90,6 +126,7 @@ def build_record(
         "cohort": cohort,
         "variant_id": variant_id,
         "group_id": group_id,
+        "patch": dict(patch) if patch else None,
         "hypothesis": hypothesis,
         "run_id": run_id,
         "evaluation_tier": int(evaluation_tier),
