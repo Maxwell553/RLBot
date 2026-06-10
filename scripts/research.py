@@ -38,7 +38,12 @@ from rlbot.research.spec import (  # noqa: E402
     resolve_variants,
 )
 from rlbot.rl_config import load_config  # noqa: E402
-from rlbot.run_artifacts import PROJECT_ROOT, RunPaths, read_run_manifest  # noqa: E402
+from rlbot.run_artifacts import (  # noqa: E402
+    PROJECT_ROOT,
+    RunPaths,
+    git_provenance,
+    read_run_manifest,
+)
 
 REPO = PROJECT_ROOT
 RUNS = REPO / "Runs"
@@ -290,9 +295,23 @@ def _scored_keys(records: list[dict]) -> set[tuple[str, int]]:
     }
 
 
+def _assert_clean_tree_for_oos(allow_dirty: bool) -> None:
+    """OOS reads must be attributable to a commit: a dirty tree means the registry's
+    git_commit field lies about what produced the number."""
+    prov = git_provenance()
+    if prov.get("git_dirty") and not allow_dirty:
+        raise SystemExit(
+            "Working tree is dirty — an OOS read would be recorded against a commit "
+            "that does not match the code that produced it. Commit (or stash) first, "
+            "or pass --allow-dirty to record the read with git_dirty=true."
+        )
+
+
 def cmd_launch(args: argparse.Namespace) -> None:
     spec = load_spec(args.spec)
     gates.assert_tier_allowed(spec.evaluation_tier, promoted=args.promote)
+    if gates.tier_touches_oos(spec.evaluation_tier):
+        _assert_clean_tree_for_oos(getattr(args, "allow_dirty", False))
     cm = _materialize(spec)
     reg = _registry_path(spec.id)
     touches_oos = gates.tier_touches_oos(spec.evaluation_tier)
@@ -510,6 +529,7 @@ def cmd_promote(args: argparse.Namespace) -> None:
     spec = load_spec(args.spec)
     if not args.promote:
         raise SystemExit("promote requires --promote (it reads the OOS holdout).")
+    _assert_clean_tree_for_oos(getattr(args, "allow_dirty", False))
     # Promote must NOT re-materialize: rewriting cohort.json + variant configs from
     # the *current* spec/config would silently clobber the plan of record the runs
     # actually trained under. Load the launch-time cohort manifest and verify the
@@ -610,6 +630,42 @@ def _queue_move(src: Path, dest_dir: Path) -> None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest = dest_dir / f"{src.stem}.{stamp}{src.suffix}"
     shutil.move(str(src), dest)
+
+
+def cmd_validate(args: argparse.Namespace) -> None:
+    """Validate a spec with NO side effects: schema, patch firewall, canonical
+    windows, success-gate keys, variant-id collisions. The fast feedback loop for
+    an agent proposing specs. ``--agent`` additionally requires the fields an
+    autonomous proposer must fill: hypothesis, parent, success_gates."""
+    spec = load_spec(args.spec)  # schema + firewall + windows + gate keys
+    variants = resolve_variants(spec)  # id collisions
+    problems: list[str] = []
+    if getattr(args, "agent", False):
+        if not spec.hypothesis.strip():
+            problems.append("agent specs must state a non-empty hypothesis")
+        if not (spec.parent or "").strip():
+            problems.append(
+                "agent specs must name a parent (cohort or spec id this builds on)"
+            )
+        if not spec.success_gates:
+            problems.append(
+                "agent specs must pre-register success_gates (when does this win?)"
+            )
+        if gates.tier_touches_oos(spec.evaluation_tier):
+            problems.append(
+                f"agent specs may not declare tier {spec.evaluation_tier} (touches the "
+                "OOS holdout; promotion is a human action)"
+            )
+    if problems:
+        for msg in problems:
+            print(f"[research] INVALID: {msg}", file=sys.stderr)
+        raise SystemExit(f"{len(problems)} problem(s); spec not valid for agent submission.")
+    windows = sorted({(v.window or {}).get("name", "(config default)") for v in variants})
+    print(f"[research] VALID: {args.spec}")
+    print(f"  id={spec.id} tier={spec.evaluation_tier} variants={len(variants)} "
+          f"seeds={spec.seeds} windows={windows}")
+    print(f"  hypothesis: {spec.hypothesis or '(none)'}")
+    print(f"  success_gates: {spec.success_gates or '(none)'}")
 
 
 def cmd_run_queue(args: argparse.Namespace) -> None:
@@ -775,6 +831,8 @@ def main() -> None:
     sl.add_argument("--modal-gpu", default=None,
                     help="GPU profile for --backend modal (e.g. A10G, H100)")
     sl.add_argument("--promote", action="store_true")
+    sl.add_argument("--allow-dirty", action="store_true",
+                    help="permit a tier>=4 launch from a dirty working tree (recorded)")
     sl.add_argument("--dry-run", action="store_true")
     sl.add_argument(
         "--window-budget", type=int, default=None,
@@ -787,6 +845,12 @@ def main() -> None:
     )
     sl.set_defaults(func=cmd_launch)
     sc = sub.add_parser("collect"); sc.add_argument("cohort"); sc.set_defaults(func=cmd_collect, spec=None)
+    sv = sub.add_parser("validate", help="validate a spec with no side effects (agent feedback loop)")
+    sv.add_argument("spec")
+    sv.add_argument("--agent", action="store_true",
+                    help="enforce agent-submission requirements (hypothesis, parent, "
+                    "success_gates, no OOS tiers)")
+    sv.set_defaults(func=cmd_validate)
     sq = sub.add_parser("run-queue", help="drain Runs/queue/*.yaml: launch+report each, move to done/failed")
     sq.add_argument("--queue-dir", default=str(PROJECT_ROOT / "Runs" / "queue"))
     sq.add_argument("--backend", default="local", choices=("local", "modal"))
@@ -810,6 +874,8 @@ def main() -> None:
     spm.add_argument("--variant", required=True)
     spm.add_argument("--promote", action="store_true")
     spm.add_argument("--dry-run", action="store_true")
+    spm.add_argument("--allow-dirty", action="store_true",
+                     help="permit promotion from a dirty working tree (recorded)")
     spm.add_argument(
         "--window-budget", type=int, default=None,
         help="Cumulative distinct-model budget per holdout window (global ledger).")

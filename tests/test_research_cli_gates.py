@@ -84,6 +84,9 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (tmp_path / "config").mkdir()
     shutil.copy(ROOT / "config" / "config.yaml", tmp_path / "config" / "config.yaml")
     monkeypatch.setattr(mod, "REPO", tmp_path)
+    # OOS actions refuse dirty trees; the harness pins a clean fake so tests are
+    # independent of the developer's working-tree state.
+    monkeypatch.setattr(mod, "git_provenance", lambda: {"git_commit": "test", "git_dirty": False})
     monkeypatch.setattr(mod, "RUNS", tmp_path / "Runs")
     monkeypatch.setattr(mod, "RunPaths", lambda rid: _RealRunPaths(run_id=rid, root=tmp_path))
 

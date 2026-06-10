@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MarketTrainer (RLBot) trains a RecurrentPPO (LSTM) agent on a multi-asset daily portfolio environment, with strict chronological out-of-sample holdouts. `README.md` is the canonical reference for the asset universe, observation layout, reward formula, and walk-forward windows — read it for those details. This file covers commands and the invariants that span files. **No published OOS results** under the current pipeline yet; use `<RUN_ID>` placeholders in docs and commands until fresh backtests complete.
 
-Library code lives in the `rlbot/` package (`data_utils.py`, `trading_env.py`, `rl_config.py`, `baselines.py`, `run_artifacts.py`, `inference_load.py`, `inference_output.py`, `vecnorm_utils.py`, `modal_cloud.py`, `stats.py`, `reward_logging.py`, `visualize.py`, `research/`). CLIs live in `scripts/` (`train.py`, `backtest.py`, `modal_app.py`, `infer_weights.py`, `research.py`, `migrate_runs_layout.py`, `run_seed_ensemble.sh`). There is **no** top-level `train.py`/`backtest.py`, **no** `windows/` directory, and **no** `paper_trade/` tree.
+Library code lives in the `rlbot/` package (`data_utils.py`, `trading_env.py`, `rl_config.py`, `baselines.py`, `run_artifacts.py`, `inference_load.py`, `inference_output.py`, `vecnorm_utils.py`, `modal_cloud.py`, `stats.py`, `reward_logging.py`, `visualize.py`, `research/`). CLIs live in `scripts/` (`train.py`, `backtest.py`, `modal_app.py`, `infer_weights.py`, `research.py`, `shadow_trade.py`, `migrate_runs_layout.py`, `run_seed_ensemble.sh`). There is **no** top-level `train.py`/`backtest.py`, **no** `windows/` directory, and **no** `paper_trade/` tree.
 
 ## Commands
 
@@ -45,6 +45,11 @@ python scripts/research.py screen specs/x.yaml --keep-top 0.25  # tier-1 grid sc
 python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (no tier ≥4)
 python scripts/research.py report feature_split_ab
 python scripts/research.py report --all                         # cross-cohort memory + knob sensitivity
+python scripts/research.py validate specs/x.yaml --agent        # no-side-effect spec check (agent loop)
+
+# Tier-5 shadow trading (forward OOS that burns no holdout; ledger under gitignored execution/)
+python scripts/shadow_trade.py record    --run-id <RUN_ID>
+python scripts/shadow_trade.py reconcile --run-id <RUN_ID>
 
 # Audited target weights for a run (provenance-rich; measurement only, no broker)
 python scripts/infer_weights.py --run-id <RUN_ID> --checkpoint best --as-of 2022-12-31

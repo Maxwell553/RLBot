@@ -1090,11 +1090,16 @@ def rollout_policy_on_slice(
     reset_seed: int = 0,
     progress: bool = False,
     progress_label: str = "rollout",
+    obs_sink: list | None = None,
 ) -> tuple[np.ndarray, int, int, np.ndarray | None]:
     """
     One full episode on a contiguous date slice. Returns
     (navs, start_bar, n_rewards, weights|None) where n_rewards == len(navs) - 1.
     Causal: no look-ahead beyond training-time observation pipeline.
+
+    ``obs_sink``: when given, receives the FINAL (normalized, if VecNormalize is
+    active) observation — normalized features are z-scores vs frozen training
+    stats, so callers can run drift alarms without reloading the pkl.
     """
     n_bars = len(test_idx)
     if n_bars < 10:
@@ -1167,6 +1172,8 @@ def rollout_policy_on_slice(
                     w_rows.append(np.asarray(tw, dtype=np.float64).reshape(-1))
             if use_vec_norm and vec_env is not None:
                 obs = vec_env.normalize_obs(obs)
+            if obs_sink is not None:
+                obs_sink[:] = [np.asarray(obs, dtype=np.float64).reshape(-1)]
             if "nav" in info:
                 navs.append(info["nav"])
             step_i += 1

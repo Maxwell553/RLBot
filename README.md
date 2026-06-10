@@ -175,7 +175,8 @@ Per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists,
 |-----------------|---------|
 | `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, stochastic-path fan plot; writes `Runs/<id>/backtest_summary.json` with config/data hashes + drift warnings |
 | `scripts/infer_weights.py` | Audited target weights for a single `--as-of` date (provenance-rich JSON; no broker) |
-| `scripts/research.py` | Auto-research loop: `plan`/`launch`/`collect`/`report`/`promote` over `specs/*.yaml`; OOS firewall via tiers + `Runs/<cohort>/registry.jsonl` |
+| `scripts/research.py` | Auto-research loop: `validate`/`plan`/`launch`/`screen`/`run-queue`/`collect`/`report`/`promote` over `specs/*.yaml`; OOS firewall via tiers + `Runs/<cohort>/registry.jsonl` + global burn ledger |
+| `scripts/shadow_trade.py` | Tier-5 shadow trading: daily audited weights → gitignored `execution/` ledger, reconciled vs realized returns (forward OOS, no holdout burn) |
 | `scripts/run_seed_ensemble.sh` | Multi-seed training + ensemble backtest |
 | `scripts/migrate_runs_layout.py` | Move legacy `models/`, `plots/`, … into `Runs/<id>/` |
 | `rlbot/baselines.py` | Cash, benchmark-only B&H, equal-weight (daily + monthly, tx-cost-aware), 60/40, naive risk parity |
@@ -227,7 +228,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 |------|------|
 | `config/config.yaml` | Universe, PPO, reward, costs, curriculum |
 | `rlbot/` | Library: `data_utils`, `trading_env`, `rl_config`, `run_artifacts`, `inference_load`, `inference_output`, `vecnorm_utils`, `visualize`, `baselines`, `modal_cloud`, `stats`, `reward_logging`, `research/` |
-| `scripts/` | `train.py`, `backtest.py`, `infer_weights.py`, `research.py`, `modal_app.py`, `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
+| `scripts/` | `train.py`, `backtest.py`, `infer_weights.py`, `research.py`, `shadow_trade.py`, `modal_app.py`, `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
 | `specs/` | Pre-registered experiment specs for `research.py` (feature-split A/B, reward/curriculum ablations) |
 | `Runs/<run_id>/` | `manifest.json`, `config.yaml`, `data_cache.npz`, `models/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/`, `backtest_summary.json` |
 | `docs/TRAINING.md` | Local operations guide |

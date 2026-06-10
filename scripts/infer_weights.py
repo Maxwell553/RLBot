@@ -168,6 +168,7 @@ def main() -> None:
 
     print(f"[infer] warming recurrent state over {warm} bars ending {as_of} ...")
     t0 = time.perf_counter()
+    final_obs: list = []
     _, _, _, weights = rollout_policy_on_slice(
         model,
         test_idx=idx[sl],
@@ -186,6 +187,7 @@ def main() -> None:
         use_vec_norm=vn_path.is_file(),
         deterministic=True,
         collect_weights=True,
+        obs_sink=final_obs,
     )
     if weights is None or len(weights) == 0:
         raise RuntimeError("rollout produced no weights")
@@ -214,6 +216,7 @@ def main() -> None:
         "obs_lag": obs_lag,
         **git_provenance(),
     }
+    obs_norm = final_obs[0].tolist() if final_obs else None
     payload = build_weights_payload(
         run_id=run_id,
         checkpoint=args.checkpoint,
@@ -228,6 +231,9 @@ def main() -> None:
     out = Path(args.out) if args.out.strip() else (
         RunPaths(run_id).run_meta_dir / f"target_weights_{as_of}.json"
     )
+    # Final normalized observation (z-scores vs frozen training stats): the
+    # tier-5 shadow loop runs its observation-drift alarm off this, torch-free.
+    payload["observation_normalized"] = obs_norm
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(json.dumps(payload, indent=2, default=str))
