@@ -124,6 +124,7 @@ Writes audited JSON (executed target weights after action smoothing, live mask, 
 Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. **No OOS results are published yet** under the current pipeline — backtest only after a fresh run under the current `config/config.yaml` completes; record numbers in RESEARCH.md with the actual `<RUN_ID>`.
 
 ```bash
+python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2>,<RUN_ID_3> --checkpoint best
 python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
 ```
 
@@ -170,7 +171,7 @@ For long runs on a cloud GPU with the same `Runs/<run_id>/` layout, see [MODAL.m
 Quick flow:
 
 1. `pip install -e ".[modal]"` and `modal setup`
-2. `modal run scripts/modal_app.py -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
+2. `modal run scripts/modal_app.py::train -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
 3. In another terminal: `python scripts/modal_app.py sync --run-id <RUN_ID> --watch` (open `Runs/<RUN_ID>/plots/training.png` in the IDE)
 4. After the job: `python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all` then backtest locally
 

@@ -32,6 +32,7 @@ _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 
 import argparse
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,13 @@ def _startup_log(msg: str) -> None:
 
 
 _startup_log("[train] Starting (loading dependencies)...")
+
+# Fast-fail on contradictory flags before the expensive torch import (also keeps this
+# check testable without torch installed).
+if any(a == "--resume" or a.startswith("--resume=") for a in sys.argv[1:]) and any(
+    a == "--finetune" or a.startswith("--finetune=") for a in sys.argv[1:]
+):
+    raise SystemExit("Use only one of --resume or --finetune, not both.")
 
 import numpy as np
 
@@ -73,6 +81,7 @@ from rlbot.data_utils import (
 from rlbot.rl_config import (
     UNIVERSE_MAX_ASSETS,
     UNIVERSE_MIN_ASSETS,
+    WorkerConfigInstaller,
     apply_deterministic_seeds,
     get_config,
     load_config,
@@ -89,6 +98,7 @@ from rlbot.run_artifacts import (
     config_sha256,
     git_provenance,
     new_run_id,
+    read_run_manifest,
     resolve_data_cache,
     sha256_file,
     merge_manifest,
@@ -108,8 +118,11 @@ DATA_CACHE = DEFAULT_DATA_CACHE
 def _persist_trade_artifacts(model: RecurrentPPO, train_env: VecNormalize, paths: RunPaths) -> tuple[Path, Path | None]:
     """Save end-of-run VecNormalize stats + final policy weights.
 
-    Does **not** overwrite ``best/vec_normalize.pkl`` — that file is written alongside
-    ``best_model.zip`` whenever eval NAV improves.
+    Writes ``Runs/<id>/models/vec_normalize.pkl``. ``models/best/vec_normalize.pkl`` is
+    written by ``EvalNavBestModelCallback`` at best-save time (stats the checkpoint was
+    actually selected under) and is **never** overwritten here — a run that never saved
+    a best model returns ``None`` for it rather than pairing best weights with
+    end-of-run stats.
     """
     root_vn = paths.models_dir / "vec_normalize.pkl"
     train_env.save(str(root_vn))
@@ -135,10 +148,19 @@ def _make_env_factory(
     domain_randomize: bool = True,
     inactivity_penalty_scale: float = 1.0,
     record_episode_nav: bool = False,
+    config_installer: WorkerConfigInstaller | None = None,
 ):
-    """Return a callable that creates and wraps a single environment."""
+    """Return a callable that creates and wraps a single environment.
+
+    ``config_installer`` MUST be passed for SubprocVecEnv use: workers are spawned
+    with a fresh interpreter where ``get_config()`` would otherwise fall back to the
+    default ``config/config.yaml``, silently discarding ``--config``/``--n-assets``
+    overrides for everything the env reads at construction (reward, costs, cap, DR).
+    """
 
     def _init():
+        if config_installer is not None:
+            config_installer()
         env = MultiAssetPortfolioEnv(
             **pack.env_kwargs(),
             random_start=random_start,
@@ -153,6 +175,15 @@ def _make_env_factory(
             domain_randomize=domain_randomize,
             inactivity_penalty_scale=inactivity_penalty_scale,
         )
+        if domain_randomize:
+            # SB3 resets envs in _setup_learn BEFORE the curriculum callback applies
+            # its pinned pre-ramp bounds, so without this the very first episode per
+            # worker samples fee/lag from the full config DR range. Pin at
+            # construction; the curriculum widens from fee_ramp_end onward.
+            from rlbot.rl_config import get_config as _gc
+
+            _lag = _gc().environment.obs_lag_default
+            env.set_randomization_bounds(1.0, 1.0, _lag, _lag)
         if record_episode_nav:
             return EpisodeEndNavRecorder(env)
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -268,6 +299,8 @@ class EvalNavBestModelCallback(EvalCallback):
                         self._best_model_dir.mkdir(parents=True, exist_ok=True)
                         self.model.save(str(self._best_model_dir / "best_model"))
                         if self._train_vec_env is not None:
+                            # Pair the checkpoint with the normalization stats it was
+                            # selected under, not whatever exists at end of training.
                             self._train_vec_env.save(
                                 str(self._best_model_dir / "vec_normalize.pkl")
                             )
@@ -525,7 +558,13 @@ class TradingCurriculumCallback(BaseCallback):
         env_cfg = get_config().environment
         lag_lo, lag_hi = env_cfg.min_obs_lag, env_cfg.max_obs_lag
         if t < self.fee_ramp_end:
-            return dr_min, dr_max, lag_lo, lag_hi
+            # No DR before the fee curriculum releases: fee is pinned by the override
+            # anyway, and obs_lag stays at the deterministic default. Returning the
+            # full-wide bounds here (the old behavior) randomized lag from step 0 and
+            # then snapped it to a 1-bar cliff exactly at fee_ramp_end — the same step
+            # the best-model gate opens.
+            lag_fixed = max(lag_lo, min(env_cfg.obs_lag_default, lag_hi))
+            return 1.0, 1.0, lag_fixed, lag_fixed
         if t >= self.dr_widen_end:
             return dr_min, dr_max, lag_lo, lag_hi
         progress = (t - self.fee_ramp_end) / max(self.dr_widen_end - self.fee_ramp_end, 1)
@@ -729,6 +768,12 @@ def main() -> None:
             "adaptive-entropy callbacks (experimental regime, not crash resume)."
         ),
     )
+    parser.add_argument(
+        "--overwrite-run", action="store_true",
+        help="Allow training into an existing Runs/<run-id>/ directory (overwrites its "
+             "manifest/models; refused by default — reuse also restores the old run's "
+             "best-eval threshold, which can suppress best_model saves).",
+    )
     args = parser.parse_args()
     if args.resume.strip() and args.finetune.strip():
         raise SystemExit("Use only one of --resume or --finetune, not both.")
@@ -755,7 +800,24 @@ def main() -> None:
             "Provide --run-id or --window (auto id: W{window}_<month><day>, e.g. W1_604)."
         )
     paths = RunPaths(run_id=run_id)
+    if (paths.run_meta_dir / "manifest.json").is_file() and not (
+        args.overwrite_run or args.resume
+    ):
+        raise SystemExit(
+            f"Run directory Runs/{run_id}/ already has a manifest. Refusing to overwrite "
+            "an existing run (its artifacts may be referenced by the research registry). "
+            "Pick a new --run-id, or pass --overwrite-run to retrain in place."
+        )
     paths.mkdirs()
+    if args.overwrite_run and not args.resume:
+        # A fresh retrain must not inherit the old run's best-eval threshold or its
+        # best-time normalization stats; stale ones suppress best_model saves.
+        for stale in (
+            paths.eval_nav_history,
+            paths.best_model_dir / "best_model.zip",
+            paths.best_model_dir / "vec_normalize.pkl",
+        ):
+            stale.unlink(missing_ok=True)
     if args.n_assets is not None:
         write_config_snapshot(cfg, paths.run_meta_dir / "config.yaml")
     else:
@@ -806,7 +868,7 @@ def main() -> None:
             macro_vol,
             asset_live,
             panel_tickers,
-        ) = load_cache(str(data_cache))
+        ) = load_cache(str(data_cache), expected_fracdiff_d=cfg.data.fracdiff_d)
 
     if list(panel_tickers) != cfg.universe.tickers:
         (
@@ -943,6 +1005,7 @@ def main() -> None:
             fracdiff_d=cfg.data.fracdiff_d,
             feature_purge_warmup=purge,
             feature_split_mode=split_mode,
+            feature_preroll_bars=cfg.data.feature_preroll_bars,
             **feature_kwargs,
         )
     )
@@ -989,8 +1052,8 @@ def main() -> None:
                 "holdout_end": args.holdout_end or (str(idx_hold[-1]) if len(idx_hold) else None),
                 "trainable_end": str(idx_fit[-1]) if len(idx_fit) else None,
                 "holdout_bars": int(len(idx_hold)),
-                "date_start": str(idx_hold[0]),
-                "date_end": str(idx_hold[-1]),
+                "date_start": str(idx_hold[0]) if len(idx_hold) else None,
+                "date_end": str(idx_hold[-1]) if len(idx_hold) else None,
             },
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
@@ -1041,7 +1104,7 @@ def main() -> None:
         f"  reward: return*{cfg.reward.reward_scale:g} (downside amp gamma={cfg.reward.drawdown_downside_gamma:g}) "
         f"+ bench_excess*{cfg.reward.benchmark_excess_scale:g} "
         f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
-        f"(combined cap {cfg.reward.benchmark_relative_max_share:.0%}) "
+        f"(combined abs cap {cfg.reward.benchmark_combined_abs_cap:g}) "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
         f"- inactivity - tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g}"
     )
@@ -1137,6 +1200,7 @@ def main() -> None:
             "[train] reproducible=True: deterministic per-env seed streams "
             "(seed + env index); same-seed runs reproduce."
         )
+    worker_config = WorkerConfigInstaller(cfg)
     train_env = SubprocVecEnv([
         _make_env_factory(
             train_pack,
@@ -1151,6 +1215,7 @@ def main() -> None:
             obs_lag_default=args.obs_lag,
             domain_randomize=True,
             inactivity_penalty_scale=1.0,
+            config_installer=worker_config,
         )
         for i in range(n_envs)
     ])
@@ -1176,6 +1241,7 @@ def main() -> None:
             domain_randomize=False,
             inactivity_penalty_scale=cfg.reward.eval_inactivity_penalty_scale,
             record_episode_nav=True,
+            config_installer=worker_config,
         )
     ])
     eval_env = VecNormalize(
@@ -1227,7 +1293,12 @@ def main() -> None:
         parts = stem.split("_", 1)
         vn_path = resume_path.parent / f"{parts[0]}_vecnormalize_{parts[1]}.pkl" if len(parts) == 2 else None
         if vn_path is None or not vn_path.is_file():
-            vn_path = resume_path.parent.parent / "vec_normalize.pkl"
+            # Prefer the stats saved NEXT TO the checkpoint (e.g. best/vec_normalize.pkl
+            # for best_model.zip) before falling back to the run-level end-of-run stats —
+            # the grandparent fallback alone silently mispaired best weights with
+            # end-of-run normalization.
+            sibling = resume_path.parent / "vec_normalize.pkl"
+            vn_path = sibling if sibling.is_file() else resume_path.parent.parent / "vec_normalize.pkl"
         if vn_path and vn_path.is_file():
             loaded_vn = VecNormalize.load(str(vn_path), train_env.venv)
             train_env.obs_rms = loaded_vn.obs_rms
@@ -1318,9 +1389,13 @@ def main() -> None:
         save_vecnormalize=True,
     )
 
+    # curriculum_update_freq is configured in GLOBAL timesteps; callbacks count
+    # vector steps (n_calls), so divide by n_envs — otherwise the ramp granularity
+    # (and thus training behavior) silently varies with the GPU profile's env count.
+    callback_update_freq = max(tr_cfg.curriculum_update_freq // n_envs, 1)
     reward_decomp_callback = RewardDecompCallback(
         json_path=paths.eval_log_dir / "reward_decomp.json",
-        log_freq=max(tr_cfg.curriculum_update_freq, 1),
+        log_freq=callback_update_freq,
     )
     callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
     if not finetune_mode:
@@ -1329,7 +1404,7 @@ def main() -> None:
             TradingCurriculumCallback(
                 train_env,
                 learn_budget=args.timesteps,
-                update_freq=tr_cfg.curriculum_update_freq,
+                update_freq=callback_update_freq,
                 eval_vec_env=eval_env,
             ),
         )
@@ -1357,6 +1432,7 @@ def main() -> None:
     # ── train ────────────────────────────────────────────────────────────
     _startup_log(f"[train] Starting PPO learning ({args.timesteps:,} timesteps)...")
     learn_error: BaseException | None = None
+    interrupted = False
     try:
         model.learn(
             total_timesteps=args.timesteps,
@@ -1365,6 +1441,7 @@ def main() -> None:
             reset_num_timesteps=not bool(args.resume),
         )
     except KeyboardInterrupt:
+        interrupted = True
         print("\n\nCtrl+C detected — saving current weights before exit…")
     except BaseException as e:
         learn_error = e
@@ -1391,11 +1468,23 @@ def main() -> None:
     )
     best_eval_step = None
     if eval_callback._mean_ending_nav and eval_callback._nav_timesteps:
-        i = int(np.argmax(np.asarray(eval_callback._mean_ending_nav)))
-        if i < len(eval_callback._nav_timesteps):
-            best_eval_step = int(eval_callback._nav_timesteps[i])
+        # Only consider post-gate evals: pre-gate NAVs run at reduced fees/churn and
+        # never wrote best_model.zip, so the argmax over the full history would point
+        # at an eval that does not correspond to the saved best checkpoint.
+        navs_arr = np.asarray(eval_callback._mean_ending_nav, dtype=np.float64)
+        steps_arr = np.asarray(eval_callback._nav_timesteps, dtype=np.int64)
+        n = min(len(navs_arr), len(steps_arr))
+        navs_arr, steps_arr = navs_arr[:n], steps_arr[:n]
+        gate = int(eval_callback.best_model_min_step)
+        post_gate = steps_arr >= gate if gate > 0 else np.ones(n, dtype=bool)
+        if post_gate.any():
+            j = int(np.argmax(navs_arr[post_gate]))
+            best_eval_step = int(steps_arr[post_gate][j])
     early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
 
+    # Merge (never rebuild) the pre-training manifest: it carries the
+    # chronological_holdout block that defines what OOS is for this run; losing it
+    # would let a later backtest silently extend the holdout window.
     merge_manifest(
         paths.manifest_path,
         {
@@ -1408,6 +1497,7 @@ def main() -> None:
             "n_eval_bars": int(len(eval_idx)),
             "data_cache_snapshot": str(paths.data_snapshot),
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "training_status": "interrupted" if interrupted else "completed",
             "total_params": total_params,
             "trainable_params": trainable_params,
             "best_eval_nav": best_eval_nav,

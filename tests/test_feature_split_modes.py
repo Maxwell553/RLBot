@@ -76,19 +76,52 @@ def _segment_starts(pack: WalkforwardEnvPack) -> list[int]:
     return [0] + list(pack.block_boundaries)
 
 
-def test_independent_purges_each_segment_head() -> None:
-    """Independent mode neutralizes the first PURGE bars of every segment."""
+def test_independent_purges_panel_head_only() -> None:
+    """Only bars with insufficient preroll history (the panel head) are neutralized;
+    mid-panel segment heads get real causal warmup via the preroll instead."""
     _, tr, ev = _split("independent")
+    # Panel-head segment (starts at bar 0, no preroll available): purged.
+    assert np.allclose(tr.rsi[:PURGE], 50.0)
+    assert np.allclose(tr.macd[:PURGE], 0.0)
+    assert np.allclose(tr.fracdiff[:PURGE], 0.0)
+    assert np.allclose(tr.fracdiff_macro[:PURGE], 0.0)
+    assert np.allclose(tr.trend[:PURGE], 0.0)
+    # Mid-panel segment heads are warmed up with preroll history, not neutralized.
     for pack in (tr, ev):
-        starts = _segment_starts(pack)
-        ends = starts[1:] + [pack.rsi.shape[0]]
-        for s, e in zip(starts, ends):
-            n = min(PURGE, e - s)
-            assert np.allclose(pack.rsi[s : s + n], 50.0)
-            assert np.allclose(pack.macd[s : s + n], 0.0)
-            assert np.allclose(pack.fracdiff[s : s + n], 0.0)
-            assert np.allclose(pack.fracdiff_macro[s : s + n], 0.0)
-            assert np.allclose(pack.trend[s : s + n], 0.0)
+        for s in _segment_starts(pack)[1:]:
+            assert not np.allclose(pack.rsi[s : s + PURGE], 50.0)
+    # The first eval segment starts mid-panel: warmed up, never neutralized.
+    assert not np.allclose(ev.rsi[:PURGE], 50.0)
+
+
+def test_independent_with_full_preroll_matches_continuous() -> None:
+    """When the preroll covers all available history, per-segment recomputation is
+    exactly the continuous panel sliced — no truncation transients remain."""
+    _, tr_c, ev_c = _split("continuous")
+    _, tr_i, ev_i = _split("independent")
+    # 300-bar panel < default 252-bar preroll + segment starts, so every mid-panel
+    # segment sees its full history; eval segments match continuous bit-for-bit.
+    assert np.allclose(ev_c.rsi, ev_i.rsi)
+    assert np.allclose(ev_c.macd, ev_i.macd)
+    assert np.allclose(ev_c.fracdiff, ev_i.fracdiff)
+    assert np.allclose(ev_c.trend, ev_i.trend)
+    # Train rows beyond the panel-head purge also match.
+    assert np.allclose(tr_c.rsi[PURGE:], tr_i.rsi[PURGE:])
+    assert np.allclose(tr_c.fracdiff[PURGE:], tr_i.fracdiff[PURGE:])
+
+
+def test_independent_short_preroll_limits_neutralization() -> None:
+    """An explicit short preroll still purges only the residual head bars."""
+    idx, ohlcv, macro = _panel()
+    tr, _ = train_test_split_alternating(
+        idx, ohlcv, macro,
+        block_size=BLOCK, eval_stride=STRIDE, feature_purge_warmup=PURGE,
+        feature_split_mode="independent", feature_preroll_bars=0,
+    )
+    pack = WalkforwardEnvPack.from_tuple(tr)
+    starts = [0] + list(pack.block_boundaries)
+    for s in starts:
+        assert np.allclose(pack.rsi[s : s + PURGE], 50.0)
 
 
 def test_continuous_does_not_purge() -> None:

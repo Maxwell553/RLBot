@@ -4,7 +4,7 @@ This file provides guidance to coding agents (e.g. OpenAI Codex) when working wi
 
 MarketTrainer (RLBot) trains a RecurrentPPO (LSTM) agent on a multi-asset daily portfolio environment, with strict chronological out-of-sample holdouts. `README.md` is the canonical reference for the asset universe, observation layout, reward formula, and walk-forward windows — read it for those details. This file covers commands and the invariants that span files. **No published OOS results** under the current pipeline yet; use `<RUN_ID>` placeholders in docs and commands until fresh backtests complete.
 
-Library code lives in the `rlbot/` package (`data_utils.py`, `trading_env.py`, `rl_config.py`, `baselines.py`, `run_artifacts.py`, `inference_load.py`, `inference_output.py`, `vecnorm_utils.py`, `modal_cloud.py`, `stats.py`, `reward_logging.py`, `research/`). CLIs live in `scripts/` (`train.py`, `backtest.py`, `modal_app.py`, `infer_weights.py`, `research.py`, `migrate_runs_layout.py`, `run_seed_ensemble.sh`). There is **no** top-level `train.py`/`backtest.py`, **no** `windows/` directory, and **no** `paper_trade/` tree.
+Library code lives in the `rlbot/` package (`data_utils.py`, `trading_env.py`, `rl_config.py`, `baselines.py`, `run_artifacts.py`, `inference_load.py`, `inference_output.py`, `vecnorm_utils.py`, `modal_cloud.py`, `stats.py`, `reward_logging.py`, `visualize.py`, `research/`). CLIs live in `scripts/` (`train.py`, `backtest.py`, `modal_app.py`, `infer_weights.py`, `research.py`, `shadow_trade.py`, `migrate_runs_layout.py`, `run_seed_ensemble.sh`). There is **no** top-level `train.py`/`backtest.py`, **no** `windows/` directory, and **no** `paper_trade/` tree.
 
 ## Commands
 
@@ -35,12 +35,21 @@ python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2> --checkpoint best  # 
 python scripts/backtest.py --ensemble-prefix my_cohort --detailed        # writes ensemble_summary.json
 
 # Cloud training (see docs/MODAL.md)
-modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID>
+modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 1 --run-id <RUN_ID>
 
 # Auto-research loop (spec → train/backtest → JSONL registry → report; OOS-gated)
 python scripts/research.py plan   specs/feature_split_ab.yaml   # materialize variant configs
 python scripts/research.py launch specs/feature_split_ab.yaml   # tiers 1–3; tier ≥4 needs --promote
+python scripts/research.py launch specs/x.yaml --backend modal --modal-gpu H100  # cloud variants
+python scripts/research.py screen specs/x.yaml --keep-top 0.25  # tier-1 grid screen (halving)
+python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (refuses tiers 4/5)
 python scripts/research.py report feature_split_ab
+python scripts/research.py report --all                         # cross-cohort memory + knob sensitivity
+python scripts/research.py validate specs/x.yaml --agent        # no-side-effect spec check (agent loop)
+
+# Tier-5 shadow trading (forward OOS that burns no holdout; ledger under gitignored execution/)
+python scripts/shadow_trade.py record    --run-id <RUN_ID> --refresh-data
+python scripts/shadow_trade.py reconcile --run-id <RUN_ID>
 
 # Audited target weights for a run (provenance-rich; measurement only, no broker)
 python scripts/infer_weights.py --run-id <RUN_ID> --checkpoint best --as-of 2022-12-31
@@ -63,9 +72,10 @@ The pipeline in `rlbot/data_utils.py` is built so indicators never see the futur
 
 - **Chronological holdout** (`reserve_chronological_holdout`) strips the OOS tail *before* any train/eval split. Only `scripts/backtest.py` ever sees it.
 - **Feature split mode** (`data.feature_split_mode`, default **`independent`**) controls how `train_test_split_alternating()` builds train/eval block features (all features are strictly causal and the holdout is reserved first, so neither mode leaks OOS data):
-  - `independent` (default): features are recomputed per contiguous segment and the first `feature_purge_warmup` (config `data.feature_purge_warmup: 25`) bars of each segment are neutralized via `_neutralize_feature_warmup()`, so eval blocks are not feature-state-contaminated by adjacent train blocks.
-  - `continuous`: RSI/MACD/fracdiff/trend/realized-vol are computed by `compute_feature_panel()` on the contiguous panel (cache or built once) and **sliced** into blocks. The in-training **eval** signal carries indicator memory continuous with adjacent train blocks (intentional — "matches continuous backtest memory"); `feature_purge_warmup` is **not** applied here.
-- **Causal execution** (`rlbot/trading_env.py`): market features at bar `t` use data through `close[t - obs_lag]`; holding cost is deducted on pre-rebalance units at `close[t]`; rebalance fills at `open[t+1]`; mark-to-market at `close[t+1]`. `obs_lag` is randomized over {0,1,2} during training (`min_obs_lag`=0, `max_obs_lag`=2, after the fee curriculum releases) and fixed to **1** in OOS backtest (`backtest.py --obs-lag`, default 1).
+  - `independent` (default): features are recomputed per contiguous segment over a **causal preroll** of up to `data.feature_preroll_bars` (default 252) earlier panel bars, sliced off after computation, so slow indicators (EMA-100 trend, MACD, fracdiff) get real warmup instead of truncation transients while eval blocks stay free of exact continuous-panel indicator state from adjacent train blocks. Only segment-head bars whose preroll is shorter than `feature_purge_warmup` (config `data.feature_purge_warmup: 25`, i.e. the panel head) are neutralized via `_neutralize_feature_warmup()`.
+  - `continuous`: RSI/MACD/fracdiff/trend/realized-vol are computed by `compute_feature_panel()` on the contiguous panel (cache or built once) and **sliced** into blocks. The in-training **eval** signal carries indicator memory continuous with adjacent train blocks (intentional — "matches continuous backtest memory"); treat eval NAV as a model-*selection* signal, not a fully independent estimate. `feature_purge_warmup` is **not** applied here.
+- **Pre-live/dead bars are feature-neutralized**: `compute_feature_panel(asset_live=...)` zeroes per-asset fracdiff/macd/trend/vol (RSI→50) where `asset_live = 0`, so the pre-IPO bfilled price level never reaches the observation; post-delisting bars keep the last real price (unlimited ffill) so dead positions liquidate at the last real close, not a 1e-8 filler. `load_cache(expected_fracdiff_d=...)` recomputes fracdiff when the cached `d` mismatches the active config.
+- **Causal execution** (`rlbot/trading_env.py`): market features at bar `t` use data through `close[t - obs_lag]`; holding cost is deducted on pre-rebalance units at `close[t]`; rebalance fills at `open[t+1]`; mark-to-market at `close[t+1]`. `obs_lag` is randomized over {0,1,2} during training (`min_obs_lag`=0, `max_obs_lag`=2, after the fee curriculum releases) and fixed in OOS backtest (`backtest.py --obs-lag`, default: the run manifest's `args.obs_lag`, else the run config's `environment.obs_lag_default`).
 
 ## Train/backtest must agree
 
@@ -73,10 +83,11 @@ A backtest is only valid if its window flags match training. `--until`, `--train
 
 Backtest binds the run's own snapshots by default for reproducibility:
 
-- `backtest.py` loads `Runs/<run_id>/config.yaml` for costs/cap/env mechanics (override with `--use-current-config`) and prefers the run-local `Runs/<run_id>/data_cache.npz` over the global cache (override with `--data-cache PATH`), so editing config or refreshing the cache does not silently change an old run's OOS numbers. Training writes the **effective N-wide** panel into the run snapshot (not a byte-copy of a wider global cache); use `--refresh-data` when changing `--n-assets` or `universe.assets`.
-- `--checkpoint` defaults to **`best`** (eval-NAV-selected **after `fee_ramp_end`**; holdout not used to pick weights); `latest`/`both` print an OOS-touch warning. **`best_model.zip` is saved with `best/vec_normalize.pkl` from the same eval step** — do not pair best weights with end-of-run normalization stats.
-- OOS backtest **requires** VecNormalize by default (`--allow-missing-vec-normalize` for debug only).
-- Each single-run backtest writes `Runs/<run_id>/backtest_summary.json` (override `--summary-json`) with metrics plus config/data-cache hashes for drift detection.
+- `backtest.py` loads `Runs/<run_id>/config.yaml` for costs/cap/env mechanics (override with `--use-current-config`) and prefers the run-local `Runs/<run_id>/data_cache.npz` over the global cache (override with `--data-cache PATH`; a missing snapshot triggers a loud reproducibility warning), so editing config or refreshing the cache does not silently change an old run's OOS numbers. Training writes the **effective N-wide** panel into the run snapshot (not a byte-copy of a wider global cache); use `--refresh-data` when changing `--n-assets` or `universe.assets`.
+- `--checkpoint` defaults to **`best`** (eval-NAV-selected **after `fee_ramp_end`**; holdout not used to pick weights); `latest`/`both` print an OOS-touch warning. The summary's `checkpoint_label` is derived from the weights actually evaluated (best/final/latest), never from `--plot-tag`. **`best_model.zip` is saved with `best/vec_normalize.pkl` from the same eval step** — never pair best weights with end-of-run normalization stats.
+- OOS backtest **requires** VecNormalize by default (`--allow-missing-vec-normalize` for debug only), and a missing `vec_normalize.pkl` on a `norm_obs: true` run additionally requires `--allow-raw-obs` (raw-obs metrics are meaningless). Same `norm_obs` guard in `scripts/infer_weights.py`.
+- Each single-run backtest writes `Runs/<run_id>/backtest_summary.json` (override `--summary-json`) with metrics plus config/data-cache hashes, and **compares** those hashes to the training manifest (mismatch → `hash_drift` field + warning).
+- The final manifest write **merges into** the pre-training manifest (preserving `chronological_holdout`) and stamps `training_status: completed|interrupted`.
 
 ## Inference freezes normalization
 
@@ -92,16 +103,16 @@ Backtest binds the run's own snapshots by default for reproducibility:
 
 ## Auto-research loop and inference
 
-- **Experiment specs** (`specs/*.yaml`, parsed by `rlbot/research/spec.py`) declare a hypothesis + a config `patch`/`grid`. A patch may only target method knobs (`reward.*`, `curriculum.*`, `entropy_schedule.*`, `policy.*`, `hyperparameters.*`, `environment.*`, `data.feature_split_mode`, safe `training.*`). Patching the universe, transaction costs, holdout dates, or the split (`block_size`/`eval_stride`/`holdout_days`) is **rejected** — those change what OOS is.
-- **`scripts/research.py`** (`plan`/`launch`/`collect`/`report`/`promote`) shells to the canonical `train.py`/`backtest.py`, writes `Runs/<cohort>/registry.jsonl`, and enforces the OOS firewall via `rlbot/research/gates.py`: tiers 1–3 train + in-training eval only; tier ≥ 4 reads the holdout **once per variant** and requires `--promote`.
-- **Per-term reward logging**: training writes `Runs/<id>/eval_logs/reward_decomp.json` + TB scalars (`rew_decomp/*`) so the reward balance is observable.
-- **Reward shaping** (`config.yaml` → `reward`): return + benchmark excess + Sortino diff (capped together at `benchmark_relative_max_share: 0.6`) + participation − inactivity (max **~2.25** at 100% cash) − cost-linked churn. **`max_single_asset_weight: 0.25`**. **Fee/churn curriculum** on train **and** eval; **`models/best/`** after `fee_ramp_end`. See README reward table.
+- **Experiment specs** (`specs/*.yaml`, parsed by `rlbot/research/spec.py`) declare a hypothesis + a config `patch`/`grid`. A patch may only target method knobs (`reward.*`, `curriculum.*`, `entropy_schedule.*`, `policy.*`, `hyperparameters.*`, `environment.*`, `data.feature_split_mode`, safe `training.*`). Patching the universe, transaction costs, holdout dates, or the split (`block_size`/`eval_stride`/`holdout_days`) is **rejected** — those change what OOS is. `base_config` is pinned to `config/config.yaml`, and `windows` entries must match `CANONICAL_WINDOWS` (two-year holdouts; reference by name, e.g. `- name: W4`; W1–W5 only — W6 is embargoed).
+- **`scripts/research.py`** (`plan`/`launch`/`collect`/`report`/`promote`) shells to the canonical `train.py`/`backtest.py`, writes `Runs/<cohort>/registry.jsonl`, and enforces the OOS firewall via `rlbot/research/gates.py`: tiers 1–3 train + in-training eval only; tier ≥ 4 requires `--promote`, is capped by `--oos-budget` (default 1 holdout read per launch), and every holdout read is registered **before** the backtest runs (status `oos_read_attempt`, upgraded to a scored record after) — so crashed reads still block re-scoring (`--allow-failed-rescore` retries only never-scored reads). Relaunching a cohort skips variants already scored at that tier; `report` shows OOS medians only from tier ≥ 4 scored records (deduped per run) and prints the cohort's variant count (multiplicity context). **Every** OOS backtest — including manual ones — appends to the global burn ledger `Runs/oos_ledger.jsonl`; cumulative per-window budgets (`--window-budget`, default 10 distinct models) are enforced at launch/promote, and `backtest_summary.json` reports a **deflated Sharpe** using the ledger's trial count. Spec `success_gates` are evaluated at `collect` (verdicts in `Runs/<cohort>/verdicts.json`); `promote` refuses a non-passing verdict without `--force-gates`. **W6 is embargoed** (reserved terminal validation window; specs may use W1–W5 only).
+- **Per-term reward logging**: training writes `Runs/<id>/eval_logs/reward_decomp.json` + TB scalars (`rew_decomp/*`) so the reward balance (e.g. inactivity vs participation) is observable.
+- **Reward shaping** (`config.yaml` → `reward`): return + benchmark excess + Sortino diff (capped together at the constant `benchmark_combined_abs_cap: 24.0` — never relative to the other terms) + participation − inactivity (max **~2.25** at 100% cash) − cost-linked churn. **`max_single_asset_weight: 0.25`**. **Fee/churn curriculum** on train **and** eval; **`models/best/`** after `fee_ramp_end`. See README reward table.
 - **`scripts/infer_weights.py`** emits audited **executed** target weights (`info["target_weights"]` after EMA smoothing) with full provenance (config/data/model hashes), reusing the backtest rollout. Measurement only — no broker adapter, no market-impact/capacity model.
-- **Resume vs fine-tune:** `--resume` continues curriculum + entropy after a crash; `--finetune` lowers LR/entropy/clip and skips those callbacks (experimental).
-- New env behavior knobs in `config.yaml`: `training.early_stop_patience` (>0 → patience early-stop after the curriculum completes) and `training.reproducible` (deterministic per-env seed streams).
+- **Resume vs fine-tune:** `--resume` continues curriculum + entropy after a crash; `--finetune` lowers LR/entropy/clip and skips those callbacks (experimental). `train.py` refuses an existing `Runs/<run_id>/` (manifest present) unless `--overwrite-run` (which also clears the stale best-eval threshold and best-model artifacts) or `--resume` is passed.
+- New env behavior knobs in `config.yaml`: `training.early_stop_patience` (>0 → patience early-stop after the curriculum completes), `training.reproducible` (deterministic per-env seed streams), `reward.sortino_downside_floor` (downside-deviation floor in daily-return units, 0.001 = 10 bp/day; parser default 1e-4 preserves old run snapshots), and `data.feature_preroll_bars` (causal warmup window for `independent` split mode).
 
 ## Artifacts and gitignored paths
 
 The canonical run layout is `Runs/<run_id>/` (capital R): `manifest.json` (final write merges in `chronological_holdout` from pre-train), `config.yaml`, `data_cache.npz`, `models/{final,best,checkpoints}/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/`. Run paths/IDs/manifests are managed by `rlbot/run_artifacts.py` (`RunPaths`, `new_run_id`, `write_manifest`, `merge_manifest`, `read_run_manifest`, `discover_run_ids_with_models`, `resolve_data_cache`). There is no `LATEST.txt`.
 
-Gitignored (see `.gitignore`): `.cache/`, `data_cache.npz`, `Runs/`, the legacy artifact roots `models/ runs/ tb_logs/ logs/ plots/` (pre-`Runs/` layout, migratable via `scripts/migrate_runs_layout.py`), `ibkr_paper/`, and `execution/**`. Broker automation and local execution state stay out of the research tree.
+Gitignored (see `.gitignore`): `.cache/`, `data_cache.npz`, `Runs/`, `ibkr_paper/`, and `execution/**` (reserved for the tier-5 shadow ledger / future broker state; nothing under `execution/` is tracked and the directory may not exist). The legacy artifact roots (`models/ runs/ tb_logs/ logs/ plots/`, pre-`Runs/` layout) are no longer ignore-listed — migrate them via `scripts/migrate_runs_layout.py` rather than leaving them in the tree. Broker automation and local execution state stay out of the research tree.

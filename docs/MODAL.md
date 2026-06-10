@@ -31,7 +31,7 @@ modal run scripts/modal_app.py::upload_cache
 Pass the same flags you would give `scripts/train.py` after `--`:
 
 ```bash
-modal run scripts/modal_app.py -- \
+modal run scripts/modal_app.py::train -- \
   --window 2 \
   --timesteps 65000000 \
   --since 2006-01-01 \
@@ -61,19 +61,19 @@ GPU choice is fixed at launch (`--modal-gpu`); SB3 cannot rescale `n_envs` mid-r
 `config.yaml` sets `n_epochs: 3` and a baseline `batch_size: 16384` for local 16-env training (~12 backprop loops per PPO pause). Modal overrides `n_envs` and `batch_size` at launch; `n_epochs` stays in config.
 
 ```bash
-modal run scripts/modal_app.py -- --modal-gpu A100 --window 2 --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --modal-gpu A100 --window 2 --timesteps 65000000 ...
 ```
 
 Maximum throughput (highest cost):
 
 ```bash
-modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 65000000 ...
 ```
 
 Use an explicit run id when you plan to watch or sync artifacts:
 
 ```bash
-modal run scripts/modal_app.py -- --run-id <RUN_ID> --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --run-id <RUN_ID> --timesteps 65000000 ...
 ```
 
 Remote writes go to Modal volumes:
@@ -147,7 +147,7 @@ Then open the plot route with `?run_id=<RUN_ID>`.
 Checkpoints land on the runs volume under `Runs/<run_id>/models/checkpoints/`. After a **crash or preemption**, continue with `--resume` (restores curriculum + entropy schedule). Use `--finetune` only for an intentional second-stage experiment (lower LR/entropy, no curriculum).
 
 ```bash
-modal run scripts/modal_app.py -- \
+modal run scripts/modal_app.py::train -- \
   --run-id <RUN_ID> \
   --resume Runs/<RUN_ID>/models/checkpoints/ppo_<steps>_steps.zip \
   --timesteps 65000000

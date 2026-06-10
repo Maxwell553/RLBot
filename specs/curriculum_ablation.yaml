@@ -11,10 +11,7 @@ grid:
   curriculum.fee_ramp_fraction: [0.35, 0.45]
 seeds: [42]
 windows:
-  - name: w1
-    train_end: "2020-12-31"
-    holdout_start: "2021-01-01"
-    holdout_end: "2022-12-31"
+  - name: W4  # canonical: train through 2021-12-31, holdout 2022-01-01..2023-12-31
 timesteps: 3000000
 checkpoint_rule: best
 evaluation_tier: 3

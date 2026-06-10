@@ -28,7 +28,33 @@ WORKSPACE = "/workspace"
 DEFAULT_GPU = "A10G"
 MODAL_MAX_TIMEOUT_SEC = 86_400
 DEFAULT_TIMEOUT_SEC = MODAL_MAX_TIMEOUT_SEC
-N_STEPS = 4096
+def resolve_n_steps_for_argv(train_argv: list[str] | None = None) -> int:
+    """hyperparameters.n_steps for a launch: from the forwarded ``--config`` when
+    present (research variants may patch n_steps), else the default config. Called
+    at launch time, never frozen at import. Falls back to 4096 only when no config
+    is parseable (skeleton containers)."""
+    cfg_path = None
+    argv = list(train_argv or [])
+    if "--config" in argv:
+        i = argv.index("--config")
+        if i + 1 < len(argv):
+            cfg_path = argv[i + 1]
+    else:
+        cfg_path = next(
+            (a.split("=", 1)[1] for a in argv if a.startswith("--config=")), None
+        )
+    try:
+        from rlbot.rl_config import get_config, load_config
+
+        cfg = load_config(cfg_path) if cfg_path else get_config()
+        return int(cfg.hyperparameters.n_steps)
+    except Exception:
+        return 4096
+
+
+# Default-config value, kept for callers without an argv context (prints, sizing
+# fallbacks). Prefer resolve_n_steps_for_argv at launch time.
+N_STEPS = resolve_n_steps_for_argv()
 TARGET_MINIBATCHES_PER_EPOCH = 4
 MODAL_GPU_FLAG = "--modal-gpu"
 
@@ -261,8 +287,17 @@ def pull_all(
     root: Path = PROJECT_ROOT,
     volume: str = DEFAULT_RUNS_VOLUME,
 ) -> Path:
+    """Download Runs/<run_id> from the volume. The modal CLI re-creates the remote
+    directory NAME under the destination (paths are relative to the remote parent),
+    so the destination must be the Runs/ parent — passing Runs/<run_id> would nest
+    everything one level too deep (Runs/<id>/<id>/...)."""
     local_run = root / "Runs" / run_id
-    volume_get_dir(volume, run_id, local_run)
+    ok = volume_get_dir(volume, run_id, root / "Runs")
+    if not ok or not (local_run / "manifest.json").is_file():
+        raise RuntimeError(
+            f"pull_all({run_id!r}) did not produce {local_run}/manifest.json — the "
+            "remote run may not exist on the volume or the download failed."
+        )
     return local_run
 
 
@@ -337,7 +372,10 @@ def sync_cli_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.pull_all:
-        print(f"Pulled run → {pull_all(args.run_id, volume=args.volume)}")
+        try:
+            print(f"Pulled run → {pull_all(args.run_id, volume=args.volume)}")
+        except RuntimeError as exc:
+            raise SystemExit(f"sync --pull-all failed: {exc}")
         return
     if args.watch:
         watch_run(

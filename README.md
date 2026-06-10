@@ -44,7 +44,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 pip install -e ".[modal]" && modal setup
 
 # Train on Modal (broker scales n_envs + batch_size; pass --run-id or use --window N)
-modal run scripts/modal_app.py -- \
+modal run scripts/modal_app.py::train -- \
   --modal-gpu H100 --window 2 --run-id <RUN_ID> --timesteps 65000000 \
   --refresh-data --since 2006-01-01 --train-end 2017-12-31 \
   --holdout-start 2018-01-01 --holdout-end 2019-12-31 --until 2019-12-31
@@ -63,6 +63,8 @@ Use `--refresh-data` (or `modal run scripts/modal_app.py::upload_cache`) when a 
 ```bash
 python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2>,<RUN_ID_3> --checkpoint best
 ```
+
+(`--checkpoint latest|both` evaluates non-ex-ante weights on the holdout and prints an OOS-touch warning; `best` is the published metric.)
 
 **Universe:** `N = len(universe.assets)` in config, or `python scripts/train.py --n-assets N` (first N YAML keys). When changing **N**, run `--refresh-data` so the global cache matches; each run also snapshots the effective **N**-wide panel to `Runs/<id>/data_cache.npz`. Do not change core hyperparameters across walk-forward cohorts unless starting a new study.
 
@@ -109,12 +111,14 @@ flowchart TB
 
 ### Data (`rlbot/data_utils.py`)
 
-1. Fetch aligned daily OHLCV for `universe.assets` (yfinance; HY OAS via FRED / proxy).
+1. Fetch aligned daily OHLCV for `universe.assets` (yfinance, **dividend/split-adjusted** `auto_adjust=True` → total-return series for distributing symbols like SPY/IEF/EEM; `^N225`/`^FTSE` are price indices and FX/futures have no distributions, so those sleeves are price-return by nature; HY OAS via FRED / proxy). Pre-adjustment caches trigger a rebuild warning.
 2. Cache panel, `tickers`, and **`asset_live`** (1 = real print, 0 = pre-IPO / missing) in `.cache/data_cache.npz` — **no global `dropna`** on the calendar.
 3. Reserve chronological OOS holdout before any in-training split.
 4. Walk-forward alternating split (`training.block_size: 126`; `eval_stride: 4`); precomputed `WalkforwardEnvPack` panels aligned per segment.
-5. Fractional differentiation (`data.fracdiff_d: 0.4`) on log prices; RSI, MACD, trend, realized vol.
-6. Features via `data.feature_split_mode`: **`independent`** (default — recompute per segment + `feature_purge_warmup: 25` neutralization) or **`continuous`** (full-panel compute, slice per block; eval carries indicator memory across adjacent blocks). Holdout is always reserved first; neither mode leaks OOS data.
+5. Fractional differentiation (`data.fracdiff_d: 0.4`) on log prices; RSI, MACD, trend, realized vol — all strictly causal, and the holdout is reserved first, so neither split mode leaks OOS data.
+6. Features via `data.feature_split_mode`:
+   - **`independent`** (default): features recomputed per segment over a causal preroll window (`data.feature_preroll_bars`, default 252) so slow indicators get real warmup; only panel-head bars without preroll history are neutralized (`data.feature_purge_warmup: 25`).
+   - **`continuous`**: features computed once on the contiguous panel and **sliced** into blocks. Eval-block indicator memory is continuous with adjacent train blocks (matches the continuous backtest) — treat in-training eval NAV as a model-*selection* signal, not an independent estimate.
 
 ### Environment (`rlbot/trading_env.py`)
 
@@ -123,7 +127,7 @@ flowchart TB
 - **Observation:** `obs_dim = 10×N + 28` = per-asset market block (fracdiff horizons, vol, RSI, MACD, trend) + **live mask** + portfolio weights + drawdown/progress + 4 macro series (DXY, TNX, VIX, HY OAS; macro is observe-only).
 - **Execution:** features at `t` use `close[t−obs_lag]`; holding cost on pre-rebalance units at `close[t]`; rebalance fill `open[t+1]`; MTM `close[t+1]`.
 - **Episodes:** `max_episode_steps: 252` on training envs; eval uses the full walk-forward segment. Terminates early if NAV ≤ `stop_loss_fraction` (0.45) × episode-start NAV.
-- **Domain randomization (training):** after the fee curriculum releases, each episode resamples `obs_lag` ∈ {0,1,2} and `fee_scale` (Beta-mapped bell around 1.0); bounds widen progressively through the DR phase. **Eval:** mirrors train **fee/churn curriculum** (linear ramp, no DR); OOS backtest: fixed `obs_lag = 1`, `fee_scale = 1`.
+- **Domain randomization (training):** after the fee curriculum releases, each episode resamples `obs_lag` ∈ {0,1,2} and `fee_scale` (Beta-mapped bell around 1.0); bounds widen progressively through the DR phase. **Eval:** mirrors train **fee/churn curriculum** (linear ramp, no DR); OOS backtest: `obs_lag` defaults from the run manifest (`args.obs_lag`, else the run config's `environment.obs_lag_default`), `fee_scale = 1`.
 
 #### Reward & penalties (`config.yaml` → `reward`)
 
@@ -137,13 +141,13 @@ Logged per term in `info` / TensorBoard as `rew_decomp/*` (including `rew_decomp
 |------|------|------------------------|--------------|
 | **Return** | + | `clip(log_ret, −0.12, +0.06) × reward_scale`; negative returns × `(1 + drawdown_downside_gamma × dd_pre)` | `reward_scale: 2000`; `drawdown_downside_gamma: 5` |
 | **Benchmark excess** | + | `clip(agent_log_ret − bench_log_ret, ±clip) × benchmark_excess_scale` | `benchmark_excess_scale: 600`; `benchmark_excess_clip: 0.04` |
-| **Sortino diff** | + | `clip(agent_sortino − bench_sortino, ±3) × risk_bonus_scale` after `sortino_min_steps: 20` | `risk_bonus_scale: 2.5` |
+| **Sortino diff** | + | `clip(agent_sortino − bench_sortino, ±3) × risk_bonus_scale` after `sortino_min_steps: 20`; downside deviation floored at `sortino_downside_floor: 0.001` (10 bp/day) so no-loss windows cannot saturate the clip | `risk_bonus_scale: 2.5` |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + extra linear ramp from 90%→100% cash | `1.35` + `0.9` tail (max **~2.25** at 100% cash) |
 | **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |
-| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_relative_max_share` of \|return\| + \|participation\| + \|inactivity\| + \|churn\| | `0.6` (`0` disables both) |
+| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant**, never a function of the other terms — a relative cap was reward-hackable) | `24.0` (`0` disables both) |
 
-`tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training and eval `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, fixed `obs_lag = 1`.
+`tx_cost_frac` = realized slippage + fee dollars paid at rebalance ÷ NAV (zero when `fee_scale = 0`). Training and eval `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the **fee ramp** (`fee_free_fraction` → `fee_ramp_fraction`). OOS backtest: full fees, `churn_scale = 1`, `obs_lag` defaulted from the run manifest.
 
 #### Transaction costs (`config.yaml` → `transaction_costs`)
 
@@ -160,17 +164,19 @@ Per-asset **slippage**, **tx_fee**, and **annual_holding_cost** (length-N lists,
 - **AdaptiveEntropyCallback** — cosine entropy decay (not eval-gated).
 - **RewardDecompCallback** — per-term reward balance to TensorBoard (`rew_decomp/*`) and `eval_logs/reward_decomp.json`.
 - **Cadence:** eval every **500k** global steps (`eval_freq = 500_000 // n_envs`); training plot refresh `viz_freq: 500_000`; weight checkpoints every **1M** steps.
-- OOS checkpoint rule (when reporting): **eval-NAV-best only** (holdout never used to pick weights).
-- **Run ids:** `--window N` → `W{N}_MMDD` (month/day at launch, e.g. `W1_0608`); collisions get `_a`, `_b`, …; or pass `--run-id <RUN_ID>` explicitly.
-- **Reproducibility:** default uses `reseed_on_reset` (stochastic episode starts); set `training.reproducible: true` for deterministic per-env seed streams.
+- OOS checkpoint rule (when reporting): **eval-NAV-best only** (holdout never used to pick weights). `best_model.zip` is saved together with the VecNormalize stats it was selected under.
+- **Early stop (opt-in):** `training.early_stop_patience > 0` stops after K evals with no new best NAV once the curriculum completes; the reason lands in the manifest.
+- **Reproducibility (opt-in):** default uses `reseed_on_reset` (stochastic episode starts); set `training.reproducible: true` for deterministic per-env seed streams so same-seed runs reproduce.
+- **Run ids:** `--window N` → `W{N}_MMDD` (month/day at launch, e.g. `W1_0608`); collisions get `_a`, `_b`, …; or pass `--run-id <RUN_ID>` explicitly. Reusing an explicit `--run-id` that already has a manifest is refused unless `--overwrite-run` (or `--resume`) is passed.
 
 ### Evaluation & inference
 
 | Script / module | Purpose |
 |-----------------|---------|
-| `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, stochastic-path fan plot; writes `backtest_summary.json` |
+| `scripts/backtest.py` | OOS rollout from `Runs/<id>/manifest.json`, benchmarks, stochastic-path fan plot; writes `Runs/<id>/backtest_summary.json` with config/data hashes + drift warnings |
 | `scripts/infer_weights.py` | Audited target weights for a single `--as-of` date (provenance-rich JSON; no broker) |
-| `scripts/research.py` | Auto-research: `plan`/`launch`/`report` over `specs/*.yaml` with OOS-gated tiers |
+| `scripts/research.py` | Auto-research loop: `validate`/`plan`/`launch`/`screen`/`run-queue`/`collect`/`report`/`promote` over `specs/*.yaml`; OOS firewall via tiers + `Runs/<cohort>/registry.jsonl` + global burn ledger |
+| `scripts/shadow_trade.py` | Tier-5 shadow trading: daily audited weights → gitignored `execution/` ledger, reconciled vs realized returns (forward OOS, no holdout burn) |
 | `scripts/run_seed_ensemble.sh` | Multi-seed training + ensemble backtest |
 | `scripts/migrate_runs_layout.py` | Move legacy `models/`, `plots/`, … into `Runs/<id>/` |
 | `rlbot/baselines.py` | Cash, benchmark-only B&H, equal-weight (daily + monthly, tx-cost-aware), 60/40, naive risk parity |
@@ -197,14 +203,16 @@ Passive benchmarks use **simple-return** cross-sectional aggregation, then compo
 
 Calendar flags are passed on `train.py` / `scripts/modal_app.py` and stored in `Runs/<run_id>/manifest.json`. Use `--window` or an explicit `--run-id` per cohort.
 
+The canonical window table (enforced for research specs by `rlbot/research/spec.py:CANONICAL_WINDOWS`): window *N* trains through Dec-31 of `2013 + 2N` and holds out the following two calendar years.
+
 | Window | Train through | OOS holdout | Sample `run_id` |
 |--------|---------------|-------------|------------------|
 | 1 | 2015-12-31 | 2016–2017 | `W1_MMDD` |
 | 2 | 2017-12-31 | 2018–2019 | `W2_MMDD` |
-| 3 | 2019-12-31 | 2020–H1 2021 | `W3_MMDD` |
-| 4 | 2021-06-30 | 2021 H2–2022 | `W4_MMDD` |
-| 5 | 2022-12-31 | 2023–2024 | `W5_MMDD` |
-| 6 | 2024-12-31 | 2025–latest | `W6_MMDD` |
+| 3 | 2019-12-31 | 2020–2021 | `W3_MMDD` |
+| 4 | 2021-12-31 | 2022–2023 | `W4_MMDD` |
+| 5 | 2023-12-31 | 2024–2025 | `W5_MMDD` |
+| 6 | 2025-12-31 | 2026–2027 | **embargoed** (terminal validation only; rejected for research specs) |
 
 `MMDD` = month and day at train launch; use `--window N` to auto-generate or `--run-id <RUN_ID>` for a custom id. Calendar flags, Modal commands, and the OOS results table (all pending): [docs/RESEARCH.md](docs/RESEARCH.md#walk-forward-status-results-pending).
 
@@ -220,8 +228,8 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 |------|------|
 | `config/config.yaml` | Universe, PPO, reward, costs, curriculum |
 | `rlbot/` | Library: `data_utils`, `trading_env`, `rl_config`, `run_artifacts`, `inference_load`, `inference_output`, `vecnorm_utils`, `visualize`, `baselines`, `modal_cloud`, `stats`, `reward_logging`, `research/` |
-| `scripts/` | `train.py`, `backtest.py`, `infer_weights.py`, `research.py`, `modal_app.py`, `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
-| `specs/` | Experiment specs for `research.py` (feature-split A/B, reward/curriculum ablations) |
+| `scripts/` | `train.py`, `backtest.py`, `infer_weights.py`, `research.py`, `shadow_trade.py`, `modal_app.py`, `run_seed_ensemble.sh`, `migrate_runs_layout.py` |
+| `specs/` | Pre-registered experiment specs for `research.py` (feature-split A/B, reward/curriculum ablations) |
 | `Runs/<run_id>/` | `manifest.json`, `config.yaml`, `data_cache.npz`, `models/`, `plots/`, `logs/`, `tb_logs/`, `eval_logs/`, `backtest_summary.json` |
 | `docs/TRAINING.md` | Local operations guide |
 | `docs/MODAL.md` | Modal setup, GPU broker, watch/pull workflow |

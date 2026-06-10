@@ -64,3 +64,64 @@ def test_agent_docs_in_sync_with_each_other() -> None:
     agents = _doc_text("AGENTS.md").splitlines()
     # Skip the first 3 lines (title + attribution) on each; bodies must match.
     assert claude[3:] == agents[3:]
+
+
+# ── user docs (README / RESEARCH) — claims corrected twice get a tripwire ─
+
+
+def test_readme_does_not_overclaim_purge() -> None:
+    """README.md:111 once claimed 'join purge — no cross-block leakage' for the default
+    mode, where the purge is not applied. The split-mode behavior must be described
+    via feature_split_mode instead."""
+    text = _doc_text("README.md")
+    assert "join purge — no cross-block leakage" not in text
+    assert "feature_split_mode" in text
+    assert "feature_preroll_bars" in text
+
+
+def test_research_md_states_run_local_config_binding() -> None:
+    """RESEARCH.md once claimed backtest uses the *current global* config; it binds the
+    run-local snapshot by default since the evolution-roadmap branch."""
+    text = _doc_text("docs/RESEARCH.md")
+    assert "uses the **current** global config" not in text
+    assert "run-local" in text.lower()
+
+
+def test_user_docs_mention_canonical_windows() -> None:
+    """README/RESEARCH window tables must agree with the enforced canonical table."""
+    from rlbot.research.spec import CANONICAL_WINDOWS
+
+    readme = _doc_text("README.md")
+    research = _doc_text("docs/RESEARCH.md")
+    for name, w in CANONICAL_WINDOWS.items():
+        assert w["train_end"] in readme, f"README window table missing {name} {w['train_end']}"
+        assert w["train_end"] in research, f"RESEARCH.md registry missing {name} {w['train_end']}"
+
+
+def test_published_metric_examples_use_best_checkpoint() -> None:
+    """Examples in user docs must model --checkpoint best (latest/both touch OOS)."""
+    for name in ("README.md", "docs/TRAINING.md"):
+        text = _doc_text(name)
+        assert "--checkpoint both" not in text.replace(
+            "`--checkpoint latest|both`", ""
+        ), f"{name} example still models --checkpoint both"
+
+
+def test_agent_docs_do_not_claim_untracked_execution_readme() -> None:
+    """Agent docs must match git reality: no execution/ or paper_trade/ files are
+    tracked (paper_trade was removed on main), and the docs must not claim a tracked
+    execution/README.md or a live paper_trade tree."""
+    import subprocess
+
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=PROJECT_ROOT, capture_output=True, text=True
+    ).stdout.splitlines()
+    assert not any(p.startswith("execution/") for p in tracked)
+    assert not any(p.startswith("paper_trade/") for p in tracked)
+    assert "scripts/paper_trade.py" not in tracked
+    for name in AGENT_DOCS:
+        text = _doc_text(name)
+        assert "except a tracked `execution/README.md`" not in text
+        assert "`paper_trade/` tree" not in text.replace(
+            "**no** `paper_trade/` tree", ""
+        ), f"{name} claims a live paper_trade tree"

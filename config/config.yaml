@@ -40,15 +40,23 @@ reward:
   max_step_log_return_downside: -0.12
   risk_window: 63
   sortino_min_steps: 20
-  # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_relative_max_share).
+  # Floor on downside deviation in the Sortino ratio, in daily-return units (0.001 =
+  # 10 bp/day). The old 1e-4 floor let any no-loss window (e.g. ~90% cash + carry)
+  # saturate the ±3 clipped differential — a quasi-binary +risk_bonus_scale*3 exploit.
+  sortino_downside_floor: 0.001
+  # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_combined_abs_cap).
   risk_bonus_scale: 2.5
   # Cap-weighted passive benchmark for Sortino differential + per-step excess return
   benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
   # clip(agent_log_ret - bench_log_ret) * scale; uses same friction model as Sortino benchmark
   benchmark_excess_scale: 600.0
   benchmark_excess_clip: 0.04
-  # Max combined |sortino + benchmark| share of per-step |return| + |shaping| mass
-  benchmark_relative_max_share: 0.6
+  # CONSTANT cap on |sortino + benchmark| per step (reward units; 0 disables both).
+  # Deliberately not relative to the other terms: a share-of-other-mass cap let the
+  # agent raise the cap by burning costs / taking losses (reward-hacking gradient).
+  # 24 ≈ the benchmark-excess clip max (0.04 × 600); it trims only extreme days when
+  # the Sortino diff (≤ ±7.5) and the excess clip saturate together (raw max 31.5).
+  benchmark_combined_abs_cap: 24.0
   # tx_cost_frac * churn_penalty * reward_scale * VIX_scale * curriculum_churn_scale
   churn_penalty: 1.0  # multiplier on realized tx cost (slippage + fees) in reward units
   drawdown_downside_gamma: 5.0  # amplifies negative step returns when already in drawdown
@@ -97,7 +105,7 @@ training:
   eval_n_episodes: 1  # fallback if segment list empty; train.py sets n_eval = #eval blocks
   holdout_days: 365
   viz_freq: 500000
-  curriculum_update_freq: 50000
+  curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
   checkpoint_save_freq_steps: 1000000
   reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
   early_stop_patience: 0     # >0 → stop after K evals with no new best (after curriculum)
@@ -138,9 +146,18 @@ curriculum:
 data:
   since: "2005-01-01"
   fracdiff_d: 0.4
-  feature_purge_warmup: 25  # neutralize first N bars at each joined train/eval segment
-  # "continuous": features precomputed on the contiguous panel then sliced into blocks
-  #   (matches continuous backtest memory; purge NOT applied).
-  # "independent" (default): recompute features per segment + apply feature_purge_warmup,
-  #   so the eval-selection signal is not feature-state-contaminated by adjacent train blocks.
+  feature_purge_warmup: 25  # neutralize first N bars only where preroll history is unavailable (panel head)
+  # Causal warmup history recomputed per segment in independent mode (sliced off after
+  # feature computation) so EMA-100/MACD/fracdiff are not dominated by truncation
+  # transients inside 126-bar eval blocks.
+  feature_preroll_bars: 252
+  # "continuous": features precomputed on the contiguous panel then sliced into
+  #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
+  # "independent" (default): recompute features per segment over a BOUNDED causal
+  #   preroll window (uniform history depth at every segment head, vs continuous's
+  #   unbounded panel memory). NOTE: the preroll bars ARE the adjacent train blocks,
+  #   so short-memory indicators (RSI-14/MACD-26/EMA-100/vol-20) match continuous
+  #   bit-for-bit once preroll covers their memory — the modes differ mainly in
+  #   fracdiff's long tail and in head-of-panel handling, not in train/eval isolation.
+  #   Only panel-head bars with insufficient preroll are purged.
   feature_split_mode: independent

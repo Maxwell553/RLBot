@@ -1,6 +1,6 @@
 # RLBot (MarketTrainer) — Critical Review
 
-> **Status (2026-06-09):** Historical snapshot. Since this review: dynamic N (5–55), `infer_weights.py`, auto-research, run-local backtest binding, **`feature_split_mode: independent`**, benchmark excess + Sortino cap (`risk_bonus_scale: 2.5`, `benchmark_relative_max_share: 0.6`), cap **0.25**, aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. **No new OOS results** are published under the current pipeline — prior numbers in this review are pre-refactor. See [RESEARCH.md](RESEARCH.md).
+> **Status (2026-06-09):** Historical snapshot. Since this review: dynamic N (5–55), `infer_weights.py`, auto-research, run-local backtest binding, **`feature_split_mode: independent`**, benchmark excess + Sortino cap (`risk_bonus_scale: 2.5`, `benchmark_combined_abs_cap: 24.0`), cap **0.25**, aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. **No new OOS results** are published under the current pipeline — prior numbers in this review are pre-refactor. See [RESEARCH.md](RESEARCH.md).
 
 **Date:** 2026-06 (review performed on current main branch checkout)  
 **Scope:** Full repository: code, configuration, data pipeline, training loop, evaluation, documentation, and research claims.  

@@ -4,7 +4,7 @@ Date: 2026-06-08 (updated 2026-06-09 for current benchmark-relative reward pipel
 
 Scope: this audit reviewed the repository code, tests, `README.md`, `config/README.md`, `docs/MODAL.md`, `docs/RESEARCH.md`, and `docs/TRAINING.md`. It intentionally did not use prior model review documents in `docs/`.
 
-> **Pipeline update (2026-06-09):** Default `feature_split_mode: independent`; cap **`max_single_asset_weight: 0.25`**; benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_relative_max_share: 0.6`**); train **and eval** share the fee/churn curriculum; `models/best/` saves are gated until `fee_ramp_end`. Runs are comparable only after checking their snapshotted `Runs/<id>/config.yaml`.
+> **Pipeline update (2026-06-09):** Default `feature_split_mode: independent`; cap **`max_single_asset_weight: 0.25`**; benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_combined_abs_cap: 24.0`**); train **and eval** share the fee/churn curriculum; `models/best/` saves are gated until `fee_ramp_end`. Runs are comparable only after checking their snapshotted `Runs/<id>/config.yaml`.
 
 ## Executive Summary
 

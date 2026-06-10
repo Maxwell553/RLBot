@@ -2,7 +2,7 @@
 
 Methodology and walk-forward protocol for **RecurrentPPO** on a config-driven tradeable universe (**5–55** assets via `config/config.yaml` → `universe.assets`).
 
-> **No definitive published OOS results yet.** Current pipeline: **`feature_split_mode: independent`**, cap **`max_single_asset_weight: 0.25`**, benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined cap **`benchmark_relative_max_share: 0.6`**), aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. Any interim probes must be interpreted through their snapshotted `Runs/<id>/config.yaml`.
+> **No definitive published OOS results yet.** Current pipeline: **`feature_split_mode: independent`**, cap **`max_single_asset_weight: 0.25`**, benchmark excess + Sortino (`risk_bonus_scale: 2.5`, `benchmark_excess_scale: 600`, combined constant cap **`benchmark_combined_abs_cap: 24.0`**), aligned train/eval fee curriculum, post-`fee_ramp_end` best-model gate. Any interim probes must be interpreted through their snapshotted `Runs/<id>/config.yaml`.
 
 Each window trains on data through a fixed **train-end** date; a chronological **OOS holdout** never appears in training or in-training validation. When reported, OOS metrics will use **`Runs/<run_id>/models/best/best_model.zip`** (maximum mean in-training eval NAV **after full fees/churn on eval**), not holdout-tuned weights.
 
@@ -28,14 +28,35 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 | In-training eval | One deterministic rollout **per eval segment** (~# of 126-bar eval blocks) |
 | Reward logging | `RewardDecompCallback` → TB `rew_decomp/*` + `eval_logs/reward_decomp.json` |
 | Early stop | Optional `training.early_stop_patience` (after curriculum completes) |
-| OOS backtest | `obs_lag = 1`, full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
+| OOS backtest | `obs_lag` from the run manifest (else run config default), full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
 | Checkpoint rule | Eval-NAV-best only (`models/best/best_model.zip` + matched `best/vec_normalize.pkl`) |
 
 ### Hyperparameter protocol
 
 Core hyperparameters live in `config/config.yaml` and are **copied to `Runs/<run_id>/config.yaml`** at train start. Walk-forward windows differ by **calendar flags** and **run id** only, not per-window YAML sweeps, unless a new study is intentional.
 
-After any change to universe, `asset_live` panel, `obs_dim`, or reward coefficients, run `--refresh-data` (if data/universe changed) and train with a **new** run id — old checkpoints and VecNormalize stats are incompatible. OOS backtest binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default (`--use-current-config` to opt out).
+After any change to universe, `asset_live` panel, `obs_dim`, or reward coefficients, run `--refresh-data` (if data/universe changed) and train with a **new** run id — old checkpoints and VecNormalize stats are incompatible. OOS backtest execution binds the **run-local snapshots** by default for reproducibility: `Runs/<run_id>/config.yaml` for env mechanics (fees, cap, smoothing) and `Runs/<run_id>/data_cache.npz` for the panel (`--use-current-config` / `--data-cache` override; the summary records config/data hashes and warns when they drift from the training manifest).
+
+### Auto-research loop (`scripts/research.py` + `specs/*.yaml`)
+
+Method experiments are pre-registered as specs (hypothesis + allow-listed config `patch`/`grid`; universe, costs, split, and holdout dates are not patchable, and `windows` must reference the canonical table below). The orchestrator shells out to the canonical `train.py`/`backtest.py` and records every run in `Runs/<cohort>/registry.jsonl`:
+
+```bash
+python scripts/research.py plan    specs/reward_ablation.yaml   # materialize variant configs
+python scripts/research.py launch  specs/reward_ablation.yaml   # tiers 1–3: train + in-training eval only
+python scripts/research.py report  reward_ablation              # registry → report.md (OOS shown for tier ≥ 4 only)
+python scripts/research.py promote specs/reward_ablation.yaml --variant <id> --promote
+```
+
+**Backends & throughput:** `launch --backend modal --modal-gpu H100` trains each variant on Modal (variant config pushed to the runs volume first; run tree pulled back before collect); `spec.budget.max_modal_hours` is enforced as a per-variant wall-clock cap on both backends. `research.py run-queue` drains `Runs/queue/*.yaml` sequentially (launch → report → move to `done/`/`failed/`) and **refuses promotion-requiring specs (tiers 4 and 5)** — holdout reads and shadow starts stay human actions. `research.py screen <spec> --screen-timesteps 2000000 --keep-top 0.25` runs every grid combo at tier 1 with a tiny budget and writes `screen_ranking.json` naming the top fraction to advance to a full-tier launch under a new spec id (successive halving; never touches the holdout).
+
+**Agent-proposed specs:** `research.py validate <spec> [--agent]` is the proposer's no-side-effect feedback loop (schema, firewall, canonical windows, gate keys, id collisions). `--agent` additionally requires `hypothesis`, `parent`, and `success_gates`, and refuses promotion-requiring tiers (4 and 5) — an autonomous proposer can iterate freely on tiers ≤ 3 via the queue, while promotion (and every holdout read) stays a human action. Tier ≥ 4 launches and promotes refuse a **dirty working tree** — and fail closed when git state cannot be determined at all (`--allow-dirty` overrides, recorded): an OOS number must be attributable to a commit.
+
+**Tier 5 — shadow trading (`scripts/shadow_trade.py`):** forward evaluation that never burns a holdout. A daily `record --refresh-data` (after the close) refreshes the **global** cache (the run snapshot is frozen by design), runs the audited inference path (frozen VecNormalize, manifest-checked panel, OOS-ledger logged), and appends target weights + provenance + an **observation-drift alarm** (fraction of normalized features >5σ from frozen training stats; thresholds are heuristics, `--drift-sigma/--drift-frac`) to the gitignored `execution/shadow_ledger_<RUN_ID>.jsonl`. Rows are keyed by their **decision bar** — the bar whose observation actually produced the weights (the rollout env needs two later bars to execute a step, so the recorded book lags the cache tail; the ledger is honest about that). `reconcile` (torch-free) fills realized open→open returns **net of linear costs** (turnover vs the previous recorded book × slippage+fee, plus daily holding; the cap-weighted buy-and-hold benchmark pays holding only; no market-impact/capacity model); `report` summarizes the accumulating true walk-forward record. This is the natural terminal arbiter of the continuous loop.
+
+**Cross-cohort memory:** `research.py report --all` aggregates every `Runs/*/registry.jsonl` into `Runs/research_report_all.md`: per-cohort summaries with `parent` lineage, holdout-read counts, and a **knob-sensitivity table** (median best-eval-NAV per patched config value, normalized as a delta vs its cohort's median). This is the registry-as-memory view a hypothesis proposer reads before writing the next spec.
+
+The OOS firewall: tiers 1–3 never touch the holdout; tier ≥ 4 requires `--promote`, is budgeted (`--oos-budget`, default 1 read per launch), and every holdout read is written to the registry **before** it happens — a variant with a recorded tier-4 read cannot be re-scored (`--allow-failed-rescore` only retries crashed, never-scored reads). Published OOS numbers carry the cohort's variant count; interpret them with that multiplicity in mind.
 
 ---
 
@@ -59,10 +80,21 @@ Use `--window N` on `train.py` (or `modal run scripts/modal_app.py -- …`) for 
 |--------|---------------|-------------------------------------------|-----------|-----------------|----------|--------------|
 | 1 | 2015-12-31 | 2016-01-01 … 2017-12-31 | 2017-12-31 | `W1_MMDD` | Pending | Pending |
 | 2 | 2017-12-31 | 2018-01-01 … 2019-12-31 | 2019-12-31 | `W2_MMDD` | Pending | Pending |
-| 3 | 2019-12-31 | 2020-01-01 … 2021-06-30 | 2021-06-30 | `W3_MMDD` | Pending | Pending |
-| 4 | 2021-06-30 | 2021-07-01 … 2022-12-31 | 2022-12-31 | `W4_MMDD` | Pending | Pending |
-| 5 | 2022-12-31 | 2023-01-01 … 2024-12-31 | 2024-12-31 | `W5_MMDD` | Pending | Pending |
-| 6 | 2024-12-31 | 2025-01-01 … latest | (omit / latest bar) | `W6_MMDD` | Pending | Pending |
+| 3 | 2019-12-31 | 2020-01-01 … 2021-12-31 | 2021-12-31 | `W3_MMDD` | Pending | Pending |
+| 4 | 2021-12-31 | 2022-01-01 … 2023-12-31 | 2023-12-31 | `W4_MMDD` | Pending | Pending |
+| 5 | 2023-12-31 | 2024-01-01 … 2025-12-31 | 2025-12-31 | `W5_MMDD` | Pending | Pending |
+| 6 | 2025-12-31 | 2026-01-01 … 2027-12-31 | (omit / latest bar) | **embargoed** | — | reserved (terminal validation only) |
+
+Window *N* trains through Dec-31 of `2013 + 2N` with a two-year holdout. This table is canonical: research specs may only reference these windows (`rlbot/research/spec.py:CANONICAL_WINDOWS` rejects anything else — a spec that placed its own holdout would change what OOS *is*). **W6 is embargoed** (`EMBARGOED_WINDOWS`): it is the reserved terminal validation window, untouched by the iterate-measure loop, usable only for a final human-run pre-deployment validation or the tier-5 shadow path.
+
+### Holdout-burn accounting & selection-aware significance
+
+- **Every** OOS backtest — research-launched or manual — appends a record to the global ledger `Runs/oos_ledger.jsonl` *before* the rollout starts (a crash still burns). Burn is counted in **distinct models per window** (re-scoring the same run adds no selection pressure).
+- `research.py launch/promote` enforce a cumulative per-window budget (`--window-budget`, default `oos_ledger.DEFAULT_WINDOW_BUDGET = 10` distinct models). Past budget, further research reads are refused — iterate on tiers ≤ 3 instead.
+- The ledger starts empty at its introduction: holdout reads that predate it are invisible, so early trial counts are a flattering undercount — treat early DSR values as upper bounds.
+- Trial counts aggregate **same-key** reads only: canonical-window reads share one key, while tail-mode and `infer_weights`/shadow reads are keyed by their realized slices and never inflate (or deflate) a canonical window's count. In particular, daily shadow records overlapping W6's calendar range add no W6 trials — a future terminal W6 validation should reckon with that informal forward-selection feedback separately.
+- `backtest_summary.json` reports `deflated_sharpe`: the probabilistic Sharpe ratio (Bailey & López de Prado, skew/kurtosis-adjusted) evaluated against the expected max Sharpe of *N* zero-skill strategies, with *N* = the ledger's distinct-model count for the window read. DSR > 0.95 is the conventional significance bar **after** selection. (Simplification: the null cross-trial SR variance is taken as `1/n_obs`; see `rlbot/stats.py`.)
+- **Pre-registered decision rules**: spec `success_gates` (`min_seeds`, `eval_nav_mean_min`, `eval_nav_median_min`, `eval_nav_spread_max_frac`, `oos_sharpe_min`, `oos_max_drawdown_floor`, `deflated_sharpe_min`) are evaluated per seed-group at `collect`; verdicts (`pass`/`fail`/`inconclusive`) land in `Runs/<cohort>/verdicts.json`. `promote` refuses to spend a holdout read on a group whose verdict is not `pass` unless `--force-gates` is passed explicitly.
 
 **Local train example (window 1):**
 
@@ -136,8 +168,8 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 1. **Fractional differentiation** (`data.fracdiff_d: 0.4`) on log prices.
 2. **Walk-forward blocks:** `train_test_split_alternating`, `block_size` 126, `eval_stride` 4 (`WalkforwardEnvPack` in `data_utils.py`).
-3. **Feature split mode** (`data.feature_split_mode`): **`independent`** (default — recompute per segment + neutralize first `feature_purge_warmup: 25` bars) vs `continuous` (compute on full trainable panel, slice per block; eval carries indicator memory across adjacent blocks). Holdout reserved first in both modes.
-4. **`asset_live` panel:** no global calendar `dropna`; missing pre-IPO bars filled; live mask gates allocation.
+3. **Feature split mode** (`data.feature_split_mode`): **`independent`** (default — recompute per segment over a causal preroll window, `feature_preroll_bars: 252`, neutralizing only panel-head bars without preroll history via `feature_purge_warmup: 25`) vs `continuous` (compute on full trainable panel, slice per block; eval carries indicator memory across adjacent blocks — a model-*selection* signal, not an independent estimate). Holdout reserved first in both modes.
+4. **`asset_live` panel:** no global calendar `dropna`; missing pre-IPO bars filled; live mask gates allocation **and** per-asset features are neutralized on pre-live bars (no pre-IPO price level reaches the observation).
 5. **Causal execution:** features at `t` use `close[t−obs_lag]`; holding cost at `close[t]`; fill `open[t+1]`; MTM `close[t+1]`.
 6. **Chronological holdout:** removed before train/eval; only `scripts/backtest.py` uses OOS bars.
 7. **HY OAS macro:** causal expanding OLS calibration (no per-bar `polyfit` look-ahead).
@@ -155,7 +187,7 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 **Episodes:** `max_episode_steps: 252` (train); eval = full segment. Early stop if NAV ≤ `stop_loss_fraction` (0.45) × episode-start NAV.
 
-**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. **Eval:** mirrors train fee/churn curriculum (linear ramp); fixed `obs_lag = 1`, no DR. OOS backtest: `obs_lag = 1`, `fee_scale = 1`.
+**Domain randomization (training only):** after fee curriculum releases, per-episode `obs_lag` ∈ {0,1,2} and Beta-mapped `fee_scale`; bounds widen through DR phase. **Eval:** mirrors train fee/churn curriculum (linear ramp); fixed `obs_lag` (config default), no DR. OOS backtest: `obs_lag` from the run manifest, `fee_scale = 1`.
 
 ### Reward decomposition
 
@@ -167,8 +199,8 @@ Per-step (before VecNormalize during training):
 |-----------|------|----------------|-------------------|
 | **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 5` |
 | **Benchmark excess** | + | `clip(agent_log_ret − bench_log_ret, ±clip) × benchmark_excess_scale` (same friction model as Sortino bench) | `benchmark_excess_scale: 600`; `benchmark_excess_clip: 0.04` |
-| **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window`, clipped ±3 | `risk_bonus_scale: 2.5` |
-| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_relative_max_share` of \|return\|+\|participation\|+\|inactivity\|+\|churn\| | **0.6** (`0` disables both) |
+| **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window`, clipped ±3; downside deviation floored at `sortino_downside_floor: 0.001` (10 bp/day) | `risk_bonus_scale: 2.5` |
+| **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant** — a relative cap was reward-hackable) | **24.0** (`0` disables both) |
 | **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
 | **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.35** + **0.9** tail (max **~2.25** at 100% cash) |
 | **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |

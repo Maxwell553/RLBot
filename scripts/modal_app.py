@@ -5,7 +5,7 @@ Setup:
   pip install -e ".[modal]" && modal setup
 
 Train (pass train.py flags after ``--``):
-  modal run scripts/modal_app.py -- --modal-gpu H100 --window 2 --run-id W2_605 ...
+  modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 2 --run-id W2_605 ...
 
 Sync plots locally while training:
   python scripts/modal_app.py sync --run-id W2_605 --watch
@@ -36,6 +36,7 @@ if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "sync":
 import modal
 
 from rlbot.modal_cloud import (
+    resolve_n_steps_for_argv,
     APP_NAME,
     DEFAULT_GPU,
     DEFAULT_TIMEOUT_SEC,
@@ -115,17 +116,34 @@ def train_remote(
     os.environ[VOLUME_CACHE_ENV] = VOLUME_CACHE
     os.chdir(WORKSPACE)
 
+    # Broker values are *defaults*: prepend them so a user-passed --n-envs/--batch-size
+    # (argparse last-wins) overrides the GPU profile instead of being silently ignored.
+    def _user_passed(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in train_argv)
+
+    def _flag_value(flag: str) -> str:
+        if flag in train_argv:
+            i = train_argv.index(flag)
+            if i + 1 >= len(train_argv):
+                raise SystemExit(f"{flag} requires a value")
+            return train_argv[i + 1]
+        return next(a.split("=", 1)[1] for a in train_argv if a.startswith(flag + "="))
+
+    if _user_passed("--n-envs"):
+        n_envs_override = int(_flag_value("--n-envs"))
+    if _user_passed("--batch-size"):
+        batch_size_override = int(_flag_value("--batch-size"))
     cmd = [
         sys.executable,
         "scripts/train.py",
-        *train_argv,
         "--n-envs",
         str(n_envs_override),
         "--batch-size",
         str(batch_size_override),
+        *train_argv,
     ]
     rollout = N_STEPS * n_envs_override
-    minibatches = rollout // batch_size_override
+    minibatches = rollout // max(batch_size_override, 1)
     print(f"[modal] cwd={os.getcwd()}", flush=True)
     print(
         f"[modal] rollout={rollout:,}  batch_size={batch_size_override:,}  "
@@ -213,7 +231,7 @@ def train(*arglist: str):
     if not train_argv:
         print(
             "Pass train.py arguments after --\n"
-            "  modal run scripts/modal_app.py -- --modal-gpu H100 --window 2 --run-id W2_605 ...\n"
+            "  modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 2 --run-id W2_605 ...\n"
             "Sync: python scripts/modal_app.py sync --run-id W2_605 --watch"
         )
         raise SystemExit(1)
@@ -221,8 +239,12 @@ def train(*arglist: str):
     gpu_key = normalize_gpu_name(gpu)
     profile = gpu_profile(gpu)
     target_envs = profile["n_envs"]
-    batch_size = rollout_batch_size(target_envs)
-    rollout = N_STEPS * target_envs
+    # n_steps must come from the config the REMOTE train will actually use: a
+    # research variant may patch hyperparameters.n_steps, and a batch sized from
+    # the default config would no longer divide the rollout.
+    n_steps = resolve_n_steps_for_argv(train_argv)
+    batch_size = rollout_batch_size(target_envs, n_steps=n_steps)
+    rollout = n_steps * target_envs
 
     print("=" * 60)
     print("MODAL LAUNCH BROKER")
@@ -277,6 +299,6 @@ def serve_plot(run_id: str):
 
 if __name__ == "__main__":
     print("Usage:")
-    print("  modal run scripts/modal_app.py -- [train.py flags]")
+    print("  modal run scripts/modal_app.py::train -- [train.py flags]")
     print("  python scripts/modal_app.py sync --run-id W2_605 --watch")
     raise SystemExit(1)

@@ -21,6 +21,7 @@ _bootstrap_mod = importlib.util.module_from_spec(_bootstrap_spec)
 _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 
 import argparse
+import os
 import copy
 import json
 import re
@@ -43,7 +44,10 @@ from rlbot.data_utils import (
     resolve_panel_tickers,
     reserve_chronological_holdout,
 )
+from rlbot.research import oos_ledger
+from rlbot.stats import deflated_sharpe_ratio
 from rlbot.run_artifacts import (
+    check_holdout_window_against_manifest,
     PROJECT_ROOT,
     RUNS_ROOT,
     RunPaths,
@@ -136,7 +140,7 @@ def _get_shared_panel(cache_path: str | Path | None = None) -> tuple:
     if key not in _PANEL_CACHE:
         _bt_log(f"[backtest] Loading market cache (once per path): {key}")
         t0 = time.perf_counter()
-        _PANEL_CACHE[key] = load_cache(key)
+        _PANEL_CACHE[key] = load_cache(key, expected_fracdiff_d=get_config().data.fracdiff_d)
         _bt_log(f"[backtest] Cache loaded ({time.perf_counter() - t0:.1f}s).")
     return _PANEL_CACHE[key]
 
@@ -276,6 +280,10 @@ class BacktestResult:
     max_drawdown: float
     n_bars: int
     seed_label: str = ""
+    # return-distribution stats for selection-aware significance (PSR/DSR)
+    n_rets: int = 0
+    ret_skew: float = float("nan")
+    ret_kurt: float = float("nan")
 
 
 def _resolve_model_path_for_run(
@@ -409,6 +417,20 @@ def resolve_oos_holdout(
         holdout_end=holdout_end,
     )
     test_idx = holdout[0]
+
+    # Cross-check the realized window against what training recorded (see
+    # rlbot.run_artifacts.check_holdout_window_against_manifest). Explicit CLI window
+    # flags (the documented cross-window check) downgrade the failure to a loud warning.
+    cli_override = any(
+        v is not None
+        for v in (args.train_end, args.holdout_start, args.holdout_end, args.holdout_days)
+    ) or bool((getattr(args, "until", "") or "").strip())
+    warn = check_holdout_window_against_manifest(
+        test_idx[0], test_idx[-1], ch, cli_override=cli_override
+    )
+    if warn:
+        print(f"[backtest] WARNING: {warn} (explicit CLI window flags — proceeding)")
+
     if train_end and holdout_start:
         print(
             f"Strict OOS backtest: {holdout_start} .. {test_idx[-1].date()} "
@@ -438,18 +460,34 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     # regardless of the current global config / cache (override with flags).
     _maybe_load_run_config(run_id, args)
     cache_path = _resolve_run_data_cache(run_id, args)
+    if not (getattr(args, "data_cache", "") or "").strip() and not RunPaths(
+        run_id
+    ).data_snapshot.is_file():
+        print(
+            f"[backtest] WARNING: run-local data snapshot Runs/{run_id}/data_cache.npz is "
+            f"missing; falling back to {cache_path}. If that cache has newer bars and the "
+            "manifest lacks an explicit holdout_end, the OOS window may extend past what "
+            "training reserved — results may not be reproducible."
+        )
     model_path = _resolve_model_path_for_run(
         run_id,
         allow_latest_checkpoint=args.allow_latest_checkpoint,
         model_override=Path(args.model) if args.model.strip() else None,
     )
-    tag = (getattr(args, "plot_tag", None) or "").strip()
-    if tag:
-        ckpt_label = tag
-    elif model_path.name == "best_model.zip":
+    # OOS provenance: the label is derived from the weights actually evaluated, never
+    # from --plot-tag (a tag once mislabeled final-model OOS numbers as "best").
+    if model_path.name == "best_model.zip":
         ckpt_label = "best"
+    elif model_path == RunPaths(run_id).final_model:
+        ckpt_label = "final"
     else:
         ckpt_label = "latest"
+    tag = (getattr(args, "plot_tag", None) or "").strip()
+    if tag and tag != ckpt_label:
+        print(
+            f"[backtest] NOTE: --plot-tag {tag!r} names the plot only; metrics are "
+            f"labeled by the evaluated checkpoint ({ckpt_label!r})."
+        )
     _bt_log(f"[backtest] Checkpoint: {model_path} ({ckpt_label})")
 
     if getattr(args, "reuse_panel", False):
@@ -482,10 +520,12 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             macro_vol,
             asset_live,
             cache_tickers,
-        ) = load_cache(str(cache_path))
-    panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
+        ) = load_cache(str(cache_path), expected_fracdiff_d=get_config().data.fracdiff_d)
     n_assets = int(ohlcv.shape[1])
-    _assert_manifest_panel_compatible(manifest, panel_tickers, n_assets)
+    # Compare the manifest against the RAW cache tickers — resolve_panel_tickers
+    # prefers the manifest's own list, which would make the order check tautological.
+    _assert_manifest_panel_compatible(manifest, cache_tickers, n_assets)
+    panel_tickers = resolve_panel_tickers(manifest, cache_tickers)
     until = args.until
     if until is None and manifest:
         until = manifest.get("args", {}).get("until")
@@ -537,10 +577,54 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     if len(test_idx) < 10:
         raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
 
+    # Global holdout-burn accounting: EVERY backtest read lands in
+    # Runs/oos_ledger.jsonl, recorded before the rollout so a crash still burns
+    # (fail-closed). Keyed on the REGISTERED calendar window from the manifest when
+    # present (the same key research budgets use), else the realized trading days.
+    # Research-driven reads (RLBOT_OOS_CONTEXT=research:*) re-check the cumulative
+    # window budget atomically at read time — a launch-time check alone would leave
+    # an hours-long gap to concurrent burns.
+    _ch = (manifest or {}).get("chronological_holdout") or {}
+    _ledger_window = oos_ledger.window_key_for_read(
+        _ch.get("holdout_start"), _ch.get("holdout_end"), test_idx[0], test_idx[-1]
+    )
+    _oos_context = os.environ.get("RLBOT_OOS_CONTEXT", "manual")
+    _budget_env = os.environ.get("RLBOT_WINDOW_BUDGET", "")
+    _enforce = None
+    if _oos_context.startswith("research:"):
+        _enforce = int(_budget_env) if _budget_env.strip() else oos_ledger.DEFAULT_WINDOW_BUDGET
+    _cache_hash = sha256_file(cache_path)
+    args._data_cache_hash = _cache_hash  # type: ignore[attr-defined]
+    oos_ledger.record_oos_read(
+        run_id=run_id,
+        window=_ledger_window,
+        checkpoint=getattr(args, "checkpoint", "") or "",
+        data_cache_hash=_cache_hash,
+        context=_oos_context,
+        enforce_budget=_enforce,
+    )
+    args._ledger_window = _ledger_window  # type: ignore[attr-defined]
+    _burn = oos_ledger.trials_for_window(_ledger_window)
+    _bt_log(
+        f"[backtest] OOS ledger: window {_ledger_window} has now been read by "
+        f"{_burn} distinct model(s) — selection-aware significance (deflated Sharpe) "
+        "uses this trial count."
+    )
+
     _bt_log(
         f"[backtest] OOS holdout: {test_idx[0].date()} .. {test_idx[-1].date()} "
         f"({len(test_idx)} bars, setup {time.perf_counter() - t_phase:.1f}s)"
     )
+
+    obs_lag = args.obs_lag
+    if obs_lag is None:
+        margs = manifest.get("args") or {}
+        if margs.get("obs_lag") is not None:
+            obs_lag = int(margs["obs_lag"])
+        else:
+            obs_lag = int(get_config().environment.obs_lag_default)
+        _bt_log(f"[backtest] obs_lag={obs_lag} (from manifest/run config)")
+    obs_lag = int(obs_lag)
 
     device = getattr(args, "device", "cpu") or "cpu"
     full_reload = bool(getattr(args, "full_policy_load", False))
@@ -549,12 +633,25 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     explicit_vn = Path(args.vec_normalize).expanduser().resolve() if args.vec_normalize.strip() else None
     vec_norm_path = _find_vec_normalize(model_path, run_id, explicit=explicit_vn)
     use_vec_norm = vec_norm_path.is_file()
-    require_vn = not getattr(args, "allow_missing_vec_normalize", False)
-    if not use_vec_norm and require_vn:
-        raise FileNotFoundError(
-            f"No VecNormalize stats at {vec_norm_path} "
-            "(required for OOS backtest; pass --allow-missing-vec-normalize to debug without obs norm)"
-        )
+    if not use_vec_norm:
+        if not getattr(args, "allow_missing_vec_normalize", False):
+            raise FileNotFoundError(
+                f"No VecNormalize stats at {vec_norm_path} "
+                "(required for OOS backtest; pass --allow-missing-vec-normalize to debug without obs norm)"
+            )
+        if get_config().vec_normalize.norm_obs and not getattr(args, "allow_raw_obs", False):
+            raise FileNotFoundError(
+                f"No VecNormalize stats at {vec_norm_path}, but this run trained with "
+                "vec_normalize.norm_obs: true — rolling out on raw observations would "
+                "produce plausible-looking but meaningless metrics. Restore "
+                "models/vec_normalize.pkl (or pass --vec-normalize PATH); "
+                "--allow-raw-obs overrides this check explicitly."
+            )
+        if getattr(args, "allow_raw_obs", False):
+            print(
+                "[backtest] WARNING: no VecNormalize stats found — rolling out on RAW "
+                "observations (--allow-raw-obs). Metrics are not comparable to training."
+            )
 
     _bt_log("[backtest] Deterministic OOS rollout...")
     t_roll = time.perf_counter()
@@ -571,7 +668,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         test_asset_vol=test_avol,
         test_macro_vol=test_mvol,
         test_asset_live=test_live,
-        obs_lag=args.obs_lag,
+        obs_lag=obs_lag,
         vec_norm_path=vec_norm_path,
         use_vec_norm=use_vec_norm,
         deterministic=True,
@@ -604,7 +701,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             test_asset_vol=test_avol,
             test_macro_vol=test_mvol,
             test_asset_live=test_live,
-            obs_lag=args.obs_lag,
+            obs_lag=obs_lag,
             vec_norm_path=vec_norm_path,
             use_vec_norm=use_vec_norm,
             progress=progress,
@@ -612,12 +709,21 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         _bt_log(f"[backtest] Stochastic paths done ({time.perf_counter() - t_stoch:.1f}s).")
         if nav_ensemble.shape[1] != len(navs):
             m = min(nav_ensemble.shape[1], len(navs))
+            print(
+                f"[backtest] WARNING: stochastic-path length ({nav_ensemble.shape[1]}) != "
+                f"deterministic NAV length ({len(navs)}); truncating BOTH to {m} bars — "
+                "the headline deterministic metrics below cover the truncated window."
+            )
             navs = navs[:m]
             nav_ensemble = nav_ensemble[:, :m]
 
     log_rets = np.diff(np.log(np.maximum(navs, 1e-12)))
     total_return = float(navs[-1] / navs[0] - 1.0)
     sharpe = _sharpe_ann_from_log_rets(log_rets)
+    _sd = float(np.std(log_rets)) + 1e-12
+    _z = (log_rets - float(np.mean(log_rets))) / _sd
+    ret_skew = float(np.mean(_z**3)) if log_rets.size >= 3 else float("nan")
+    ret_kurt = float(np.mean(_z**4)) if log_rets.size >= 4 else float("nan")
 
     if not args.no_viz and not getattr(args, "_ensemble_mode", False):
         _bt_log("[backtest] Building plot...")
@@ -678,7 +784,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             open_plot_file(out)
 
     detailed_stats: dict | None = None
-    if args.detailed and not getattr(args, "_ensemble_mode", False):
+    if args.detailed:
         _bt_log(
             f"[backtest] Detailed stats (bootstrap resamples={args.bootstrap_resamples})..."
         )
@@ -707,8 +813,11 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         max_drawdown=_max_drawdown(navs),
         n_bars=len(test_idx),
         seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
+        n_rets=int(log_rets.size),
+        ret_skew=ret_skew,
+        ret_kurt=ret_kurt,
     )
-    _write_backtest_summary(result, args, detailed_stats, cache_path)
+    _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
     return result
 
 
@@ -717,19 +826,74 @@ def _write_backtest_summary(
     args: argparse.Namespace,
     detailed: dict | None,
     cache_path: Path,
+    manifest: dict | None = None,
 ) -> None:
-    """Write a machine-readable per-run backtest summary (skipped in ensemble mode)."""
-    if getattr(args, "_ensemble_mode", False):
-        return
+    """Write a machine-readable per-run backtest summary."""
     from dataclasses import asdict
 
     cfg = get_config()
+    config_hash = config_sha256(cfg.to_dict())
+    data_cache_hash = getattr(args, "_data_cache_hash", None) or sha256_file(cache_path)
+    # Drift detection: hashes are not just recorded, they are compared to training.
+    hash_drift: dict[str, dict] = {}
+    for key, now in (("config_hash", config_hash), ("data_cache_hash", data_cache_hash)):
+        trained = (manifest or {}).get(key)
+        if trained and trained != now:
+            hash_drift[key] = {"training": trained, "backtest": now}
+            print(
+                f"[backtest] WARNING: {key} differs from the training manifest "
+                f"({trained[:12]}… → {now[:12]}…); this backtest does not bind the "
+                "exact training-time inputs and may not reproduce the run's OOS numbers."
+            )
+    # Selection-aware significance: the deflated Sharpe deflates the observed Sharpe
+    # by the expected max-Sharpe of N zero-skill models, where N = distinct models
+    # that have read this window per the global OOS ledger.
+    # Use the window ACTUALLY read this invocation (recorded in the ledger at
+    # rollout time) — under an explicit CLI cross-window override it differs from
+    # the manifest's recorded window.
+    window = getattr(args, "_ledger_window", None)
+    if window is None:
+        ch = (manifest or {}).get("chronological_holdout") or {}
+        if ch.get("holdout_start") and ch.get("holdout_end"):
+            window = oos_ledger.window_key(ch["holdout_start"], ch["holdout_end"])
+    n_trials = 1
+    if window:
+        # A batch/ensemble is ONE selection event: every seed's DSR must use the same
+        # trial count (prior burns ∪ the whole invocation), not an order-dependent
+        # running count.
+        prior = oos_ledger.distinct_models_for_window(
+            oos_ledger.read_ledger(on_corrupt="raise"), window
+        )
+        invocation = {str(r) for r in getattr(args, "_invocation_run_ids", [])}
+        n_trials = max(1, len(prior | invocation))
+    dsr = None
+    if result.n_rets >= 4 and np.isfinite(result.sharpe):
+        dsr = float(
+            deflated_sharpe_ratio(
+                result.sharpe,
+                n_obs=result.n_rets,
+                n_trials=n_trials,
+                skew=result.ret_skew if np.isfinite(result.ret_skew) else 0.0,
+                kurt=result.ret_kurt if np.isfinite(result.ret_kurt) else 3.0,
+            )
+        )
+        if not np.isfinite(dsr):
+            dsr = None
+        else:
+            print(
+                f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
+                f"window): {dsr:.3f} (>0.95 = significant after selection)"
+            )
     payload = {
         **asdict(result),
         "config_path": str(cfg.path),
-        "config_hash": config_sha256(cfg.to_dict()),
+        "config_hash": config_hash,
         "data_cache_path": str(cache_path),
-        "data_cache_hash": sha256_file(cache_path),
+        "data_cache_hash": data_cache_hash,
+        "hash_drift": hash_drift or None,
+        "oos_window": window,
+        "oos_trials_for_window": n_trials,
+        "deflated_sharpe": dsr,
         "feature_split_mode": cfg.data.feature_split_mode,
         **git_provenance(),
         "detailed": detailed,
@@ -737,6 +901,10 @@ def _write_backtest_summary(
     override = (getattr(args, "summary_json", "") or "").strip()
     if override:
         out = Path(override)
+        if getattr(args, "_multi_run_summary", False):
+            # Batch/ensemble: one fixed path would be silently clobbered per run.
+            out = out.with_name(f"{out.stem}_{result.run_id}{out.suffix or '.json'}")
+            print(f"[backtest] NOTE: --summary-json with multiple runs → per-run file {out.name}")
     else:
         label = result.checkpoint_label
         name = "backtest_summary.json" if label == "best" else f"backtest_summary_{label}.json"
@@ -794,9 +962,18 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     if ck in ("best", "both"):
         modes.append(("best", False))
     if ck in ("latest", "both"):
-        modes.append(("latest", True))
+        # Ensemble 'latest' resolves ppo_portfolio_final.zip (run-level final weights),
+        # not the newest step checkpoint like single-run --checkpoint latest — label
+        # the rows by what is actually evaluated.
+        print("[backtest] NOTE: ensemble 'latest' evaluates each run's FINAL model "
+              "(end-of-run weights); rows are labeled 'final'.")
+        modes.append(("final", True))
 
     args._ensemble_mode = True  # type: ignore[attr-defined]
+    args._multi_run_summary = True  # type: ignore[attr-defined]
+    args._invocation_run_ids = list(run_ids)  # type: ignore[attr-defined]
+    if not args.no_viz:
+        _bt_log("[backtest] Ensemble mode: per-run plots are skipped (μ±σ table + ensemble_summary.json).")
     args.no_viz = True
 
     summary_root: dict[str, object] = {"prefix": prefix, "checkpoints": {}}
@@ -913,11 +1090,16 @@ def rollout_policy_on_slice(
     reset_seed: int = 0,
     progress: bool = False,
     progress_label: str = "rollout",
+    obs_sink: list | None = None,
 ) -> tuple[np.ndarray, int, int, np.ndarray | None]:
     """
     One full episode on a contiguous date slice. Returns
     (navs, start_bar, n_rewards, weights|None) where n_rewards == len(navs) - 1.
     Causal: no look-ahead beyond training-time observation pipeline.
+
+    ``obs_sink``: when given, receives the FINAL (normalized, if VecNormalize is
+    active) observation — normalized features are z-scores vs frozen training
+    stats, so callers can run drift alarms without reloading the pkl.
     """
     n_bars = len(test_idx)
     if n_bars < 10:
@@ -990,6 +1172,8 @@ def rollout_policy_on_slice(
                     w_rows.append(np.asarray(tw, dtype=np.float64).reshape(-1))
             if use_vec_norm and vec_env is not None:
                 obs = vec_env.normalize_obs(obs)
+            if obs_sink is not None:
+                obs_sink[:] = [np.asarray(obs, dtype=np.float64).reshape(-1)]
             if "nav" in info:
                 navs.append(info["nav"])
             step_i += 1
@@ -1409,7 +1593,11 @@ def main() -> None:
         metavar="YYYY-MM-DD",
         help="Last OOS day (must match training). Default: manifest or last bar.",
     )
-    parser.add_argument("--obs-lag", type=int, default=1, help="Market features lag (must match training)")
+    parser.add_argument(
+        "--obs-lag", type=int, default=None,
+        help="Market features lag (must match training). Default: manifest args.obs_lag, "
+        "else the run config's environment.obs_lag_default.",
+    )
     parser.add_argument(
         "--vec-normalize",
         type=str,
@@ -1421,6 +1609,12 @@ def main() -> None:
         "--allow-missing-vec-normalize",
         action="store_true",
         help="Allow backtest without VecNormalize stats (debug only; training uses obs norm by default)",
+    )
+    parser.add_argument(
+        "--allow-raw-obs",
+        action="store_true",
+        help="Permit a rollout without VecNormalize stats even though the run trained "
+        "with norm_obs: true (refused by default — raw-obs metrics are meaningless).",
     )
     parser.add_argument("--no-viz", action="store_true", help="Skip saving backtest plot PNG")
     parser.add_argument(
@@ -1497,6 +1691,8 @@ def main() -> None:
         run_ids = _parse_run_id_list(args.run_ids)
         if not run_ids:
             raise SystemExit("--run-ids is empty")
+        args._multi_run_summary = len(run_ids) > 1  # type: ignore[attr-defined]
+        args._invocation_run_ids = list(run_ids)  # type: ignore[attr-defined]
         full_batch = args.detailed or int(args.stochastic_paths) > 0
         if not full_batch:
             args.no_viz = True
