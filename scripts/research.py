@@ -299,7 +299,17 @@ def _assert_clean_tree_for_oos(allow_dirty: bool) -> None:
     """OOS reads must be attributable to a commit: a dirty tree means the registry's
     git_commit field lies about what produced the number."""
     prov = git_provenance()
-    if prov.get("git_dirty") and not allow_dirty:
+    dirty = prov.get("git_dirty")
+    if dirty is None and not allow_dirty:
+        # Unknown git state (no git binary / not a repo / timeout) fails CLOSED:
+        # the gate exists for attribution, and that is exactly when attribution
+        # is least certain.
+        raise SystemExit(
+            "Cannot determine git state (git absent or not a repo) — an OOS read "
+            "would be unattributable. Run from a git checkout, or pass --allow-dirty "
+            "to record it with git_dirty=null."
+        )
+    if dirty and not allow_dirty:
         raise SystemExit(
             "Working tree is dirty — an OOS read would be recorded against a commit "
             "that does not match the code that produced it. Commit (or stash) first, "
@@ -637,8 +647,13 @@ def cmd_validate(args: argparse.Namespace) -> None:
     windows, success-gate keys, variant-id collisions. The fast feedback loop for
     an agent proposing specs. ``--agent`` additionally requires the fields an
     autonomous proposer must fill: hypothesis, parent, success_gates."""
-    spec = load_spec(args.spec)  # schema + firewall + windows + gate keys
-    variants = resolve_variants(spec)  # id collisions
+    try:
+        spec = load_spec(args.spec)  # schema + firewall + windows + gate keys
+        variants = resolve_variants(spec)  # id collisions
+    except (PermissionError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+        # One failure surface: an agent parses INVALID lines, never tracebacks.
+        print(f"[research] INVALID: {exc}", file=sys.stderr)
+        raise SystemExit("1 problem(s); spec not valid.")
     problems: list[str] = []
     if getattr(args, "agent", False):
         if not spec.hypothesis.strip():
@@ -651,10 +666,10 @@ def cmd_validate(args: argparse.Namespace) -> None:
             problems.append(
                 "agent specs must pre-register success_gates (when does this win?)"
             )
-        if gates.tier_touches_oos(spec.evaluation_tier):
+        if gates.tier_needs_promotion(spec.evaluation_tier):
             problems.append(
-                f"agent specs may not declare tier {spec.evaluation_tier} (touches the "
-                "OOS holdout; promotion is a human action)"
+                f"agent specs may not declare tier {spec.evaluation_tier} "
+                f"({gates.tier_label(spec.evaluation_tier)}): promotion is a human action"
             )
     if problems:
         for msg in problems:

@@ -104,6 +104,21 @@ def test_realized_portfolio_return_open_to_open() -> None:
     assert got == pytest.approx(0.025)
 
 
+def test_linear_costs_turnover_plus_holding() -> None:
+    from scripts.shadow_trade import linear_costs
+
+    tickers = ["A", "B"]
+    slip = np.array([0.001, 0.002])
+    fee = np.array([0.0005, 0.0005])
+    hold = np.array([0.0001, 0.0002])
+    # first day: full entry turnover
+    c0 = linear_costs({"A": 0.6, "B": 0.4}, None, tickers, slip, fee, hold)
+    assert c0 == pytest.approx(0.6 * 0.0015 + 0.4 * 0.0025 + 0.6 * 0.0001 + 0.4 * 0.0002)
+    # unchanged book: holding cost only
+    c1 = linear_costs({"A": 0.6, "B": 0.4}, {"A": 0.6, "B": 0.4}, tickers, slip, fee, hold)
+    assert c1 == pytest.approx(0.6 * 0.0001 + 0.4 * 0.0002)
+
+
 def test_shadow_reconcile_fills_realized_and_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     import pandas as pd
 
@@ -132,24 +147,34 @@ def test_shadow_reconcile_fills_realized_and_is_idempotent(tmp_path: Path, monke
     monkeypatch.setattr(shadow, "EXECUTION_DIR", tmp_path / "execution")
     monkeypatch.setattr(shadow, "read_run_manifest", lambda rid: {"universe": {"tickers": tickers}})
     monkeypatch.setattr(shadow, "_bind_run_config", lambda rid, cur: None)
-    monkeypatch.setattr(shadow, "resolve_run_data_cache", lambda rid, dc, default=None: cache)
 
-    as_of = str(idx[1].date())
+    decision_bar = str(idx[1].date())
     shadow._append_jsonl(
         shadow.ledger_path("r1"),
-        {"run_id": "r1", "as_of": as_of,
+        {"run_id": "r1", "as_of": str(idx[3].date()), "decision_bar": decision_bar,
+         "checkpoint": "best",
          "target_weights": {"CASH": 0.5, tickers[0]: 0.5}, "obs_drift": None},
     )
-    args = argparse.Namespace(run_id="r1", data_cache="", use_current_config=True)
+    args = argparse.Namespace(run_id="r1", data_cache=str(cache), use_current_config=False)
     shadow.cmd_reconcile(args)
     rows = shadow._read_jsonl(shadow.reconciled_path("r1"))
     assert len(rows) == 1
     realized = rows[0]["realized"]
-    assert realized["model_open_to_open_return"] == pytest.approx(0.5 * 0.05)
+    # gross: half the book in asset 0, which moved +5% open[t+1]→open[t+2]
+    assert realized["model_return_gross"] == pytest.approx(0.5 * 0.05)
     assert realized["fill_bar"] == str(idx[2].date())
-    # benchmark holds the cap-weighted book; asset 0 (SP500, weight .55) moved +5%
-    assert realized["benchmark_open_to_open_return"] == pytest.approx(0.55 * 0.05, rel=1e-6)
-    assert realized["excess_return"] == pytest.approx(0.025 - 0.0275, rel=1e-6)
+    # costs: first record → full entry turnover on 0.5 of asset 0, + daily holding
+    cfg2 = get_config()
+    slip = cfg2.transaction_costs.slippage_array()[0]
+    fee = cfg2.transaction_costs.tx_fee_array()[0]
+    hold = cfg2.transaction_costs.daily_holding_cost_array()
+    exp_cost = 0.5 * (slip + fee) + 0.5 * hold[0]
+    assert realized["model_linear_costs"] == pytest.approx(exp_cost)
+    assert realized["model_return_net"] == pytest.approx(0.5 * 0.05 - exp_cost)
+    # benchmark (buy & hold): asset 0 (cap weight .55) moved +5%, pays holding only
+    bench_w = cfg2.reward.benchmark_cap_weights_array()
+    exp_bench = 0.55 * 0.05 - float(np.dot(bench_w, hold))
+    assert realized["benchmark_return_net"] == pytest.approx(exp_bench, rel=1e-6)
     # idempotent: second reconcile adds nothing
     shadow.cmd_reconcile(args)
     assert len(shadow._read_jsonl(shadow.reconciled_path("r1"))) == 1

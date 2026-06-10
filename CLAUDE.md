@@ -48,7 +48,7 @@ python scripts/research.py report --all                         # cross-cohort m
 python scripts/research.py validate specs/x.yaml --agent        # no-side-effect spec check (agent loop)
 
 # Tier-5 shadow trading (forward OOS that burns no holdout; ledger under gitignored execution/)
-python scripts/shadow_trade.py record    --run-id <RUN_ID>
+python scripts/shadow_trade.py record    --run-id <RUN_ID> --refresh-data
 python scripts/shadow_trade.py reconcile --run-id <RUN_ID>
 
 # Audited target weights for a run (provenance-rich; measurement only, no broker)

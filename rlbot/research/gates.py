@@ -17,7 +17,9 @@ TIERS: dict[int, tuple[str, bool, bool]] = {
     2: ("short dev train, in-training eval only", False, False),
     3: ("multi-seed / multi-window, no final OOS", False, False),
     4: ("pre-registered full train, OOS read once", True, True),
-    5: ("paper / shadow trading", True, True),
+    # Tier 5 reads NO holdout (forward shadow data only) but starting it is still
+    # a human promotion decision.
+    5: ("paper / shadow trading (forward data; no holdout read)", False, True),
 }
 
 

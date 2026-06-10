@@ -92,6 +92,11 @@ def main() -> None:
     parser.add_argument("--data-cache", default="", metavar="PATH")
     parser.add_argument("--use-current-config", action="store_true")
     parser.add_argument("--out", default="", metavar="PATH", help="Output JSON path.")
+    parser.add_argument(
+        "--emit-observation", action="store_true",
+        help="Include the final VecNormalize-normalized observation in the payload "
+        "(z-scores vs frozen training stats; consumed by shadow_trade's drift alarm).",
+    )
     args = parser.parse_args()
 
     run_id = args.run_id.strip()
@@ -169,7 +174,7 @@ def main() -> None:
     print(f"[infer] warming recurrent state over {warm} bars ending {as_of} ...")
     t0 = time.perf_counter()
     final_obs: list = []
-    _, _, _, weights = rollout_policy_on_slice(
+    _, roll_start_bar, n_steps, weights = rollout_policy_on_slice(
         model,
         test_idx=idx[sl],
         test_ohlcv=ohlcv[sl],
@@ -191,6 +196,12 @@ def main() -> None:
     )
     if weights is None or len(weights) == 0:
         raise RuntimeError("rollout produced no weights")
+    # The bar whose observation produced weights[-1]. The env needs t+1 (fill) and
+    # t+1 close (MTM), so the last executed decision sits ~2 bars before the slice
+    # end — the consumer must reconcile from THIS bar, not from as_of, and should
+    # know the recorded book lags the newest data accordingly.
+    decision_idx = int(roll_start_bar + n_steps - 1)
+    decision_bar = str(idx[sl][decision_idx].date())
     print(f"[infer] rollout done ({time.perf_counter() - t0:.1f}s)")
     target = np.asarray(weights[-1], dtype=np.float64)
 
@@ -231,9 +242,18 @@ def main() -> None:
     out = Path(args.out) if args.out.strip() else (
         RunPaths(run_id).run_meta_dir / f"target_weights_{as_of}.json"
     )
+    payload["decision_bar"] = decision_bar
+    if decision_bar != last_bar:
+        print(
+            f"[infer] NOTE: weights[-1] were decided from bar {decision_bar} "
+            f"(the rollout env needs two later bars to execute/mark a step); the "
+            f"newest cache bar is {last_bar}."
+        )
     # Final normalized observation (z-scores vs frozen training stats): the
     # tier-5 shadow loop runs its observation-drift alarm off this, torch-free.
-    payload["observation_normalized"] = obs_norm
+    # Opt-in: it adds an opaque obs_dim-float vector to the audited artifact.
+    if args.emit_observation:
+        payload["observation_normalized"] = obs_norm
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(json.dumps(payload, indent=2, default=str))
