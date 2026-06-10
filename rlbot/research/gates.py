@@ -40,9 +40,13 @@ def assert_tier_allowed(tier: int, *, promoted: bool) -> None:
     if int(tier) not in TIERS:
         raise ValueError(f"unknown evaluation tier {tier!r} (valid: {sorted(TIERS)})")
     if tier_needs_promotion(tier) and not promoted:
+        reason = (
+            "touches the OOS holdout" if tier_touches_oos(tier)
+            else "starts forward shadow evaluation"
+        )
         raise PermissionError(
-            f"tier {tier} ({tier_label(tier)}) touches the OOS holdout and requires "
-            f"explicit promotion (--promote); refusing to run automatically."
+            f"tier {tier} ({tier_label(tier)}) {reason} and requires explicit "
+            f"promotion (--promote); refusing to run automatically."
         )
 
 

@@ -1,5 +1,7 @@
 # Fix-sprint implementation log — 2026-06-09
 
+> **Status (2026-06-09, post feat/continuous-research-hardening):** Historical snapshot. Written against an earlier tree; numbers and open findings herein were superseded by the hardening branch (see git log: C1/H1/H2 fixed, OOS burn ledger + deflated Sharpe + success gates + modal backend + shadow trading added; suite 226 passed / 3 skipped). Kept for provenance.
+
 Implements §5 of `docs/claude-review-20260609.md` (all four sprints). Test suite: 94 → **150 passed / 3 skipped** (torch/SB3-gated; they run in the new manual CI torch job). Torch-free suite still ~2 s.
 
 ## Sprint 1 — research firewall (P0 + P1)

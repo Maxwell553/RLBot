@@ -127,11 +127,12 @@ def cmd_record(args: argparse.Namespace) -> None:
     manifest = read_run_manifest(run_id)
     if manifest is None:
         raise SystemExit(f"Missing Runs/{run_id}/manifest.json")
-    # Config context for the refresh (universe/since); inference itself binds the
-    # run snapshot inside the infer_weights subprocess.
-    _bind_run_config(run_id, args.use_current_config)
-
     if args.refresh_data:
+        # The GLOBAL cache is shared infrastructure: refresh it under the CURRENT
+        # config (universe/since), never a run snapshot — a sliced-universe run must
+        # not reshape the cache other consumers read. Inference itself binds the run
+        # snapshot inside the infer_weights subprocess; panel compatibility is
+        # asserted there against the run manifest.
         cache_path = _refresh_global_cache()
     else:
         # The run-local snapshot is frozen at training time — recording from it

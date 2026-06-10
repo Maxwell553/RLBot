@@ -359,3 +359,30 @@ def test_screen_uses_isolated_run_ids() -> None:
         "would overwrite full-budget artifacts and let collect stamp screen runs at "
         "the full tier"
     )
+
+
+def test_run_queue_refuses_tier5_specs(harness) -> None:
+    """Tier 5 no longer 'touches OOS' taxonomically, but starting shadow evaluation
+    is still a human promotion decision — the queue must refuse it too."""
+    mod, tmp, state = harness
+    qdir = tmp / "queue"
+    qdir.mkdir()
+    spec_path = _write_spec(tmp, spec_id="exp_q5", tier=5, seeds=[0])
+    shutil.copy2(spec_path, qdir / "exp_q5.yaml")
+    mod.cmd_run_queue(argparse.Namespace(queue_dir=str(qdir), backend="local",
+                                         modal_gpu=None, window_budget=None))
+    assert (qdir / "failed" / "exp_q5.yaml").exists()
+    assert state["calls"] == []
+
+
+def test_promote_always_records_at_tier_4(harness) -> None:
+    """Registry tier>=4 rows mean exactly 'holdout reads': a tier-5 spec's promote
+    must record at tier 4, never 5 (shadow evidence lives in execution/, not here)."""
+    mod, tmp, state = harness
+    spec_path = _write_spec(tmp, spec_id="exp_p5", tier=5, seeds=[0])
+    variant = "exp_p5__seed0__W4"
+    _fabricate_manifest(tmp, variant)
+    mod._materialize(mod.load_spec(spec_path))
+    mod.cmd_promote(_promote_args(spec_path, variant))
+    records = registry.read_records(tmp / "Runs" / "exp_p5" / "registry.jsonl")
+    assert [int(r["evaluation_tier"]) for r in records] == [4, 4]

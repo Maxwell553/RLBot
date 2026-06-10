@@ -1,5 +1,7 @@
 # RLBot Comprehensive Review — 2026-06-09
 
+> **Status (2026-06-09, post feat/continuous-research-hardening):** Historical snapshot. Written against an earlier tree; numbers and open findings herein were superseded by the hardening branch (see git log: C1/H1/H2 fixed, OOS burn ledger + deflated Sharpe + success gates + modal backend + shadow trading added; suite 226 passed / 3 skipped). Kept for provenance.
+
 **Branch:** `feat/evolution-roadmap` (HEAD `ca3c4a5`) · **Test suite:** 92 passed / 1 skipped (torch-free, 1.6 s)
 **Scope:** full repo — core methodology (`rlbot/trading_env.py`, `rlbot/data_utils.py`, `rlbot/rl_config.py`), harness (`scripts/train.py`, `scripts/backtest.py`, artifacts/inference), auto-research loop (`rlbot/research/`, `scripts/research.py`), Modal cloud, tests, and docs. Follows up the 2026-06-05 review cycle (`docs/claude-review-20260605.md`, codex/grok reviews, May-31 design/critical reviews) and audits what `feat/evolution-roadmap` actually delivered.
 

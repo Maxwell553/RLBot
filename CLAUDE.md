@@ -42,7 +42,7 @@ python scripts/research.py plan   specs/feature_split_ab.yaml   # materialize va
 python scripts/research.py launch specs/feature_split_ab.yaml   # tiers 1–3; tier ≥4 needs --promote
 python scripts/research.py launch specs/x.yaml --backend modal --modal-gpu H100  # cloud variants
 python scripts/research.py screen specs/x.yaml --keep-top 0.25  # tier-1 grid screen (halving)
-python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (no tier ≥4)
+python scripts/research.py run-queue                            # drain Runs/queue/*.yaml (refuses tiers 4/5)
 python scripts/research.py report feature_split_ab
 python scripts/research.py report --all                         # cross-cohort memory + knob sensitivity
 python scripts/research.py validate specs/x.yaml --agent        # no-side-effect spec check (agent loop)

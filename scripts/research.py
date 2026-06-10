@@ -1,9 +1,12 @@
-"""Auto-research orchestrator: plan → launch → collect → report → promote.
+"""Auto-research orchestrator: validate → plan → launch/screen/run-queue → collect →
+report (--all) → promote.
 
 Shells out to the canonical ``scripts/train.py`` / ``scripts/backtest.py`` CLIs (no
 training-stack rewrite) and records every run in ``Runs/<cohort>/registry.jsonl``.
-Enforces the OOS firewall: tiers 1–3 train + in-training eval only; tier ≥ 4 reads the
-holdout once per variant and requires ``--promote``.
+Enforces the OOS firewall: tiers 1–3 train + in-training eval only; tier 4 reads the
+holdout once per variant, requires ``--promote``, and is budgeted per window via the
+global burn ledger (``Runs/oos_ledger.jsonl``); tier 5 (shadow trading) reads no
+holdout but also requires promotion — see ``scripts/shadow_trade.py``.
 
 Usage:
     python scripts/research.py plan    specs/feature_split_ab.yaml
@@ -559,7 +562,10 @@ def cmd_promote(args: argparse.Namespace) -> None:
     if entry is None:
         raise SystemExit(f"variant {args.variant!r} not in cohort {spec.id!r}")
     reg = _registry_path(spec.id)
-    promote_tier = max(4, int(cm.get("evaluation_tier", 1)))
+    # Promote means exactly one thing: read the holdout once. Always tier 4 — a
+    # tier-5 spec's forward evidence lives in execution/ shadow ledgers, never in
+    # the registry, so registry tier>=4 records stay synonymous with holdout reads.
+    promote_tier = 4
 
     # Pre-registered promotion rule: when the spec declares success_gates, the
     # variant's seed-group must PASS them on in-training evidence before its one
@@ -686,8 +692,8 @@ def cmd_validate(args: argparse.Namespace) -> None:
 def cmd_run_queue(args: argparse.Namespace) -> None:
     """Process queued specs (Runs/queue/*.yaml) sequentially: launch → report, then
     move each spec to done/ or failed/. The queue is the substrate an autonomous
-    proposer schedules onto; tier ≥ 4 specs are REFUSED here — promotion stays a
-    human action (run `promote` directly).
+    proposer schedules onto; promotion-requiring tiers (4: holdout read, 5: shadow
+    start) are REFUSED here — both stay human actions.
 
     Single-drainer by design: run ONE run-queue process at a time (no claim locks;
     two drains would double-launch). A spec moved to failed/ may have partially
@@ -704,10 +710,11 @@ def cmd_run_queue(args: argparse.Namespace) -> None:
         print(f"\n[research] ===== queue: {spec_path.name} =====")
         try:
             spec = load_spec(spec_path)
-            if gates.tier_touches_oos(spec.evaluation_tier):
+            if gates.tier_needs_promotion(spec.evaluation_tier):
                 raise PermissionError(
-                    f"tier {spec.evaluation_tier} touches the OOS holdout; the queue "
-                    "never promotes. Run `research.py promote` by hand."
+                    f"tier {spec.evaluation_tier} ({gates.tier_label(spec.evaluation_tier)}) "
+                    "requires human promotion; the queue never promotes. Run "
+                    "`research.py promote` (tier 4) or `shadow_trade.py` (tier 5) by hand."
                 )
             sub = argparse.Namespace(
                 spec=str(spec_path), promote=False, dry_run=False,

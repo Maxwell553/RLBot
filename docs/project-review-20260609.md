@@ -1,5 +1,7 @@
 # RLBot Comprehensive Project Review — 2026-06-09
 
+> **Status (2026-06-09, post feat/continuous-research-hardening):** Historical snapshot. Written against an earlier tree; numbers and open findings herein were superseded by the hardening branch (see git log: C1/H1/H2 fixed, OOS burn ledger + deflated Sharpe + success gates + modal backend + shadow trading added; suite 226 passed / 3 skipped). Kept for provenance.
+
 **Branch/commit reviewed:** `main` @ `9687454` ("rebalance rewards+add benchmarks")
 **Method:** six parallel deep-read reviews (data pipeline, environment/reward, training/config, backtest/inference, auto-research loop, tests/docs), each tracing code line-by-line; findings marked **VERIFIED** were confirmed by tracing or execution, others marked *suspected*. Test suite executed on this machine (torch-free): **108 passed, 1 skipped, 1 failed** (the failure is `test_finetune_and_resume_mutually_exclusive`, which requires torch before reaching the behavior it tests — a test bug, not a code bug).
 
