@@ -69,14 +69,14 @@ The README and architecture diagram reference:
 
 ### 2.2 The Validation NAV Cliff — Partially Addressed, Still Dangerous
 All three walk-forward windows exhibit the same pattern (documented in RESEARCH.md):
-- Training reward and training episode NAV rise through 65M steps.
+- Training reward and training episode NAV rise through 50M steps.
 - Validation ending NAV peaks early (≈9–13M steps for W1/W3, later for W2) then stagnates or declines.
-- The **final 65M checkpoint is frequently materially worse OOS** than the early "best" checkpoint.
+- The **final 50M checkpoint is frequently materially worse OOS** than the early "best" checkpoint.
 
 The mitigation (EvalNavBestModelCallback + manual comparison of best vs final) is better than nothing, but:
 - No automated early stopping on validation NAV.
 - No analysis of *why* the LSTM hidden state overfits the alternating blocks (possible temporal correlation across segment boundaries despite purge).
-- Continuing to 65M after the peak wastes compute and risks publishing the worse checkpoint if someone forgets the manual step.
+- Continuing to 50M after the peak wastes compute and risks publishing the worse checkpoint if someone forgets the manual step.
 
 This is the single most important empirical red flag in the current system.
 
@@ -132,7 +132,7 @@ The 50% cap with 10 assets mathematically allows up to 5× cap in risky exposure
 6. Add automated leakage regression tests (e.g., assert that feature values immediately after a block boundary match what a fresh per-segment computation would produce).
 7. Persist the HY OAS calibration coefficients (and any other derived parameters) inside the data cache or manifest.
 8. Improve the RESEARCH.md training-dynamics analysis: quantify the correlation between validation NAV peak timing and curriculum phase transitions.
-9. Add a `uv.lock` or `poetry.lock` (or at least a reproducible Docker image) so that 65M-step runs are bit-reproducible across machines.
+9. Add a `uv.lock` or `poetry.lock` (or at least a reproducible Docker image) so that 50M-step runs are bit-reproducible across machines.
 
 ### Longer-Term / Strategic
 10. Treat the current 10-asset system as a **methodology testbed**. Extract the valuable pieces (anti-leakage split, curriculum, best-by-wealth callback, cost-aware reward, deterministic training harness) into a small reusable library.

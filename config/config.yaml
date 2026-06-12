@@ -25,7 +25,7 @@ environment:
   obs_lag_default: 1
   min_obs_lag: 0
   max_obs_lag: 2
-  max_single_asset_weight: 0.25
+  max_single_asset_weight: 0.20
   fee_scale_default: 1.0
   stop_loss_fraction: 0.45
   domain_randomize_fee_dr_min: 0.75
@@ -46,8 +46,8 @@ reward:
   sortino_downside_floor: 0.001
   # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_combined_abs_cap).
   risk_bonus_scale: 2.5
-  # Cap-weighted passive benchmark for Sortino differential + per-step excess return
-  benchmark_cap_weights: [0.55, 0.04, 0.03, 0.02, 0.02, 0.08, 0.06, 0.10, 0.02, 0.08]
+  # Equal-weight passive benchmark (1/N per asset; feasible under max_single_asset_weight 0.20)
+  benchmark_cap_weights: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
   # clip(agent_log_ret - bench_log_ret) * scale; uses same friction model as Sortino benchmark
   benchmark_excess_scale: 600.0
   benchmark_excess_clip: 0.04
@@ -58,13 +58,28 @@ reward:
   # the Sortino diff (≤ ±7.5) and the excess clip saturate together (raw max 31.5).
   benchmark_combined_abs_cap: 24.0
   # tx_cost_frac * churn_penalty * reward_scale * VIX_scale * curriculum_churn_scale
-  churn_penalty: 1.0  # multiplier on realized tx cost (slippage + fees) in reward units
-  drawdown_downside_gamma: 5.0  # amplifies negative step returns when already in drawdown
-  inactivity_penalty_over_50: 1.35  # linear: cash_frac * this (no 50% step cliff)
-  inactivity_penalty_over_90: 0.9  # extra linear ramp from 90% → 100% cash
+  churn_penalty: 4.0  # multiplier on realized tx cost (slippage + fees) in reward units
+  # turnover_frac * turnover_penalty * reward_scale * VIX_scale * curriculum_churn_scale
+  turnover_penalty: 0.007
+  drawdown_downside_gamma: 12.0  # amplifies negative step returns when already in drawdown
+  # Direct drawdown shaping (applied every step; logged as rew_decomp/drawdown_penalty):
+  drawdown_increase_penalty: 0.75  # × reward_scale on fresh dd expansion
+  drawdown_level_penalty: 3.0  # per step while dd_next > drawdown_level_floor
+  drawdown_level_floor: 0.08  # no level penalty until 8% off episode peak
+  # Portfolio diversification: penalty * max(target_eff_n - eff_n, 0)
+  concentration_penalty: 0.75
+  concentration_target_eff_assets: 6.0
+  # Daily cash accrual on idle cash before MTM (0 disables; e.g. 0.00025 ≈ 6.3% ann. at 252 days)
+  cash_daily_yield: 0.0
+  inactivity_penalty_over_50: 0.35  # linear: cash_frac * this (no 50% step cliff)
+  inactivity_penalty_over_90: 0.15  # extra linear ramp from 90% → 100% cash
   eval_inactivity_penalty_scale: 1.0
-  participation_bonus: 0.05
-  participation_reward_scale: 20.0
+  participation_bonus: 0.02
+  participation_reward_scale: 10.0
+  # Cut gross exposure when realized vol (or VIX+) is elevated: gross * vol_or_vix * scale
+  exposure_risk_mode: realized_vol  # realized_vol | vix_positive
+  # realized_vol: 40 is reasonable. vix_positive needs ~1–3 (NOT 40: VIX 36 + full gross ≈ 36 units)
+  exposure_risk_penalty_scale: 80.0
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
@@ -96,7 +111,7 @@ policy:
   net_arch_vf: [128, 128]
 
 training:
-  timesteps: 65000000
+  timesteps: 50000000
   n_envs: 16
   obs_noise: 0.02
   seed: 0
@@ -108,7 +123,13 @@ training:
   curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
   checkpoint_save_freq_steps: 1000000
   reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
-  early_stop_patience: 0     # >0 → stop after K evals with no new best (after curriculum)
+  early_stop_patience: 8     # >0 → stop after K evals with no new best (after curriculum)
+  # Benchmark-relative eval selection (equal-weight daily passive book by default):
+  # score = (1-blend)*mean(excess) + blend*stitched_excess - std_coef*std(excess) - dd_coef*p75(max_dd)
+  best_model_score_std_coef: 0.75
+  best_model_score_dd_coef: 2.0
+  best_model_score_stitched_blend: 0.5  # 0 = segment mean only; 1 = stitched excess only
+  best_model_benchmark: equal_weight_daily  # balanced_6040 | equal_weight_daily
 
 vec_normalize:
   norm_obs: true
@@ -122,17 +143,17 @@ entropy_schedule:
   early_floor: 0.01
   early_floor_high: 0.02
   warmup_improvements: 5  # logged only (eval NAV); does not gate decay
-  decay_start_fraction: 0.45  # cosine decay starts after fee_ramp_fraction (0.45)
+  decay_start_fraction: 0.585  # cosine decay starts after fee_ramp_fraction (0.585)
   dr_lock_fraction: 0.10
-  early_floor_fraction: 0.45  # exploration floors through fee ramp (same milestone as decay start)
+  early_floor_fraction: 0.585  # exploration floors through fee ramp (same milestone as decay start)
 
-# Smoothed curriculum track: spread fee / churn / DR shifts across the 65M run (avoids mid-run cliffs).
+# Smoothed curriculum track: spread fee / churn / DR shifts across the 50M run (avoids mid-run cliffs).
 curriculum:
-  budget_short: 65000000
+  budget_short: 50000000
   budget_long: 120000000
-  # ≤ budget_short: fraction-of-run schedule
-  fee_free_fraction: 0.10
-  fee_ramp_fraction: 0.45
+  # ≤ budget_short: fraction-of-run schedule (0.13/0.585 keep fee_free/fee_ramp at ~6.5M/29.25M)
+  fee_free_fraction: 0.13   # ~6.5M
+  fee_ramp_fraction: 0.585  # ~29.25M
   churn_ramp_floor: 0.10  # churn scale at fee-ramp start; ramps to 1.0 by fee_ramp_end
   dr_widen_span_fraction: 0.65
   # Long-run anchors (≥ budget_long)

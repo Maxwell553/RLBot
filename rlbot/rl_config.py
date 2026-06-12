@@ -82,12 +82,21 @@ class RewardConfig:
     benchmark_excess_clip: float
     benchmark_combined_abs_cap: float
     churn_penalty: float
+    turnover_penalty: float
     drawdown_downside_gamma: float
+    drawdown_increase_penalty: float
+    drawdown_level_penalty: float
+    drawdown_level_floor: float
+    concentration_penalty: float
+    concentration_target_eff_assets: float
+    cash_daily_yield: float
     inactivity_penalty_over_50: float
     inactivity_penalty_over_90: float
     eval_inactivity_penalty_scale: float
     participation_bonus: float
     participation_reward_scale: float
+    exposure_risk_mode: str
+    exposure_risk_penalty_scale: float
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -160,6 +169,10 @@ class TrainingConfig:
     # the diversity behavior; True makes same-seed runs reproducible.
     reproducible: bool = False
     early_stop_patience: int = 0  # >0 enables patience early-stop after curriculum completes
+    best_model_score_std_coef: float = 0.75
+    best_model_score_dd_coef: float = 2.0
+    best_model_score_stitched_blend: float = 0.5
+    best_model_benchmark: str = "equal_weight_daily"
 
 
 @dataclass(frozen=True)
@@ -345,6 +358,48 @@ def _validate_reward_config(rew: RewardConfig) -> None:
             f"reward.benchmark_combined_abs_cap must be a finite value >= 0 "
             f"(0 disables the Sortino + benchmark-excess terms), got {cap}"
         )
+    if rew.drawdown_increase_penalty < 0.0:
+        raise ValueError(
+            f"reward.drawdown_increase_penalty must be >= 0, got {rew.drawdown_increase_penalty}"
+        )
+    if rew.drawdown_level_penalty < 0.0:
+        raise ValueError(
+            f"reward.drawdown_level_penalty must be >= 0, got {rew.drawdown_level_penalty}"
+        )
+    floor = float(rew.drawdown_level_floor)
+    if not (0.0 <= floor < 1.0):
+        raise ValueError(
+            f"reward.drawdown_level_floor must be in [0, 1), got {floor}"
+        )
+    if rew.concentration_penalty < 0.0:
+        raise ValueError(
+            f"reward.concentration_penalty must be >= 0, got {rew.concentration_penalty}"
+        )
+    if rew.concentration_target_eff_assets < 0.0:
+        raise ValueError(
+            "reward.concentration_target_eff_assets must be >= 0, "
+            f"got {rew.concentration_target_eff_assets}"
+        )
+    if rew.cash_daily_yield < 0.0:
+        raise ValueError(
+            f"reward.cash_daily_yield must be >= 0, got {rew.cash_daily_yield}"
+        )
+    from rlbot.eval_selection import EXPOSURE_RISK_MODES
+
+    if rew.exposure_risk_mode not in EXPOSURE_RISK_MODES:
+        raise ValueError(
+            f"reward.exposure_risk_mode must be one of {sorted(EXPOSURE_RISK_MODES)}, "
+            f"got {rew.exposure_risk_mode!r}"
+        )
+    if rew.exposure_risk_penalty_scale < 0.0:
+        raise ValueError(
+            "reward.exposure_risk_penalty_scale must be >= 0, "
+            f"got {rew.exposure_risk_penalty_scale}"
+        )
+    if rew.turnover_penalty < 0.0:
+        raise ValueError(
+            f"reward.turnover_penalty must be >= 0, got {rew.turnover_penalty}"
+        )
 
 
 def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
@@ -432,7 +487,16 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             benchmark_excess_clip=float(_req(rew, "benchmark_excess_clip", "reward")),
             benchmark_combined_abs_cap=_benchmark_combined_abs_cap(rew),
             churn_penalty=_reward_churn_penalty(rew),
+            turnover_penalty=float(rew.get("turnover_penalty", 0.0)),
             drawdown_downside_gamma=float(_req(rew, "drawdown_downside_gamma", "reward")),
+            drawdown_increase_penalty=float(rew.get("drawdown_increase_penalty", 0.75)),
+            drawdown_level_penalty=float(rew.get("drawdown_level_penalty", 3.0)),
+            drawdown_level_floor=float(rew.get("drawdown_level_floor", 0.08)),
+            concentration_penalty=float(rew.get("concentration_penalty", 0.0)),
+            concentration_target_eff_assets=float(
+                rew.get("concentration_target_eff_assets", 5.5)
+            ),
+            cash_daily_yield=float(rew.get("cash_daily_yield", 0.0)),
             inactivity_penalty_over_50=float(_req(rew, "inactivity_penalty_over_50", "reward")),
             inactivity_penalty_over_90=float(_req(rew, "inactivity_penalty_over_90", "reward")),
             eval_inactivity_penalty_scale=float(
@@ -442,6 +506,8 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             participation_reward_scale=float(
                 _req(rew, "participation_reward_scale", "reward")
             ),
+            exposure_risk_mode=str(rew.get("exposure_risk_mode", "realized_vol")),
+            exposure_risk_penalty_scale=float(rew.get("exposure_risk_penalty_scale", 0.0)),
         ),
         transaction_costs=TransactionCostsConfig(
             slippage=_float_list(
@@ -495,6 +561,10 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             ),
             reproducible=bool(tr.get("reproducible", False)),
             early_stop_patience=int(tr.get("early_stop_patience", 0)),
+            best_model_score_std_coef=float(tr.get("best_model_score_std_coef", 0.75)),
+            best_model_score_dd_coef=float(tr.get("best_model_score_dd_coef", 2.0)),
+            best_model_score_stitched_blend=float(tr.get("best_model_score_stitched_blend", 0.5)),
+            best_model_benchmark=str(tr.get("best_model_benchmark", "equal_weight_daily")),
         ),
         vec_normalize=VecNormalizeConfig(
             norm_obs=bool(_req(vn, "norm_obs", "vec_normalize")),
@@ -538,6 +608,19 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
         raw=data,
     )
     _validate_reward_config(cfg.reward)
+    from rlbot.eval_selection import EVAL_BENCHMARK_MODES
+
+    bm = cfg.training.best_model_benchmark
+    if bm not in EVAL_BENCHMARK_MODES:
+        raise ValueError(
+            f"training.best_model_benchmark must be one of {sorted(EVAL_BENCHMARK_MODES)}, "
+            f"got {bm!r}"
+        )
+    blend = float(cfg.training.best_model_score_stitched_blend)
+    if not 0.0 <= blend <= 1.0:
+        raise ValueError(
+            f"training.best_model_score_stitched_blend must be in [0, 1], got {blend}"
+        )
     return cfg
 
 

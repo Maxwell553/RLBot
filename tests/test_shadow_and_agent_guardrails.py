@@ -171,9 +171,9 @@ def test_shadow_reconcile_fills_realized_and_is_idempotent(tmp_path: Path, monke
     exp_cost = 0.5 * (slip + fee) + 0.5 * hold[0]
     assert realized["model_linear_costs"] == pytest.approx(exp_cost)
     assert realized["model_return_net"] == pytest.approx(0.5 * 0.05 - exp_cost)
-    # benchmark (buy & hold): asset 0 (cap weight .55) moved +5%, pays holding only
+    # benchmark (buy & hold): equal-weight passive bench; asset 0 moved +5%
     bench_w = cfg2.reward.benchmark_cap_weights_array()
-    exp_bench = 0.55 * 0.05 - float(np.dot(bench_w, hold))
+    exp_bench = float(bench_w[0]) * 0.05 - float(np.dot(bench_w, hold))
     assert realized["benchmark_return_net"] == pytest.approx(exp_bench, rel=1e-6)
     # idempotent: second reconcile adds nothing
     shadow.cmd_reconcile(args)

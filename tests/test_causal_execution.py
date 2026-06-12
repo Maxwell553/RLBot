@@ -34,7 +34,11 @@ def _installed_config(
             max_single_asset_weight=cap,
             action_smoothing_alpha=0.0,
         ),
-        reward=replace(base.reward, benchmark_cap_weights=[1.0 / n_assets] * n_assets),
+        reward=replace(
+            base.reward,
+            benchmark_cap_weights=[1.0 / n_assets] * n_assets,
+            cash_daily_yield=0.0,
+        ),
         transaction_costs=replace(
             base.transaction_costs,
             slippage=[slippage] * n_assets,

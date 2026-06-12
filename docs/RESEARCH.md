@@ -27,7 +27,7 @@ Each window trains on data through a fixed **train-end** date; a chronological *
 | Checkpoints | Every **1M** global steps under `models/checkpoints/` |
 | In-training eval | One deterministic rollout **per eval segment** (~# of 126-bar eval blocks) |
 | Reward logging | `RewardDecompCallback` → TB `rew_decomp/*` + `eval_logs/reward_decomp.json` |
-| Early stop | Optional `training.early_stop_patience` (after curriculum completes) |
+| Early stop | `training.early_stop_patience: 8` (after curriculum completes; `0` disables) |
 | OOS backtest | `obs_lag` from the run manifest (else run config default), full fees, `churn_scale = 1`, action smoothing 0.15; run-local config/cache binding |
 | Checkpoint rule | Eval-NAV-best only (`models/best/best_model.zip` + matched `best/vec_normalize.pkl`) |
 
@@ -99,7 +99,7 @@ Window *N* trains through Dec-31 of `2013 + 2N` with a two-year holdout. This ta
 **Local train example (window 1):**
 
 ```bash
-python scripts/train.py --window 1 --timesteps 65000000 \
+python scripts/train.py --window 1 --timesteps 50000000 \
   --since 2006-01-01 --train-end 2015-12-31 \
   --holdout-start 2016-01-01 --holdout-end 2017-12-31 --until 2017-12-31
 ```
@@ -108,7 +108,7 @@ python scripts/train.py --window 1 --timesteps 65000000 \
 
 ```bash
 modal run scripts/modal_app.py -- \
-  --modal-gpu H100 --window 2 --run-id <RUN_ID> --timesteps 65000000 \
+  --modal-gpu H100 --window 2 --run-id <RUN_ID> --timesteps 50000000 \
   --refresh-data --since 2006-01-01 --train-end 2017-12-31 \
   --holdout-start 2018-01-01 --holdout-end 2019-12-31 --until 2019-12-31
 python scripts/modal_app.py sync --run-id <RUN_ID> --watch
@@ -193,22 +193,29 @@ Ticker order: `Runs/<run_id>/manifest.json` → `universe.tickers` and `.cache/d
 
 Per-step (before VecNormalize during training):
 
-`reward = return (with downside amp) + benchmark_excess + sortino_diff + participation − inactivity − churn`
+`reward = return (with downside amp) + benchmark_excess + sortino_diff + participation − inactivity − churn − drawdown_penalty − concentration`
 
 | Component | Sign | Implementation | Default coefficients |
 |-----------|------|----------------|-------------------|
-| **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 5` |
+| **Return** | + | `clip(log_ret, …) × reward_scale`; negative returns amplified by `(1 + drawdown_downside_gamma × dd_pre)` | clip **−0.12 / +0.06**; scale **2000**; `drawdown_downside_gamma: 12` |
 | **Benchmark excess** | + | `clip(agent_log_ret − bench_log_ret, ±clip) × benchmark_excess_scale` (same friction model as Sortino bench) | `benchmark_excess_scale: 600`; `benchmark_excess_clip: 0.04` |
 | **Sortino differential** | + | Agent vs cap-weighted benchmark Sortino over `risk_window`, clipped ±3; downside deviation floored at `sortino_downside_floor: 0.001` (10 bp/day) | `risk_bonus_scale: 2.5` |
 | **Bench cap** | (meta) | Sortino + benchmark scaled so combined \|.\| ≤ `benchmark_combined_abs_cap` (a **constant** — a relative cap was reward-hackable) | **24.0** (`0` disables both) |
-| **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.05 × 20` |
-| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **1.35** + **0.9** tail (max **~2.25** at 100% cash) |
-| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 1.0` |
-| **Drawdown amp** | (in return) | Extra negative return when underwater; logged as `rew_decomp/drawdown` | `drawdown_downside_gamma: 5` |
+| **Participation** | + | `gross_exposure × participation_bonus × participation_reward_scale` | `0.02 × 10` (~0.20/step at full gross) |
+| **Inactivity** | − | `cash_frac × inactivity_penalty_over_50` + ramp 90%→100% | **0.35** + **0.15** tail (max **~0.50** at 100% cash) |
+| **Churn** | − | `tx_cost_frac × churn_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `churn_penalty: 4.0` |
+| **Turnover** | − | `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` | `turnover_penalty: 0.01` |
+| **Drawdown amp** | (in return) | Extra negative return when underwater; logged as `rew_decomp/drawdown` | `drawdown_downside_gamma: 12` |
+| **Drawdown penalty** | − | `dd_increase × reward_scale × drawdown_increase_penalty + max(dd_next − floor, 0) × drawdown_level_penalty` | **0.75**, **3.0**, floor **0.08** |
+| **Concentration** | − | `concentration_penalty × max(target_eff_n − eff_n, 0)` on risky weights | **0.75**, target **6.0** eff assets |
+| **Exposure risk** | − | `gross_exposure × vol_or_vix × exposure_risk_penalty_scale` | mode `realized_vol`; scale **40.0** |
+| **Cash carry** | (in NAV) | `cash *= (1 + cash_daily_yield)` before MTM each step when `> 0` | **0.0** (disabled) |
 
-`info` / TensorBoard: `rew_decomp/return`, `benchmark`, `sortino`, `participation`, `inactivity`, `churn`, `drawdown`, `vix_churn_mult`.
+`info` / TensorBoard: `rew_decomp/return`, `benchmark`, `sortino`, `participation`, `inactivity`, `churn`, `drawdown`, `drawdown_penalty`, `concentration`, `exposure_risk`, `effective_n_assets`, `vix_churn_mult`.
 
-**Churn detail:** `tx_cost_frac` = realized slippage + fee dollars ÷ NAV (zero when `fee_scale = 0`). `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Train **and eval** `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the fee ramp window. OOS backtest: `churn_scale = 1`.
+In-training eval logs **`eval_logs/eval_portfolio_diagnostics.jsonl`** (mean cash, effective N, top-3 concentration, turnover, per-asset weights, segment NAV paths) plus TensorBoard `eval/*`. OOS `backtest_summary.json` adds **`portfolio_diagnostics`**: same panel metrics from the holdout rollout.
+
+**Churn / turnover detail:** `tx_cost_frac` = realized slippage + fee dollars ÷ NAV (zero when `fee_scale = 0`). Turnover uses the same `curriculum_churn_scale` and VIX multiplier as churn (off during fee-free). `VIX_mult = clip(VIX/18, 0.75, 1.5)`. Train **and eval** `curriculum_churn_scale` is **0** during fee-free phase, then **0.1 → 1.0** over the fee ramp window. OOS backtest: `churn_scale = 1`.
 
 **Inactivity detail:** Training and eval envs use `eval_inactivity_penalty_scale: 1.0` (balanced with return term; cash can beat a −1% day).
 
@@ -261,29 +268,29 @@ Default `--checkpoint` is **`best`** (eval-NAV-selected); `latest`/`both` print 
 
 ---
 
-## Training loop & curriculum (65M timesteps)
+## Training loop & curriculum (50M timesteps)
 
-RecurrentPPO + VecNormalize (obs norm on; reward norm train-only) + `TradingCurriculumCallback` (fee/churn on **train + eval**) + `EvalNavBestModelCallback` (best saves gated until **`fee_ramp_end`**) + `AdaptiveEntropyCallback` + `RewardDecompCallback` + `TrainingVizCallback`. Cosine LR to `learning_rate_floor`. Optional patience early-stop via `training.early_stop_patience` (after `dr_widen_end` curriculum milestone). Milestones use `curriculum.budget_short` fractions in `config/config.yaml`:
+RecurrentPPO + VecNormalize (obs norm on; reward norm train-only) + `TradingCurriculumCallback` (fee/churn on **train + eval**) + `EvalNavBestModelCallback` (best saves gated until **`fee_ramp_end`**) + `AdaptiveEntropyCallback` + `RewardDecompCallback` + `TrainingVizCallback`. Cosine LR to `learning_rate_floor`. Patience early-stop via `training.early_stop_patience: 8` (after `dr_widen_end` curriculum milestone; `0` disables). Milestones use `curriculum.budget_short` fractions in `config/config.yaml`:
 
-| Phase | Approx. step (65M run) | Effect |
+| Phase | Approx. step (50M run) | Effect |
 |-------|------------------------|--------|
-| Fee-free | 0 – 6.5M (`fee_free_fraction` 0.10) | `fee_scale = 0` (train + eval) |
-| Fee ramp | 6.5M – 29.25M (`fee_ramp_fraction` 0.45) | fees → full (train + eval, linear) |
+| Fee-free | 0 – 6.5M (`fee_free_fraction` 0.13) | `fee_scale = 0` (train + eval) |
+| Fee ramp | 6.5M – 29.25M (`fee_ramp_fraction` 0.585) | fees → full (train + eval, linear) |
 | Churn ramp | 6.5M – 29.25M (aligned with fee ramp) | `curriculum_churn_scale` 0 → 0.1 → 1.0 (train + eval) |
 | Best-model gate | opens at **29.25M** (`fee_ramp_end`; `best_model_min_step: null`) | eval NAV logged always; `models/best/` updates only after full eval fees + churn |
-| DR widen | through ~42.25M (`dr_widen_span_fraction` 0.65) | fee/lag domain-randomization bounds widen (**train only**) |
-| Entropy | cosine decay from `decay_start_fraction` 0.45 (~29.25M) | exploration → `final_ent` |
-| Eval / plot | every **500k** global steps | ~130 eval rollouts per 65M run (decoupled from `n_steps`) |
+| DR widen | through **50M** (`dr_widen_span_fraction` 0.65; budget-limited) | fee/lag domain-randomization bounds widen (**train only**) |
+| Entropy | cosine decay from `decay_start_fraction` 0.585 (~29.25M) | exploration → `final_ent` |
+| Eval / plot | every **500k** global steps | ~100 eval rollouts per 50M run (decoupled from `n_steps`) |
 | Checkpoints | every **1M** global steps | `models/checkpoints/ppo_*_steps.zip` |
 
 ```bash
 python scripts/train.py --refresh-data --timesteps 1000 --run-id _data_refresh --no-viz
-python scripts/train.py --window 1 --timesteps 65000000 \
+python scripts/train.py --window 1 --timesteps 50000000 \
   --train-end 2015-12-31 --holdout-start 2016-01-01 --holdout-end 2017-12-31 --until 2017-12-31
 python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stochastic-paths 30 --plot-tag best
 
 # Modal equivalent (pull artifacts before backtest)
-modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 65000000 \
+modal run scripts/modal_app.py -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 50000000 \
   --since 2006-01-01 --train-end 2015-12-31 \
   --holdout-start 2016-01-01 --holdout-end 2017-12-31 --until 2017-12-31
 python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all
@@ -298,7 +305,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 ```bash
 ./scripts/run_seed_ensemble.sh --cohort my_cohort -- --train-end 2019-12-31 \
-  --holdout-start 2020-01-01 --holdout-end 2021-06-30 --until 2021-06-30 --timesteps 65000000
+  --holdout-start 2020-01-01 --holdout-end 2021-06-30 --until 2021-06-30 --timesteps 50000000
 python scripts/backtest.py --ensemble-prefix my_cohort --ensemble-checkpoint best --detailed
 ```
 

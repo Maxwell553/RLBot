@@ -4,6 +4,7 @@ Training and backtest charts (matplotlib, non-interactive PNG by default).
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -68,11 +69,22 @@ def _timestep_formatter() -> mticker.FuncFormatter:
     return mticker.FuncFormatter(fmt)
 
 
+def _percent_formatter() -> mticker.FuncFormatter:
+    def fmt(v, _):
+        return f"{v:.1f}%"
+    return mticker.FuncFormatter(fmt)
+
+
 def plot_training_progress(
     episode_timesteps: Sequence[int],
     episode_rewards: Sequence[float],
     eval_timesteps: Optional[np.ndarray] = None,
     eval_ending_navs: Optional[np.ndarray] = None,
+    eval_std_navs: Optional[np.ndarray] = None,
+    eval_robust_scores: Optional[np.ndarray] = None,
+    eval_mean_max_dd_pct: Optional[np.ndarray] = None,
+    eval_stitched_agent_nav: Optional[np.ndarray] = None,
+    eval_stitched_excess_nav: Optional[np.ndarray] = None,
     episode_navs: Optional[Sequence[float]] = None,
     episode_nav_ts: Optional[Sequence[int]] = None,
     episode_lengths: Optional[Sequence[int]] = None,
@@ -80,10 +92,11 @@ def plot_training_progress(
     title: str = "RL portfolio training",
     save_path: str | Path = "plots/training.png",
 ) -> Path:
-    """Episode rewards + eval mean ending NAV + training episode-end NAV ($).
+    """Episode rewards + eval NAV/score/drawdown + training episode-end NAV ($).
 
-    Top panel: per-step training reward. Middle: mean ending portfolio NAV on the
-    in-training eval split (from ``eval_nav_history.npz``). Bottom: training NAV.
+    Top panel: per-step training reward. Middle: eval mean ending NAV (green),
+    ±1σ band, robust score (dashed), p75 max drawdown (%) on secondary axis,
+    stitched validation NAV (compounded eval blocks). Bottom: training NAV.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,26 +133,99 @@ def plot_training_progress(
     ax0.set_title("Training episodes — per-step avg reward")
     ax0.grid(True, alpha=0.25)
 
-    # ── Panel 1: Eval mean ending NAV ($) ─────────────────────────────
+    # ── Panel 1: Eval NAV, robust score, dispersion, drawdown ───────────
     ax1 = axes[1]
     if eval_timesteps is not None and eval_ending_navs is not None and len(eval_ending_navs) > 0:
+        ts = np.asarray(eval_timesteps, dtype=np.int64)
+        nav = np.asarray(eval_ending_navs, dtype=np.float64)
         ax1.plot(
-            eval_timesteps,
-            eval_ending_navs,
+            ts,
+            nav,
             marker="o",
             ms=3,
             color="#2ca02c",
+            lw=2.0,
             label="mean ending NAV",
+            zorder=3,
         )
-        ax1.axhline(100_000, color="gray", ls="--", lw=0.8, alpha=0.6, label="$100k start")
-        ax1.set_ylabel("Portfolio Value ($)")
+        if eval_std_navs is not None and len(eval_std_navs) == len(nav):
+            std = np.asarray(eval_std_navs, dtype=np.float64)
+            ax1.fill_between(
+                ts,
+                nav - std,
+                nav + std,
+                color="#2ca02c",
+                alpha=0.18,
+                label="mean NAV ± std",
+                zorder=1,
+            )
+        if eval_robust_scores is not None and len(eval_robust_scores) == len(nav):
+            ax1.plot(
+                ts,
+                np.asarray(eval_robust_scores, dtype=np.float64),
+                color="#1a4d1a",
+                ls="--",
+                lw=1.8,
+                marker=".",
+                ms=4,
+                label="robust score",
+                zorder=4,
+            )
+        if eval_stitched_agent_nav is not None and len(eval_stitched_agent_nav) == len(nav):
+            ax1.plot(
+                ts,
+                np.asarray(eval_stitched_agent_nav, dtype=np.float64),
+                color="#ff7f0e",
+                ls="-",
+                lw=1.5,
+                marker="s",
+                ms=2.5,
+                alpha=0.9,
+                label="stitched validation NAV",
+                zorder=3,
+            )
+        if eval_stitched_excess_nav is not None and len(eval_stitched_excess_nav) == len(nav):
+            ax1.plot(
+                ts,
+                100_000.0 + np.asarray(eval_stitched_excess_nav, dtype=np.float64),
+                color="#9467bd",
+                ls=":",
+                lw=1.3,
+                alpha=0.85,
+                label="stitched bench + excess",
+                zorder=2,
+            )
+        ax1.axhline(100_000, color="gray", ls=":", lw=0.8, alpha=0.6, label="$100k start")
+        ax1.set_ylabel("Portfolio value / score ($)")
         ax1.yaxis.set_major_formatter(_dollar_formatter())
-        ax1.legend(loc="upper right", fontsize=8)
+        if eval_mean_max_dd_pct is not None and len(eval_mean_max_dd_pct) == len(nav):
+            ax1_dd = ax1.twinx()
+            dd_pct = np.asarray(eval_mean_max_dd_pct, dtype=np.float64)
+            ax1_dd.plot(
+                ts,
+                dd_pct,
+                color="#d62728",
+                ls="-.",
+                lw=1.4,
+                marker="x",
+                ms=3,
+                alpha=0.85,
+                label="p75 max drawdown (%)",
+                zorder=2,
+            )
+            ax1_dd.set_ylabel("p75 max drawdown (%)", color="#d62728")
+            ax1_dd.yaxis.set_major_formatter(_percent_formatter())
+            ax1_dd.tick_params(axis="y", labelcolor="#d62728")
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax1_dd.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
+        else:
+            ax1.legend(loc="upper left", fontsize=8)
     else:
         ax1.text(0.5, 0.5, "No eval checkpoints yet", ha="center", va="center", transform=ax1.transAxes)
     ax1.set_xlabel("timesteps")
     ax1.xaxis.set_major_formatter(_timestep_formatter())
-    ax1.set_title("Periodic evaluation — Validation Ending NAV")
+    ax1.set_title("Periodic evaluation — NAV, robust score, dispersion, drawdown")
     ax1.grid(True, alpha=0.25)
 
     # ── Panel 2: Episode-end NAV in dollars ──────────────────────────
@@ -426,29 +512,135 @@ def plot_backtest_dashboard(
 
 def load_eval_nav_npz(path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Load ``eval_nav_history.npz`` written by ``EvalNAVTrackerCallback`` in train.py.
+    Load ``eval_nav_history.npz`` written by ``EvalNavBestModelCallback`` in train.py.
 
     Returns ``(timesteps, mean_ending_nav)`` as dollar portfolio values at episode end
     (averaged across eval episodes at each checkpoint). No per-step division.
     """
+    hist = load_eval_history_npz(path)
+    if hist is None:
+        return None, None
+    return hist["timesteps"], hist["mean_ending_nav"]
+
+
+def _mean_max_dd_frac_from_diagnostics_jsonl(path: Path) -> np.ndarray | None:
+    """One mean max-drawdown fraction per eval cycle from portfolio diagnostics JSONL."""
     path = Path(path)
     if not path.is_file():
-        return None, None
+        return None
+    fracs: list[float] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            segs = rec.get("segments") or []
+            if not segs:
+                continue
+            fracs.append(float(np.mean([float(s.get("max_drawdown_frac", 0.0)) for s in segs])))
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    return np.asarray(fracs, dtype=np.float64) if fracs else None
+
+
+def load_eval_history_npz(path: Path) -> dict[str, np.ndarray] | None:
+    """Load full eval history arrays for plotting (backward-compatible with older npz)."""
+    path = Path(path)
+    if not path.is_file():
+        return None
     try:
         z = np.load(path, allow_pickle=False)
         ts = z.get("timesteps")
         nav = z.get("mean_ending_nav")
         if ts is None or nav is None:
-            return None, None
-        return np.asarray(ts, dtype=np.int64).reshape(-1), np.asarray(nav, dtype=np.float64).reshape(-1)
+            return None
+        out: dict[str, np.ndarray] = {
+            "timesteps": np.asarray(ts, dtype=np.int64).reshape(-1),
+            "mean_ending_nav": np.asarray(nav, dtype=np.float64).reshape(-1),
+        }
+        for key in (
+            "robust_scores",
+            "std_ending_nav",
+            "mean_max_drawdown_nav",
+            "mean_max_drawdown_frac",
+            "mean_excess_nav",
+            "stitched_agent_nav",
+            "stitched_excess_nav",
+            "stitched_max_drawdown_frac",
+        ):
+            arr = z.get(key)
+            if arr is not None:
+                out[key] = np.asarray(arr, dtype=np.float64).reshape(-1)
+        frac = out.get("mean_max_drawdown_frac")
+        if frac is not None and len(frac) == len(out["timesteps"]):
+            out["mean_max_drawdown_pct"] = 100.0 * frac
+        else:
+            jsonl = path.parent / "eval_portfolio_diagnostics.jsonl"
+            from_jsonl = _mean_max_dd_frac_from_diagnostics_jsonl(jsonl)
+            if from_jsonl is not None and len(from_jsonl) == len(out["timesteps"]):
+                out["mean_max_drawdown_frac"] = from_jsonl
+                out["mean_max_drawdown_pct"] = 100.0 * from_jsonl
+            elif "mean_max_drawdown_nav" in out:
+                dd_nav = out["mean_max_drawdown_nav"]
+                out["mean_max_drawdown_pct"] = (
+                    100.0 * dd_nav / np.maximum(out["mean_ending_nav"], 1e-12)
+                )
+        return out
     except (OSError, ValueError, KeyError):
-        return None, None
+        return None
+
+
+def regenerate_training_plot(run_dir: str | Path, *, title: str | None = None) -> Path | None:
+    """Rebuild ``Runs/<id>/plots/training.png`` from persisted eval + episode npz."""
+    run_dir = Path(run_dir)
+    plot_path = run_dir / "plots" / "training.png"
+    hist_path = run_dir / "eval_logs" / "eval_nav_history.npz"
+    ep_path = plot_path.with_name("training_episodes.npz")
+    hist = load_eval_history_npz(hist_path)
+    if hist is None:
+        return None
+    ep_ts: list[int] = []
+    ep_rew: list[float] = []
+    ep_len: list[int] = []
+    ep_nav: list[float] | None = None
+    ep_nav_ts: list[int] | None = None
+    if ep_path.is_file():
+        try:
+            z = np.load(ep_path, allow_pickle=False)
+            ep_ts = list(np.asarray(z["episode_ts"], dtype=np.int64))
+            ep_rew = list(np.asarray(z["episode_rewards"], dtype=np.float64))
+            ep_len = list(np.asarray(z["episode_lengths"], dtype=np.int64))
+            nav = z.get("episode_navs")
+            nav_t = z.get("episode_nav_ts")
+            if nav is not None and nav_t is not None and len(nav) > 0:
+                ep_nav = list(np.asarray(nav, dtype=np.float64))
+                ep_nav_ts = list(np.asarray(nav_t, dtype=np.int64))
+        except (OSError, ValueError, KeyError):
+            pass
+    run_id = run_dir.name
+    return plot_training_progress(
+        ep_ts,
+        ep_rew,
+        eval_timesteps=hist["timesteps"],
+        eval_ending_navs=hist["mean_ending_nav"],
+        eval_std_navs=hist.get("std_ending_nav"),
+        eval_robust_scores=hist.get("robust_scores"),
+        eval_mean_max_dd_pct=hist.get("mean_max_drawdown_pct"),
+        eval_stitched_agent_nav=hist.get("stitched_agent_nav"),
+        eval_stitched_excess_nav=hist.get("stitched_excess_nav"),
+        episode_navs=ep_nav,
+        episode_nav_ts=ep_nav_ts,
+        episode_lengths=ep_len if ep_len else None,
+        title=title or f"RL portfolio training — {run_id}",
+        save_path=plot_path,
+    )
 
 
 class TrainingVizCallback(BaseCallback):
     """
     Collect Monitor episode stats during PPO rollouts and refresh a PNG on a fixed step cadence.
-    Middle panel reads ``eval_nav_history.npz`` (mean ending NAV on the eval split).
+    Middle panel reads ``eval_nav_history.npz`` (mean ending NAV, ±std band, robust score,
+    p75 max drawdown (%) on secondary axis).
     Also tracks episode-end portfolio NAV for the bottom training panel.
 
     Episode series are persisted next to the PNG (``training_episodes.npz``) so the training
@@ -540,12 +732,26 @@ class TrainingVizCallback(BaseCallback):
         self._render()
 
     def _render(self) -> None:
-        ev_t, ev_nav = load_eval_nav_npz(self.eval_nav_npz_path)
+        hist = load_eval_history_npz(self.eval_nav_npz_path)
+        ev_t = ev_nav = ev_std = ev_score = ev_dd_pct = None
+        if hist is not None:
+            ev_t = hist["timesteps"]
+            ev_nav = hist["mean_ending_nav"]
+            ev_std = hist.get("std_ending_nav")
+            ev_score = hist.get("robust_scores")
+            ev_dd_pct = hist.get("mean_max_drawdown_pct")
+            ev_stitched = hist.get("stitched_agent_nav")
+            ev_stitched_ex = hist.get("stitched_excess_nav")
         plot_training_progress(
             self._episode_ts,
             self._episode_rewards,
             eval_timesteps=ev_t,
             eval_ending_navs=ev_nav,
+            eval_std_navs=ev_std,
+            eval_robust_scores=ev_score,
+            eval_mean_max_dd_pct=ev_dd_pct,
+            eval_stitched_agent_nav=ev_stitched,
+            eval_stitched_excess_nav=ev_stitched_ex,
             episode_navs=self._episode_navs if self._episode_navs else None,
             episode_nav_ts=self._episode_nav_ts if self._episode_nav_ts else None,
             episode_lengths=self._episode_lengths if self._episode_lengths else None,

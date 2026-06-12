@@ -2,8 +2,12 @@
 Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / config).
 
 Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
-  - inactivity - cost-linked churn
+  - inactivity - cost-linked churn - drawdown penalty - concentration penalty
   - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
+  - drawdown penalty: dd_increase * reward_scale * drawdown_increase_penalty
+    + max(dd_next - drawdown_level_floor, 0) * drawdown_level_penalty
+  - concentration: concentration_penalty * max(target_eff_n - eff_n, 0) on risky weights
+  - cash accrual (optional): cash *= (1 + cash_daily_yield) when yield > 0
   - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
   - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
   - Sortino + benchmark capped at a constant |sortino+benchmark| <= benchmark_combined_abs_cap
@@ -31,6 +35,11 @@ import numpy as np
 from gymnasium import spaces
 
 from rlbot.baselines import portfolio_step_nav
+from rlbot.reward_terms import (
+    concentration_penalty_from_weights,
+    drawdown_penalty_from_nav,
+    exposure_risk_penalty_from_state,
+)
 from rlbot.data_utils import MACRO_VIX_INDEX, N_MACRO
 from rlbot.rl_config import get_config
 
@@ -148,25 +157,100 @@ def _cap_benchmark_components(
 
 
 class EpisodeEndNavRecorder(gym.Wrapper):
-    """Record terminal ``nav`` from each episode for eval NAV tracking (SB3 EvalCallback)."""
+    """Record eval rollouts: ending NAV, segment paths, weights, and drawdowns."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
         self._ending_navs: list[float] = []
+        self._episodes: list[dict] = []
+        self._cur_navs: list[float] = []
+        self._cur_weights: list[np.ndarray] = []
+        self._cur_start_nav: float | None = None
+        self._cur_start_bar: int | None = None
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        self._cur_navs = []
+        self._cur_weights = []
+        self._cur_start_nav = None
+        self._cur_start_bar = None
+        unwrapped = self.env.unwrapped
+        start_bar = getattr(unwrapped, "_t", None)
+        if start_bar is not None:
+            self._cur_start_bar = int(start_bar)
+        start_nav = getattr(unwrapped, "_episode_start_nav", None)
+        if start_nav is None:
+            start_nav = getattr(unwrapped, "initial_cash", None)
+        if start_nav is not None and np.isfinite(float(start_nav)):
+            start_nav = float(start_nav)
+            self._cur_start_nav = start_nav
+            self._cur_navs.append(start_nav)
+        return obs, info
+
+    def _finalize_episode(self, ending_nav: float) -> dict:
+        navs = np.asarray(self._cur_navs, dtype=np.float64)
+        if navs.size:
+            peak = np.maximum.accumulate(navs)
+            dd_nav = peak - navs
+            max_dd_frac = float(np.max(dd_nav / np.maximum(peak, 1e-12)))
+            max_dd_nav = float(np.max(dd_nav))
+            start_nav = float(self._cur_start_nav if self._cur_start_nav is not None else navs[0])
+        else:
+            max_dd_frac = 0.0
+            max_dd_nav = 0.0
+            start_nav = float(ending_nav)
+        weights = (
+            np.stack(self._cur_weights, axis=0)
+            if self._cur_weights
+            else np.zeros((0, 1), dtype=np.float64)
+        )
+        return {
+            "ending_nav": float(ending_nav),
+            "start_nav": start_nav,
+            "start_bar": self._cur_start_bar,
+            "max_drawdown_frac": max_dd_frac,
+            "max_drawdown_nav": max_dd_nav,
+            "nav_path": navs.tolist(),
+            "weights": weights,
+        }
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        if terminated or truncated:
-            nav = info.get("nav")
-            if nav is not None:
-                self._ending_navs.append(float(nav))
+        nav = info.get("nav")
+        tw = info.get("target_weights")
+        if nav is not None:
+            nav_f = float(nav)
+            if self._cur_start_nav is None:
+                self._cur_start_nav = nav_f
+            self._cur_navs.append(nav_f)
+            if tw is not None:
+                self._cur_weights.append(np.asarray(tw, dtype=np.float64).reshape(-1))
+        if (terminated or truncated) and nav is not None:
+            ep = self._finalize_episode(float(nav))
+            self._episodes.append(ep)
+            self._ending_navs.append(float(nav))
+            self._cur_navs = []
+            self._cur_weights = []
+            self._cur_start_nav = None
+            self._cur_start_bar = None
         return obs, reward, terminated, truncated, info
 
     def pop_ending_navs(self) -> list[float]:
-        """Return and clear NAVs collected since the last pop (one eval cycle)."""
+        """Return and clear ending NAVs collected since the last pop (one eval cycle)."""
         navs = list(self._ending_navs)
         self._ending_navs.clear()
         return navs
+
+    def pop_eval_episodes(self) -> list[dict]:
+        """Return and clear full eval episode records (NAV paths, weights, drawdowns)."""
+        eps = list(self._episodes)
+        self._episodes.clear()
+        self._ending_navs.clear()
+        self._cur_navs = []
+        self._cur_weights = []
+        self._cur_start_nav = None
+        self._cur_start_bar = None
+        return eps
 
     def get_segments(self) -> Optional[list]:
         return self.env.get_segments()
@@ -179,7 +263,7 @@ class MultiAssetPortfolioEnv(gym.Env):
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
     Reward: return (drawdown-amplified downside) + benchmark excess + Sortino diff
-    + participation - inactivity - cost-linked churn.
+    + participation - inactivity - cost-linked churn - drawdown penalty - concentration.
     Per-step ``info`` includes ``rew_decomp/*`` for each component (see ``config.yaml`` reward section).
 
     Feature arrays after ``macd`` are keyword-only so walk-forward packs
@@ -411,7 +495,7 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         ``fee_override``: fixed ``fee_scale`` until next reset when set (0 = frictionless).
         ``None`` = release to domain randomization (or default fee) on reset.
-        ``churn_scale``: multiplies configured churn penalty (0 = off).
+        ``churn_scale``: multiplies churn and turnover penalties (0 = off during fee-free).
         """
         self._curriculum_fee_override = fee_override
         self._churn_scale = float(churn_scale)
@@ -898,6 +982,9 @@ class MultiAssetPortfolioEnv(gym.Env):
         turnover_frac, tx_cost_frac = self._rebalance(open_next, w)
         self._prev_target_w = w.copy()
 
+        if rwd.cash_daily_yield > 0.0:
+            self._cash *= 1.0 + float(rwd.cash_daily_yield)
+
         close_next = self.ohlcv[self._t + 1, :, 3]
         v_next = max(self._nav(close_next), 1e-12)
 
@@ -964,12 +1051,32 @@ class MultiAssetPortfolioEnv(gym.Env):
         churn_component = (
             tx_cost_frac * rwd.churn_penalty * rwd.reward_scale * active_churn_scale
         )
+        turnover_component = (
+            turnover_frac * rwd.turnover_penalty * rwd.reward_scale * active_churn_scale
+        )
 
         sortino_component, benchmark_component = _cap_benchmark_components(
             sortino=sortino_component,
             benchmark=benchmark_component,
             cap_abs=rwd.benchmark_combined_abs_cap,
         )
+
+        drawdown_penalty_component, dd_next, _ = drawdown_penalty_from_nav(
+            peak_before=peak_before,
+            v_pre=v_pre,
+            v_next=v_next,
+            dd_frac_pre=dd_frac_pre,
+            rwd=rwd,
+        )
+        concentration_component, eff_n = concentration_penalty_from_weights(w, rwd)
+        active_returns = np.asarray(self._return_buffer[-min(len(self._return_buffer), rwd.risk_window) :], dtype=np.float64)
+        exposure_risk_component = exposure_risk_penalty_from_state(
+            gross_exposure=gross_exposure,
+            agent_returns=active_returns,
+            vix=current_vix,
+            rwd=rwd,
+        )
+
         reward = (
             return_component
             + sortino_component
@@ -977,6 +1084,10 @@ class MultiAssetPortfolioEnv(gym.Env):
             + participation_component
             - inactivity_component
             - churn_component
+            - turnover_component
+            - drawdown_penalty_component
+            - concentration_component
+            - exposure_risk_component
         )
 
         self._episode_peak_nav = max(peak_before, v_next)
@@ -1006,8 +1117,13 @@ class MultiAssetPortfolioEnv(gym.Env):
             "rew_decomp/inactivity": -inactivity_component,
             "rew_decomp/participation": participation_component,
             "rew_decomp/churn": -churn_component,
+            "rew_decomp/turnover": -turnover_component,
             "rew_decomp/vix_churn_mult": vix_multiplier,
             "rew_decomp/drawdown": drawdown_component,
+            "rew_decomp/drawdown_penalty": -drawdown_penalty_component,
+            "rew_decomp/concentration": -concentration_component,
+            "rew_decomp/exposure_risk": -exposure_risk_component,
+            "rew_decomp/effective_n_assets": eff_n,
         }
 
         obs = self._build_obs()

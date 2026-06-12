@@ -8,7 +8,7 @@ parent: baseline
 base_config: config/config.yaml
 grid:
   curriculum.churn_ramp_floor: [0.0, 0.1, 0.25]
-  curriculum.fee_ramp_fraction: [0.35, 0.45]
+  curriculum.fee_ramp_fraction: [0.50, 0.585]
 seeds: [42]
 windows:
   - name: W4  # canonical: train through 2021-12-31, holdout 2022-01-01..2023-12-31

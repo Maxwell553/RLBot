@@ -84,7 +84,7 @@ python scripts/train.py \
   --train-end 2015-12-31 \
   --holdout-start 2016-01-01 \
   --holdout-end 2017-12-31 \
-  --timesteps 65000000 \
+  --timesteps 50000000 \
   --window 1
 ```
 
@@ -105,7 +105,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and **requires** `models/best/vec_normalize.pkl` paired with `best_model.zip` (pass `--allow-missing-vec-normalize` only for debugging). Results land in `Runs/<id>/backtest_summary.json`.
 
-**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when eval NAV improves **after `fee_ramp_end`** (full eval fees + churn). Eval NAV is logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
+**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when the **robust eval score** improves **after `fee_ramp_end`** (50/50 blend of segment-mean excess and **stitched** excess vs equal-weight daily passive book, minus dispersion and p75 drawdown). Eval metrics are logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
 
 ### 6. Target-weight inference (optional)
 
@@ -156,8 +156,8 @@ Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 | `config.yaml` | Snapshot of training config |
 | `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
 | `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair) |
-| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (per-term: return, benchmark, sortino, participation, inactivity, churn, drawdown amp) |
-| `backtest_summary.json` | OOS metrics + config/data hashes (after backtest) |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (return, benchmark, sortino, participation, inactivity, churn, drawdown amp, drawdown penalty, concentration) |
+| `backtest_summary.json` | OOS metrics, `portfolio_diagnostics` (cash, gross exposure, HHI, eff-N, cap hits, turnover, per-asset weights), config/data hashes |
 | `training_summary.json` | Training-end summary (after train completes) |
 
 Migrate legacy scattered dirs once: `python scripts/migrate_runs_layout.py`.
@@ -171,7 +171,7 @@ For long runs on a cloud GPU with the same `Runs/<run_id>/` layout, see [MODAL.m
 Quick flow:
 
 1. `pip install -e ".[modal]"` and `modal setup`
-2. `modal run scripts/modal_app.py::train -- --window 2 --timesteps 65000000 ...` (same date/universe flags as local)
+2. `modal run scripts/modal_app.py::train -- --window 2 --timesteps 50000000 ...` (same date/universe flags as local)
 3. In another terminal: `python scripts/modal_app.py sync --run-id <RUN_ID> --watch` (open `Runs/<RUN_ID>/plots/training.png` in the IDE)
 4. After the job: `python scripts/modal_app.py sync --run-id <RUN_ID> --pull-all` then backtest locally
 

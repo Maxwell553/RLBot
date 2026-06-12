@@ -32,7 +32,7 @@ def _assert_valid_weights(w: np.ndarray, n_actions: int = _N_ACTIONS) -> None:
 
 
 def test_config_cap_matches_yaml() -> None:
-    assert _max_cap() == pytest.approx(0.25)
+    assert _max_cap() == pytest.approx(0.20)
 
 
 def test_softmax_mean_decoupling() -> None:
@@ -363,7 +363,38 @@ def test_inactivity_penalty_bounded_at_full_cash() -> None:
     """100% cash inactivity penalty matches config (over_50 + over_90 tail)."""
     rwd = get_config().reward
     expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    assert expected == pytest.approx(2.25)
+    assert expected == pytest.approx(0.50, rel=1e-6)
+
+
+def test_turnover_penalty_ramps_with_churn_curriculum() -> None:
+    """Turnover uses turnover_penalty × reward_scale × active_churn_scale (0 during fee-free)."""
+    rwd = get_config().reward
+    assert rwd.turnover_penalty == pytest.approx(0.007)
+    # Full curriculum + 10% turnover → 0.10 * 0.007 * 2000 = 1.4 reward units
+    assert 0.10 * rwd.turnover_penalty * rwd.reward_scale == pytest.approx(1.4)
+
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        fee_scale_default=1.0,
+    )
+    env.set_curriculum_state(fee_override=1.0, churn_scale=0.0)
+    env.reset()
+    action = np.zeros(env.n_actions)
+    action[0] = 10.0
+    action[1] = 5.0
+    _, _, _, _, info = env.step(action)
+    assert info["rew_decomp/turnover"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_churn_penalty_uses_tx_cost_not_turnover() -> None:
@@ -426,6 +457,72 @@ def test_downside_return_amplified_when_in_drawdown() -> None:
             assert info["rew_decomp/return"] < 0.0
             break
     assert drawdown_seen
+
+
+def test_drawdown_penalty_logged_on_level_and_increase() -> None:
+    """Direct drawdown penalty applies on expansion and while sitting in deep drawdown."""
+    from rlbot.rl_config import get_config
+
+    rwd = get_config().reward
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    px = 70.0
+    for i in range(t):
+        ohlcv[i, :, :4] = px
+        ohlcv[i, :, 4] = 1e6
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        max_episode_steps=30,
+        fee_scale_default=0.0,
+    )
+    env.reset()
+    env._episode_peak_nav = 100_000.0
+    env._cash = 0.0
+    env._units[0] = 1_000.0
+    _, _, _, _, info = env.step(np.zeros(env.n_actions))
+    pen = info.get("rew_decomp/drawdown_penalty", 0.0)
+    assert pen < -1e-6
+    dd_frac = 30_000.0 / 100_000.0
+    expected_level = max(dd_frac - rwd.drawdown_level_floor, 0.0) * rwd.drawdown_level_penalty
+    assert pen == pytest.approx(-expected_level, rel=1e-4)
+
+
+def test_concentration_penalty_on_single_asset_book() -> None:
+    """Highly concentrated risky sleeve triggers concentration penalty in info."""
+    n_assets = _N_ASSETS
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    env = MultiAssetPortfolioEnv(
+        ohlcv,
+        rsi,
+        macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        random_start=False,
+        domain_randomize=False,
+        max_episode_steps=30,
+        fee_scale_default=0.0,
+    )
+    env.reset()
+    action = np.zeros(env.n_actions)
+    action[1] = 50.0
+    _, _, _, _, info = env.step(action)
+    conc = info.get("rew_decomp/concentration", 0.0)
+    assert conc < -1e-6
+    assert info.get("rew_decomp/effective_n_assets", 99.0) < float(
+        get_config().reward.concentration_target_eff_assets
+    )
 
 
 def test_benchmark_combined_abs_cap_scales_proportionally() -> None:

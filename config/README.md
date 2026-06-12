@@ -61,19 +61,41 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 | Key | Purpose |
 |-----|---------|
 | `risk_bonus_scale` | Sortino differential multiplier (default **2.5**) |
-| `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware cap-weighted benchmark |
+| `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware passive benchmark (`benchmark_cap_weights`; default equal 1/N) |
 | `benchmark_combined_abs_cap` | Constant cap on combined \|sortino+benchmark\| per step in reward units (default **24.0**; `0` disables both; never relative to the other terms) |
-| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 1.35 + 0.9 tail above 90% cash) |
-| `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 5.0) |
-| `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 1.0) |
+| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 0.35 + 0.15 tail above 90% cash; max ~0.50 at 100% cash) |
+| `participation_bonus` / `participation_reward_scale` | Gross-exposure bonus (default 0.02 × 10) |
+| `turnover_penalty` | Direct `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` (default **0.007**; ramps with churn, off during fee-free) |
+| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **80.0** for realized vol — use **~1–3** if switching to `vix_positive`) |
+| `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
+| `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults 0.75, 3.0, 0.08) |
+| `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (defaults 0.75, 6.0 effective assets) |
+| `cash_daily_yield` | Optional risk-free accrual on cash before MTM (default **0.0** = disabled; e.g. `0.00025`/day ≈ 6.3% ann.) |
+| `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 4.0) |
 | `eval_inactivity_penalty_scale` | Eval env inactivity scale (default 1.0) |
+
+## `training`
+
+| Key | Purpose |
+|-----|---------|
+| `timesteps` | Default PPO budget (default **50M**) |
+| `early_stop_patience` | Stop after K evals with no new best robust score once curriculum completes (default **8**; `0` disables) |
+| `best_model_score_std_coef` / `best_model_score_dd_coef` | Eval selection penalties on std(excess) and p75(max_dd) (defaults **0.75**, **2.0**) |
+| `best_model_score_stitched_blend` | Weight on **stitched** excess in the eval return signal (default **0.5** → 50/50 stitched/segment blend; `0` = segment mean only, `1` = stitched only) |
+| `best_model_benchmark` | Passive book for eval excess: **`equal_weight_daily`** (default) or `balanced_6040` |
+| `viz_freq` / eval cadence | Training plot + eval every **500k** global steps (~100 evals per 50M run) |
 
 ## `curriculum`
 
 | Key | Purpose |
 |-----|---------|
+| `budget_short` | Fraction-of-run schedule anchor (default **50M**; must match `training.timesteps` for standard runs) |
+| `fee_free_fraction` / `fee_ramp_fraction` | Fee-free then linear ramp (defaults **0.13** / **0.585** → ~6.5M / ~29.25M on a 50M run) |
 | `churn_ramp_floor` | Churn scale at fee-ramp start; ramps to 1.0 by `fee_ramp_fraction` (default 0.1) |
-| `best_model_min_step` | Gate `models/best/` saves until this step (`null` → `fee_ramp_end`; `0` → disable gate). Eval NAV always logged. |
+| `dr_widen_span_fraction` | Progressive DR widening span after fee ramp (default 0.65 × learn budget) |
+| `best_model_min_step` | Gate `models/best/` saves until this step (`null` → `fee_ramp_end`; `0` → disable gate). Eval + portfolio diagnostics always logged. |
+
+Entropy schedule (`entropy_schedule.decay_start_fraction` / `early_floor_fraction`, default **0.585**) aligns with `fee_ramp_fraction`.
 
 ## Other sections
 

@@ -31,7 +31,8 @@ def test_benchmark_cap_weights_normalize() -> None:
     w = cfg.reward.benchmark_cap_weights_array()
     assert w.shape == (cfg.universe.n_assets,)
     assert np.isclose(w.sum(), 1.0)
-    assert w[0] > w[1]  # SP500-heavy
+    # Equal-weight passive benchmark (1/N) — feasible under max_single_asset_weight 0.20
+    assert np.allclose(w, 1.0 / cfg.universe.n_assets)
 
 
 def test_fracdiff_weights_start_at_one() -> None:
@@ -87,12 +88,21 @@ def test_benchmark_combined_abs_cap_validation() -> None:
         benchmark_excess_clip=0.01,
         benchmark_combined_abs_cap=24.0,
         churn_penalty=1.0,
+        turnover_penalty=0.0,
         drawdown_downside_gamma=1.0,
+        drawdown_increase_penalty=0.75,
+        drawdown_level_penalty=3.0,
+        drawdown_level_floor=0.08,
+        concentration_penalty=0.35,
+        concentration_target_eff_assets=5.5,
+        cash_daily_yield=0.0,
         inactivity_penalty_over_50=1.0,
         inactivity_penalty_over_90=1.0,
         eval_inactivity_penalty_scale=1.0,
         participation_bonus=0.0,
         participation_reward_scale=1.0,
+        exposure_risk_mode="realized_vol",
+        exposure_risk_penalty_scale=0.0,
     )
     _validate_reward_config(RewardConfig(**base))
     _validate_reward_config(RewardConfig(**{**base, "benchmark_combined_abs_cap": 0.0}))

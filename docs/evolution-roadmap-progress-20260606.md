@@ -48,7 +48,7 @@ inference path. This round implements all five phases (with two honestly-scoped 
   windowed per-term means and **share-of-absolute-reward** to TensorBoard +
   `eval_logs/reward_decomp.json`, including the current benchmark-excess term.
 - **Patience early-stop** (`EvalNavBestModelCallback`, gated on curriculum completion via
-  `dr_widen_end_milestone`; `training.early_stop_patience`, default 0 = off).
+  `dr_widen_end_milestone`; `training.early_stop_patience`, default **8** (`0` disables).
 - **Eval effective-coverage reporting** (segments × scored bars) — the honest part of the
   narrow-estimator concern.
 - **`rlbot/stats.py`**: bootstrap helpers moved out of torch-importing `backtest.py`, so the

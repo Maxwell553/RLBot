@@ -284,6 +284,7 @@ class BacktestResult:
     n_rets: int = 0
     ret_skew: float = float("nan")
     ret_kurt: float = float("nan")
+    portfolio_diagnostics: dict | None = None
 
 
 def _resolve_model_path_for_run(
@@ -672,7 +673,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         vec_norm_path=vec_norm_path,
         use_vec_norm=use_vec_norm,
         deterministic=True,
-        collect_weights=not args.no_viz,
+        collect_weights=True,
         progress=progress,
         progress_label="deterministic",
     )
@@ -720,6 +721,15 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     log_rets = np.diff(np.log(np.maximum(navs, 1e-12)))
     total_return = float(navs[-1] / navs[0] - 1.0)
     sharpe = _sharpe_ann_from_log_rets(log_rets)
+    portfolio_diagnostics = None
+    if w_opt is not None and w_opt.size > 0:
+        from rlbot.portfolio_metrics import summarize_weight_panel
+
+        portfolio_diagnostics = summarize_weight_panel(
+            w_opt,
+            tickers=panel_tickers,
+            max_single_asset_weight=get_config().environment.max_single_asset_weight,
+        )
     _sd = float(np.std(log_rets)) + 1e-12
     _z = (log_rets - float(np.mean(log_rets))) / _sd
     ret_skew = float(np.mean(_z**3)) if log_rets.size >= 3 else float("nan")
@@ -816,6 +826,7 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         n_rets=int(log_rets.size),
         ret_skew=ret_skew,
         ret_kurt=ret_kurt,
+        portfolio_diagnostics=portfolio_diagnostics,
     )
     _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
     return result
@@ -1641,9 +1652,9 @@ def main() -> None:
     parser.add_argument(
         "--stochastic-paths",
         type=int,
-        default=0,
+        default=100,
         metavar="N",
-        help="If >0, run N stochastic policy rollouts and plot equity fan (default 0).",
+        help="Stochastic policy rollouts + equity fan plot (default 100; use 0 to skip).",
     )
     parser.add_argument(
         "--fast",

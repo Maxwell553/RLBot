@@ -33,7 +33,7 @@ Pass the same flags you would give `scripts/train.py` after `--`:
 ```bash
 modal run scripts/modal_app.py::train -- \
   --window 2 \
-  --timesteps 65000000 \
+  --timesteps 50000000 \
   --since 2006-01-01 \
   --train-end 2017-12-31 \
   --holdout-start 2018-01-01 \
@@ -61,19 +61,19 @@ GPU choice is fixed at launch (`--modal-gpu`); SB3 cannot rescale `n_envs` mid-r
 `config.yaml` sets `n_epochs: 3` and a baseline `batch_size: 16384` for local 16-env training (~12 backprop loops per PPO pause). Modal overrides `n_envs` and `batch_size` at launch; `n_epochs` stays in config.
 
 ```bash
-modal run scripts/modal_app.py::train -- --modal-gpu A100 --window 2 --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --modal-gpu A100 --window 2 --timesteps 50000000 ...
 ```
 
 Maximum throughput (highest cost):
 
 ```bash
-modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --modal-gpu H100 --window 1 --run-id <RUN_ID> --timesteps 50000000 ...
 ```
 
 Use an explicit run id when you plan to watch or sync artifacts:
 
 ```bash
-modal run scripts/modal_app.py::train -- --run-id <RUN_ID> --timesteps 65000000 ...
+modal run scripts/modal_app.py::train -- --run-id <RUN_ID> --timesteps 50000000 ...
 ```
 
 Remote writes go to Modal volumes:
@@ -150,7 +150,7 @@ Checkpoints land on the runs volume under `Runs/<run_id>/models/checkpoints/`. A
 modal run scripts/modal_app.py::train -- \
   --run-id <RUN_ID> \
   --resume Runs/<RUN_ID>/models/checkpoints/ppo_<steps>_steps.zip \
-  --timesteps 65000000
+  --timesteps 50000000
 ```
 
 (Paths are inside the container at `/workspace/Runs/...`.)
@@ -158,7 +158,7 @@ modal run scripts/modal_app.py::train -- \
 ## Tips
 
 - **Run id:** Auto ids (`--window N` → `W{N}_MMDD`, month/day at launch) are generated on the remote host. Check Modal logs for `Run id:` or pass `--run-id <RUN_ID>` for predictable sync.
-- **Timeout:** Modal caps each container at **24 hours** (we set the max as headroom). A 65M-step run that takes ~6h locally should finish in one session on an A10G/A100 — use `--resume` (not `--finetune`) if the job crashes or is preempted (checkpoints every 1M steps).
-- **Costs:** 65M-step jobs are long; pick GPU in `rlbot/modal_cloud.py` (`DEFAULT_GPU` or `--modal-gpu`) to match your budget.
+- **Timeout:** Modal caps each container at **24 hours** (we set the max as headroom). A 50M-step run that takes ~5h locally should finish in one session on an A10G/A100 — use `--resume` (not `--finetune`) if the job crashes or is preempted (checkpoints every 1M steps).
+- **Costs:** 50M-step jobs are long; pick GPU in `rlbot/modal_cloud.py` (`DEFAULT_GPU` or `--modal-gpu`) to match your budget.
 - **n_envs:** Linux Modal containers usually spawn `SubprocVecEnv` faster than macOS; you can still tune `--n-envs` if memory is tight.
 - **Local vs remote:** Local `Runs/` is gitignored. After `--pull-all`, local backtest uses the same paths as a local training run.

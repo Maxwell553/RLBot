@@ -189,7 +189,7 @@ Per-step `info` exposes `rew_decomp/*`. I did not find a dedicated callback that
 
 ### Training
 
-`scripts/train.py` builds a RecurrentPPO `MlpLstmPolicy` with a 2-layer 64-unit LSTM and MLP heads from config. Defaults are 16 local envs, `n_steps=4096`, `batch_size=16384`, `n_epochs=3`, and 65M timesteps.
+`scripts/train.py` builds a RecurrentPPO `MlpLstmPolicy` with a 2-layer 64-unit LSTM and MLP heads from config. Defaults are 16 local envs, `n_steps=4096`, `batch_size=16384`, `n_epochs=3`, and 50M timesteps.
 
 The training stack includes:
 

@@ -15,7 +15,7 @@ Anti-overfitting measures:
   - Observation noise on market features during training
   - Seed shuffling: fresh OS entropy on every episode reset
   - VecNormalize + cosine LR decay with floor
-  - Domain randomization: Beta-centered fee_scale + obs_lag, bounds widen 10M→40M (65M budget)
+  - Domain randomization: Beta-centered fee_scale + obs_lag, bounds widen progressively after fee ramp
   - Fee curriculum (train + eval): frictionless → linear fee/churn ramp → progressive DR on train
 """
 
@@ -103,6 +103,12 @@ from rlbot.run_artifacts import (
     sha256_file,
     merge_manifest,
     write_manifest,
+)
+from rlbot.eval_selection import (
+    EvalBenchmarkContext,
+    aggregate_eval_portfolio_diagnostics,
+    append_eval_diagnostics_jsonl,
+    compute_robust_eval_score,
 )
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
 from rlbot.reward_logging import RewardDecompAccumulator
@@ -193,13 +199,13 @@ def _make_env_factory(
 
 
 class EvalNavBestModelCallback(EvalCallback):
-    """Run periodic eval; save ``best_model.zip`` on **max mean ending NAV**, not reward.
+    """Run periodic eval; save ``best_model.zip`` on max **robust eval score**, not reward.
 
-    Still logs ``evaluations.npz`` (rewards) for entropy scheduling; deployment model
-    is chosen by validation wealth, avoiding passive low-churn reward hacks.
+    score = mean(excess vs passive bench) - std_coef * std(excess) - dd_coef * p75(max_dd_nav)
+    return term blends segment-mean excess with stitched excess (``best_model_score_stitched_blend``).
 
-    When ``best_model_min_step`` > 0, eval NAV is logged from step 0 but ``models/best/``
-    updates only after that step (default: ``fee_ramp_end`` — full eval fees + churn).
+    Passive benchmark for selection: ``training.best_model_benchmark`` (default equal-weight daily).
+    Also logs stitched validation NAV (compounded eval blocks) and drawdown.
     """
 
     def __init__(
@@ -211,13 +217,37 @@ class EvalNavBestModelCallback(EvalCallback):
         patience: int = 0,
         curriculum_end_step: int = 0,
         best_model_min_step: int = 0,
+        *,
+        panel_tickers: list[str],
+        max_single_asset_weight: float,
+        eval_diagnostics_path: Path,
+        benchmark_ctx: EvalBenchmarkContext,
+        score_std_coef: float = 0.75,
+        score_dd_coef: float = 2.0,
+        score_stitched_blend: float = 0.5,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
         self.nav_history_path = Path(nav_history_path)
+        self.eval_diagnostics_path = Path(eval_diagnostics_path)
+        self.benchmark_ctx = benchmark_ctx
+        self.panel_tickers = list(panel_tickers)
+        self.max_single_asset_weight = float(max_single_asset_weight)
+        self.score_std_coef = float(score_std_coef)
+        self.score_dd_coef = float(score_dd_coef)
+        self.score_stitched_blend = float(score_stitched_blend)
+        self.best_selection_score = -np.inf
         self.best_mean_nav = -np.inf
         self._nav_timesteps: list[int] = []
         self._mean_ending_nav: list[float] = []
+        self._robust_scores: list[float] = []
+        self._std_ending_nav: list[float] = []
+        self._mean_max_dd_nav: list[float] = []
+        self._mean_max_dd_frac: list[float] = []
+        self._mean_excess_nav: list[float] = []
+        self._stitched_agent_nav: list[float] = []
+        self._stitched_excess_nav: list[float] = []
+        self._stitched_max_dd_frac: list[float] = []
         self._train_vec_env = train_vec_env
         self.patience = int(patience)
         self.curriculum_end_step = int(curriculum_end_step)
@@ -231,12 +261,12 @@ class EvalNavBestModelCallback(EvalCallback):
     def _best_model_gate_open(self) -> bool:
         return self.best_model_min_step <= 0 or self.num_timesteps >= self.best_model_min_step
 
-    def _post_gate_best_nav(self) -> float:
+    def _post_gate_best_score(self) -> float:
         if self.best_model_min_step <= 0:
-            return self.best_mean_nav
+            return self.best_selection_score
         post = [
-            n
-            for t, n in zip(self._nav_timesteps, self._mean_ending_nav)
+            s
+            for t, s in zip(self._nav_timesteps, self._robust_scores)
             if t >= self.best_model_min_step
         ]
         return float(max(post)) if post else -np.inf
@@ -248,14 +278,35 @@ class EvalNavBestModelCallback(EvalCallback):
             z = np.load(self.nav_history_path, allow_pickle=False)
             self._nav_timesteps = list(np.asarray(z["timesteps"], dtype=np.int64))
             self._mean_ending_nav = list(np.asarray(z["mean_ending_nav"], dtype=np.float64))
-            if self._mean_ending_nav:
+            if "robust_scores" in z:
+                self._robust_scores = list(np.asarray(z["robust_scores"], dtype=np.float64))
+            elif self._mean_ending_nav:
+                self._robust_scores = list(self._mean_ending_nav)
+            if "std_ending_nav" in z:
+                self._std_ending_nav = list(np.asarray(z["std_ending_nav"], dtype=np.float64))
+            if "mean_max_drawdown_nav" in z:
+                self._mean_max_dd_nav = list(np.asarray(z["mean_max_drawdown_nav"], dtype=np.float64))
+            if "mean_max_drawdown_frac" in z:
+                self._mean_max_dd_frac = list(np.asarray(z["mean_max_drawdown_frac"], dtype=np.float64))
+            for key, attr in (
+                ("mean_excess_nav", "_mean_excess_nav"),
+                ("stitched_agent_nav", "_stitched_agent_nav"),
+                ("stitched_excess_nav", "_stitched_excess_nav"),
+                ("stitched_max_drawdown_frac", "_stitched_max_dd_frac"),
+            ):
+                if key in z:
+                    setattr(self, attr, list(np.asarray(z[key], dtype=np.float64)))
+            if self._robust_scores:
                 if self.best_model_min_step > 0:
-                    self.best_mean_nav = self._post_gate_best_nav()
+                    self.best_selection_score = self._post_gate_best_score()
                     self._post_gate_tracking_started = any(
                         t >= self.best_model_min_step for t in self._nav_timesteps
                     )
                 else:
-                    self.best_mean_nav = float(max(self._mean_ending_nav))
+                    self.best_selection_score = float(max(self._robust_scores))
+                if self._mean_ending_nav:
+                    j = int(np.argmax(self._robust_scores))
+                    self.best_mean_nav = float(self._mean_ending_nav[j])
         except (OSError, ValueError, KeyError):
             pass
 
@@ -265,52 +316,134 @@ class EvalNavBestModelCallback(EvalCallback):
             self.nav_history_path,
             timesteps=np.asarray(self._nav_timesteps, dtype=np.int64),
             mean_ending_nav=np.asarray(self._mean_ending_nav, dtype=np.float64),
+            robust_scores=np.asarray(self._robust_scores, dtype=np.float64),
+            std_ending_nav=np.asarray(self._std_ending_nav, dtype=np.float64),
+            mean_max_drawdown_nav=np.asarray(self._mean_max_dd_nav, dtype=np.float64),
+            mean_max_drawdown_frac=np.asarray(self._mean_max_dd_frac, dtype=np.float64),
+            mean_excess_nav=np.asarray(self._mean_excess_nav, dtype=np.float64),
+            stitched_agent_nav=np.asarray(self._stitched_agent_nav, dtype=np.float64),
+            stitched_excess_nav=np.asarray(self._stitched_excess_nav, dtype=np.float64),
+            stitched_max_drawdown_frac=np.asarray(self._stitched_max_dd_frac, dtype=np.float64),
+        )
+
+    def _collect_eval_episodes(self) -> list[dict]:
+        episodes: list[dict] = []
+        for batch in self.eval_env.env_method("pop_eval_episodes"):
+            episodes.extend(batch)
+        return episodes
+
+    def _log_portfolio_diagnostics(self, episodes: list[dict], metrics: dict) -> None:
+        diag = aggregate_eval_portfolio_diagnostics(
+            episodes,
+            tickers=self.panel_tickers,
+            max_single_asset_weight=self.max_single_asset_weight,
+            benchmark_ctx=self.benchmark_ctx,
+        )
+        panel = diag.get("portfolio") or {}
+        if panel:
+            self.logger.record("eval/mean_cash_frac", panel.get("mean_cash_frac", 0.0))
+            self.logger.record("eval/mean_gross_exposure", panel.get("mean_gross_exposure", 0.0))
+            self.logger.record(
+                "eval/mean_effective_n_assets", panel.get("mean_effective_n_assets", 0.0)
+            )
+            self.logger.record(
+                "eval/mean_top3_concentration", panel.get("mean_top3_concentration", 0.0)
+            )
+            self.logger.record("eval/mean_turnover", panel.get("mean_turnover", 0.0))
+            self.logger.record("eval/cap_hit_fraction", panel.get("cap_hit_fraction", 0.0))
+        append_eval_diagnostics_jsonl(
+            self.eval_diagnostics_path,
+            {
+                "timestep": int(self.num_timesteps),
+                "score": metrics,
+                "portfolio": panel,
+                "segments": diag.get("segments", []),
+                "stitched": diag.get("stitched", {}),
+            },
         )
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
             if self._train_vec_env is not None:
                 sync_vecnormalize_stats(self._train_vec_env, self.eval_env)
-            self.eval_env.env_method("pop_ending_navs")
+            self.eval_env.env_method("pop_eval_episodes")
 
         continue_training = super()._on_step()
 
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            all_navs: list[float] = []
-            for nav_list in self.eval_env.env_method("pop_ending_navs"):
-                all_navs.extend(nav_list)
-            if all_navs:
-                mean_nav = float(np.mean(all_navs))
+            episodes = self._collect_eval_episodes()
+            if episodes:
+                metrics = compute_robust_eval_score(
+                    episodes,
+                    std_coef=self.score_std_coef,
+                    dd_coef=self.score_dd_coef,
+                    stitched_blend=self.score_stitched_blend,
+                    benchmark_ctx=self.benchmark_ctx,
+                )
+                score = float(metrics["score"])
+                mean_nav = float(metrics["mean_ending_nav"])
                 self._nav_timesteps.append(int(self.num_timesteps))
                 self._mean_ending_nav.append(mean_nav)
+                self._robust_scores.append(score)
+                self._std_ending_nav.append(float(metrics["std_ending_nav"]))
+                self._mean_max_dd_nav.append(float(metrics["p75_max_drawdown_nav"]))
+                self._mean_max_dd_frac.append(float(metrics["p75_max_drawdown_frac"]))
+                self._mean_excess_nav.append(float(metrics["mean_excess_nav"]))
+                self._stitched_agent_nav.append(float(metrics.get("stitched_agent_nav", mean_nav)))
+                self._stitched_excess_nav.append(float(metrics.get("stitched_excess_nav", 0.0)))
+                self._stitched_max_dd_frac.append(
+                    float(metrics.get("stitched_max_drawdown_frac", metrics["p75_max_drawdown_frac"]))
+                )
                 self._save_nav_history()
                 self.logger.record("eval/mean_ending_nav", mean_nav)
+                self.logger.record("eval/mean_excess_nav", metrics["mean_excess_nav"])
+                self.logger.record("eval/std_excess_nav", metrics["std_excess_nav"])
+                self.logger.record("eval/robust_score", score)
+                self.logger.record(
+                    "eval/p75_max_drawdown_nav", metrics["p75_max_drawdown_nav"]
+                )
+                self.logger.record(
+                    "eval/p75_max_drawdown_pct",
+                    100.0 * float(metrics["p75_max_drawdown_frac"]),
+                )
+                if "stitched_agent_nav" in metrics:
+                    self.logger.record("eval/stitched_agent_nav", metrics["stitched_agent_nav"])
+                    self.logger.record("eval/stitched_excess_nav", metrics["stitched_excess_nav"])
+                    self.logger.record(
+                        "eval/stitched_max_drawdown_pct",
+                        100.0 * float(metrics["stitched_max_drawdown_frac"]),
+                    )
+                self._log_portfolio_diagnostics(episodes, metrics)
                 gate_open = self._best_model_gate_open()
                 self.logger.record("eval/best_model_gate_open", float(gate_open))
                 if gate_open:
                     if self.best_model_min_step > 0 and not self._post_gate_tracking_started:
                         self._post_gate_tracking_started = True
+                        self.best_selection_score = -np.inf
                         self.best_mean_nav = -np.inf
-                    if mean_nav > self.best_mean_nav:
+                    if score > self.best_selection_score:
+                        self.best_selection_score = score
                         self.best_mean_nav = mean_nav
                         self._evals_since_best = 0
                         if self.verbose >= 1:
-                            print(f"New best mean ending NAV: {mean_nav:,.0f}")
+                            print(
+                                f"New best robust eval score: {score:,.0f} "
+                                f"(mean excess {metrics['mean_excess_nav']:,.0f}, "
+                                f"std {metrics['std_excess_nav']:,.0f}, "
+                                f"p75 max DD {100.0 * metrics['p75_max_drawdown_frac']:.1f}%)"
+                            )
                         self._best_model_dir.mkdir(parents=True, exist_ok=True)
                         self.model.save(str(self._best_model_dir / "best_model"))
                         if self._train_vec_env is not None:
-                            # Pair the checkpoint with the normalization stats it was
-                            # selected under, not whatever exists at end of training.
                             self._train_vec_env.save(
                                 str(self._best_model_dir / "vec_normalize.pkl")
                             )
                     elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
-                        # Patience early-stop, but only after the curriculum has fully released.
                         self._evals_since_best += 1
                         self.logger.record("eval/evals_since_best", self._evals_since_best)
                         if self._evals_since_best >= self.patience:
                             self.early_stop_reason = (
-                                f"no new best mean ending NAV for {self.patience} evals after "
+                                f"no new best robust eval score for {self.patience} evals after "
                                 f"curriculum (step {self.num_timesteps})"
                             )
                             print(f"[train] early stop: {self.early_stop_reason}")
@@ -353,7 +486,7 @@ class AdaptiveEntropyCallback(BaseCallback):
         early_floor: float = 0.01,
         early_floor_steps: int = 3_000_000,
         min_explore_steps: int = 15_000_000,
-        decay_start_fraction: float = 0.45,
+        decay_start_fraction: float = 0.585,
         warmup_improvements: int = 3,
         eval_log_dir: str = "",
         eval_check_freq: int = 50_000,
@@ -376,7 +509,7 @@ class AdaptiveEntropyCallback(BaseCallback):
     def _sync_eval_improvements(self) -> None:
         """Update improvement count at eval cadence only (no per-step disk I/O)."""
         if self._eval_nav_callback is not None:
-            current_best = float(self._eval_nav_callback.best_mean_nav)
+            current_best = float(self._eval_nav_callback.best_selection_score)
         elif self.eval_log_dir:
             npz = Path(self.eval_log_dir) / "evaluations.npz"
             if not npz.is_file():
@@ -430,8 +563,8 @@ def trade_curriculum_milestones(learn_budget: int) -> tuple[int, int]:
     - **Frictionless** until ``fee_free_until``; **fee ramp** until ``fee_ramp_end``; then DR.
     - **Churn** penalty scale ramps ``churn_ramp_floor`` → 1.0 over the same fee-ramp window.
 
-    At ≤65M budget: fraction-of-run schedule to avoid a mid-run cliff.
-    Between 65M and 120M: interpolate toward long-run anchors; ≥120M uses fixed long milestones.
+    At ≤ budget_short (50M default): fraction-of-run schedule to avoid a mid-run cliff.
+    Between budget_short and budget_long: interpolate toward long-run anchors; ≥120M uses fixed long milestones.
     """
     cur = get_config().curriculum
     lb = max(1, int(learn_budget))
@@ -509,7 +642,7 @@ class TradingCurriculumCallback(BaseCallback):
     - Steps ``[fee_free_until, fee_ramp_end)``: linear ramp to ``fee_scale = 1.0``.
     - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds (train).
     - Steps ``>= dr_widen_end``: full DR on train (fee in config DR range, lag in {0, 1, 2}).
-    - Churn: ``churn_scale = 0`` before ``fee_free_until``; then ``churn_ramp_floor`` → ``1``
+    - Churn + turnover: ``churn_scale = 0`` before ``fee_free_until``; then ``churn_ramp_floor`` → ``1``
       linearly over the fee-ramp window (train + eval).
     - Eval envs mirror the fee/churn schedule (no domain randomization).
     """
@@ -1081,12 +1214,12 @@ def main() -> None:
     if _es_patience > 0:
         print(
             f"  early_stop: patience={_es_patience} evals after curriculum "
-            f"(else full {args.timesteps:,} timesteps); best_model by eval NAV"
+            f"(else full {args.timesteps:,} timesteps); best_model by robust eval score"
         )
     else:
-        print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by eval NAV)")
+        print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by robust eval score)")
     print(
-        f"  trade bundle: best/ saves model + vec_normalize together on each new best eval NAV; "
+        f"  trade bundle: best/ saves model + vec_normalize together on each new best robust score; "
         f"exit writes final model + end-of-run vec_normalize.pkl"
     )
     print(f"  n_envs={args.n_envs}, n_steps={args.n_steps}, batch={args.batch_size}")
@@ -1106,13 +1239,28 @@ def main() -> None:
         f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
         f"(combined abs cap {cfg.reward.benchmark_combined_abs_cap:g}) "
         f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
-        f"- inactivity - tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g}"
+        f"- inactivity - drawdown_penalty(inc={cfg.reward.drawdown_increase_penalty:g}, "
+        f"lvl={cfg.reward.drawdown_level_penalty:g}@{cfg.reward.drawdown_level_floor:.0%}) "
+        f"- concentration({cfg.reward.concentration_penalty:g}→{cfg.reward.concentration_target_eff_assets:g} eff) "
+        f"- exposure_risk({cfg.reward.exposure_risk_mode}, scale={cfg.reward.exposure_risk_penalty_scale:g}) "
+        f"- tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g} "
+        f"- turnover*{cfg.reward.turnover_penalty:g}*{cfg.reward.reward_scale:g} "
+        f"(both × curriculum_churn_scale×VIX) "
+        f"| cash_yield={cfg.reward.cash_daily_yield:g}/day"
     )
     print(
         f"  eval inactivity scale: {cfg.reward.eval_inactivity_penalty_scale} "
         f"(train=1.0)"
     )
-    print(f"  eval plot: mean ending NAV → Runs/<id>/eval_logs/eval_nav_history.npz")
+    print(
+        f"  eval selection ({cfg.training.best_model_benchmark}): "
+        f"{1.0 - cfg.training.best_model_score_stitched_blend:g}*mean(excess) + "
+        f"{cfg.training.best_model_score_stitched_blend:g}*stitched_excess "
+        f"- {cfg.training.best_model_score_std_coef:g}*std(excess) "
+        f"- {cfg.training.best_model_score_dd_coef:g}*p75(max_dd_nav)"
+    )
+    print(f"  eval plot: mean ending NAV + robust score → Runs/<id>/eval_logs/eval_nav_history.npz")
+    print(f"  eval portfolio diagnostics → Runs/<id>/eval_logs/eval_portfolio_diagnostics.jsonl")
     print(
         f"  action: softmax(cash+{n_assets} assets), long-only risky weights, "
         f"soft cap per asset (config)"
@@ -1137,11 +1285,11 @@ def main() -> None:
     _bms = resolve_best_model_min_step(args.timesteps)
     if _bms > 0:
         print(
-            f"  best_model gate: eval NAV logged always; models/best/ updates from step "
+            f"  best_model gate: eval logged always; models/best/ updates from step "
             f"{_bms:,} (fee_ramp_end; full eval fees + churn)"
         )
     else:
-        print("  best_model gate: off (eval NAV selects best from step 0)")
+        print("  best_model gate: off (robust eval score selects best from step 0)")
     print(
         f"  entropy: explore {ent_cfg.explore_ent} (floor 0.02 until {_edl:,} steps, "
         f"then 0.01 for {_ef:,}) → cosine decay to {ent_cfg.final_ent} from "
@@ -1367,6 +1515,14 @@ def main() -> None:
     curriculum_end_step = dr_widen_end_milestone(args.timesteps)
     early_stop_patience = int(tr_cfg.early_stop_patience)
     best_model_min_step = resolve_best_model_min_step(args.timesteps)
+    eval_benchmark_ctx = EvalBenchmarkContext(
+        ohlcv=eval_pack.ohlcv,
+        idx=eval_pack.idx,
+        tickers=list(panel_tickers),
+        asset_live=eval_pack.asset_live,
+        mode=str(tr_cfg.best_model_benchmark),
+        fee_scale=1.0,
+    )
     eval_callback = EvalNavBestModelCallback(
         eval_env,
         nav_history_path=paths.eval_nav_history,
@@ -1375,6 +1531,13 @@ def main() -> None:
         patience=early_stop_patience,
         curriculum_end_step=curriculum_end_step,
         best_model_min_step=best_model_min_step,
+        panel_tickers=panel_tickers,
+        max_single_asset_weight=cfg.environment.max_single_asset_weight,
+        eval_diagnostics_path=paths.eval_portfolio_diagnostics_jsonl,
+        benchmark_ctx=eval_benchmark_ctx,
+        score_std_coef=tr_cfg.best_model_score_std_coef,
+        score_dd_coef=tr_cfg.best_model_score_dd_coef,
+        score_stitched_blend=tr_cfg.best_model_score_stitched_blend,
         log_path=str(paths.eval_log_dir),
         eval_freq=eval_freq,
         n_eval_episodes=n_validation_blocks,
@@ -1466,12 +1629,14 @@ def main() -> None:
         if np.isfinite(eval_callback.best_mean_nav)
         else None
     )
+    best_eval_score = (
+        float(eval_callback.best_selection_score)
+        if np.isfinite(eval_callback.best_selection_score)
+        else None
+    )
     best_eval_step = None
-    if eval_callback._mean_ending_nav and eval_callback._nav_timesteps:
-        # Only consider post-gate evals: pre-gate NAVs run at reduced fees/churn and
-        # never wrote best_model.zip, so the argmax over the full history would point
-        # at an eval that does not correspond to the saved best checkpoint.
-        navs_arr = np.asarray(eval_callback._mean_ending_nav, dtype=np.float64)
+    if eval_callback._robust_scores and eval_callback._nav_timesteps:
+        navs_arr = np.asarray(eval_callback._robust_scores, dtype=np.float64)
         steps_arr = np.asarray(eval_callback._nav_timesteps, dtype=np.int64)
         n = min(len(navs_arr), len(steps_arr))
         navs_arr, steps_arr = navs_arr[:n], steps_arr[:n]
@@ -1501,6 +1666,7 @@ def main() -> None:
             "total_params": total_params,
             "trainable_params": trainable_params,
             "best_eval_nav": best_eval_nav,
+            "best_eval_score": best_eval_score,
             "best_eval_step": best_eval_step,
             "early_stop_reason": early_stop_reason,
             **provenance,
@@ -1515,6 +1681,7 @@ def main() -> None:
                 "monitor_logs": str(paths.logs_dir),
                 "eval_npz": str(paths.eval_npz),
                 "eval_nav_history": str(paths.eval_nav_history),
+                "eval_portfolio_diagnostics": str(paths.eval_portfolio_diagnostics_jsonl),
             },
         },
     )
@@ -1528,6 +1695,7 @@ def main() -> None:
             "total_params": total_params,
             "trainable_params": trainable_params,
             "best_eval_nav": best_eval_nav,
+            "best_eval_score": best_eval_score,
             "best_eval_step": best_eval_step,
             "early_stop_reason": early_stop_reason,
             "n_train_bars": int(len(train_idx)),

@@ -19,7 +19,11 @@ REWARD_TERMS = (
     "inactivity",
     "participation",
     "churn",
+    "turnover",
     "drawdown",
+    "drawdown_penalty",
+    "concentration",
+    "exposure_risk",
 )
 
 

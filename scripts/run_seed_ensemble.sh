@@ -16,7 +16,7 @@ usage() {
   echo "Usage: $0 --cohort PREFIX [--seeds \"42 101 ...\"] -- [train.py flags]"
   echo "  Example:"
   echo "    $0 --cohort wf3 -- --train-end 2019-12-31 --holdout-start 2020-01-01 \\"
-  echo "      --holdout-end 2021-06-30 --until 2021-06-30 --timesteps 65000000"
+  echo "      --holdout-end 2021-06-30 --until 2021-06-30 --timesteps 50000000"
   exit 1
 }
 

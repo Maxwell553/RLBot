@@ -88,7 +88,7 @@ Both prior reviews praised the honest "validation cliff" disclosure in RESEARCH.
 - `set_config` / `get_config` global singleton (tests use autouse session fixture in `conftest.py`).
 - Every run writes `Runs/<run_id>/config.yaml` (full effective dict) + rich `manifest.json` (universe metadata, exact calendar flags, bar counts, artifact paths, finished_at, params counts).
 - Observation dim is derived: `observation_dim_for_universe(n_assets) = 10*n + 8 + 5*4` (per-asset market features + live mask + portfolio state + 4 macros × 5 derived). Matches `noisy_market_feature_count` + live + port + meta in env.
-- Curriculum and entropy schedules expressed as fractions of budget (short vs long anchors) so the same YAML works for 65M and 120M runs.
+- Curriculum and entropy schedules expressed as fractions of budget (short vs long anchors) so the same YAML works for 50M and 120M runs.
 
 **Strength:** Changing reward/cost/DR without a new run-id is obviously wrong because the snapshot + manifest + VecNormalize + model obs layout are bound together. The two-pass argparse in train.py ensures `--config` / `--n-assets` are applied before other defaults.
 
@@ -144,7 +144,7 @@ This is best-in-class for this style of research. The prior reviews were correct
 - Callbacks (in priority order):
   1. `TradingCurriculumCallback`: fee-free → linear fee ramp → churn ramp (0→1) → progressive DR bound widening. Milestones are fractions of budget so they scale.
   2. `EvalNavBestModelCallback` (subclasses SB3 EvalCallback): runs deterministic full-segment rollouts on the eval env pack; saves `best/best_model` (and copies VecNormalize) on *max mean ending NAV* across the episodes of that eval cycle. Persists `eval_nav_history.npz`. Syncs obs_rms from train before eval. Does *not* stop training.
-  3. `AdaptiveEntropyCallback`: mandatory cosine decay from explore_ent → final_ent starting at `decay_start_fraction` (0.45, after fee ramp); floors early in run; *not* gated on eval improvement (the improvement counter is advisory only).
+  3. `AdaptiveEntropyCallback`: mandatory cosine decay from explore_ent → final_ent starting at `decay_start_fraction` (0.585, after fee ramp); floors early in run; *not* gated on eval improvement (the improvement counter is advisory only).
   4. `CheckpointCallback` (every 1M steps).
   5. `TrainingVizCallback` (periodic PNG of training curves + eval NAV history).
 - LR cosine to floor. n_epochs=3, batch sized so ~12 backprop passes per PPO pause on the  n_steps*n_envs rollout.
@@ -196,7 +196,7 @@ This is production-grade research infrastructure for the problem size.
 
 3. **OOS statistics and checkpoint rule still thin in the published record (Design 3.3/3.4).** RESEARCH.md tables and the walk-forward registry emphasize single best-of-{final,best} deterministic paths. Stronger tools (`--stochastic-paths`, block bootstrap in detailed mode, seed ensemble script) exist but are not the default reported numbers. No pre-registered "we will always publish X from the best checkpoint" rule that is enforced by the harness.
 
-4. **No automated early stopping.** Full 65M budget is burned even after the documented cliff. Risk of shipping the worse final checkpoint if the manual step is forgotten. The callback already tracks history; adding patience (e.g. after curriculum complete + K evals with no new best) is low-cost and high-signal.
+4. **Early stopping (default on).** Default `early_stop_patience: 8` stops after 8 evals with no new best once the curriculum completes (`0` disables). Still worth monitoring whether DR ends at budget cap.
 
 ### 4.2 Architectural & Coupling
 
@@ -247,7 +247,7 @@ The pattern can also drive literature synthesis, plot generation, RESEARCH.md up
 - Tests for the exact invariants (segments, bootstrap, fracdiff, weights) can be part of the "accept a proposed change" gate.
 
 **Challenges and required constraints (non-negotiable):**
-- Wall time and cost: 65M-step runs are hours on H100 even with 64 envs. Auto loops must support cheap proxy signals (short timesteps for reward-shape ablations, curriculum-fraction runs, or even frozen-policy rollouts on eval packs) + human approval gates for full-budget runs.
+- Wall time and cost: 50M-step runs are hours on H100 even with 64 envs. Auto loops must support cheap proxy signals (short timesteps for reward-shape ablations, curriculum-fraction runs, or even frozen-policy rollouts on eval packs) + human approval gates for full-budget runs.
 - Narrow/noisy validation signal: any auto "improvement" detector will overfit to the current estimator unless the estimator itself is improved first (see §4.1). The agent should be able to propose *changes to the eval harness* as first-class experiments.
 - Leakage surface: the agent must never be allowed to pass precomputed features across splits, touch holdout dates, or reuse old VecNormalize across obs_dim changes. The safest pattern is "agent proposes patch + hypothesis + short justification; human (or stronger verifier) approves; harness launches with fresh run-id and the canonical train/backtest CLIs only."
 - Non-determinism: even with seeds, reseed_on_reset + DR means "identical" runs differ. The harness must treat single-run deltas as noisy; prefer seed ensembles or at least report variance.
@@ -307,7 +307,7 @@ Secondary benefits: faster filling of RESEARCH.md tables, automatic generation o
 
 8. **Ablation and sensitivity tooling.** Toggle individual reward terms, curriculum phases, DR bounds, etc., via CLI or patch, with automated comparison to a baseline run on the same window. Make claims like "the churn term helped Window 2 participation" falsifiable with numbers.
 
-9. **Reproducibility story.** Add a `--reproducible` mode that derives per-env seed streams from the master seed (so same-seed runs are bit-identical when desired) while keeping the diversity mode the default. Add a lock file (uv/pip-tools) or a documented Docker image for the 65M-step regime.
+9. **Reproducibility story.** Add a `--reproducible` mode that derives per-env seed streams from the master seed (so same-seed runs are bit-identical when desired) while keeping the diversity mode the default. Add a lock file (uv/pip-tools) or a documented Docker image for the 50M-step regime.
 
 ### Longer-term / strategic
 
