@@ -4,7 +4,7 @@
 
 **Default:** tradeable count **N** is the number of entries under `universe.assets` in `config/config.yaml`.
 
-**CLI shortcut:** `scripts/train.py --n-assets N` uses the **first N keys** from that block (YAML order), slices `benchmark_cap_weights` and `transaction_costs.*`, and renormalizes cap weights. You cannot set **N** larger than the number of keys in the file — add symbols to the YAML first. The benchmark label (`universe.benchmark`, usually `SP500`) must stay among those first N keys (it is first in the default config).
+**CLI shortcut:** `scripts/train.py --n-assets N` uses the **first N keys** from that block (YAML order), slices `benchmark_cap_weights` and `transaction_costs.*`, and renormalizes cap weights. You cannot set **N** larger than the number of keys in the file — add symbols to the YAML first. The benchmark label (`universe.benchmark`, usually `SP500`) is used for benchmark-only/SPY and 60/40 reporting, but the reward/eval benchmark is now driven by `reward.benchmark_cap_weights` and `training.best_model_benchmark`.
 
 **Cache rule when changing N:** Training always writes the **effective** sliced panel to `Runs/<run_id>/data_cache.npz` (width **N**). The global `.cache/data_cache.npz` may still be wider until you refresh. After changing `--n-assets` or editing `universe.assets`, run **`--refresh-data`** before the next study so the global cache, config lists, and panel width stay aligned. Backtest loads the run-local snapshot by default and will error if manifest `n_assets` ≠ cache width.
 
@@ -13,7 +13,7 @@ To change **which** assets are in the panel (not just how many), edit the YAML a
 ```yaml
 # config/config.yaml — full list; --n-assets 7 keeps SP500 … BOND10Y
 universe:
-  benchmark: SP500   # must be one of the keys in assets
+  benchmark: SP500   # reporting sleeve for benchmark-only B&H / 60-40, not the reward benchmark
   assets:
     SP500: SPY
     GOLD: GLD
@@ -61,7 +61,7 @@ Kill active `scripts/train.py` processes so checkpoints are not written mid-step
 
 - Set `universe.assets` to your target **N** labels (5–55).
 - Align `benchmark_cap_weights` and all `transaction_costs.*` lists to **N** values in the **same key order**.
-- Keep `universe.benchmark` as one of the asset keys (typically `SP500`).
+- Keep `universe.benchmark` as one of the asset keys if you want benchmark-only/SPY and 60/40 diagnostics. It does **not** define the reward or robust eval benchmark.
 
 ### 3. Refresh the data cache
 
@@ -105,7 +105,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and **requires** `models/best/vec_normalize.pkl` paired with `best_model.zip` (pass `--allow-missing-vec-normalize` only for debugging). Results land in `Runs/<id>/backtest_summary.json`.
 
-**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when the **robust eval score** improves **after `fee_ramp_end`** (50/50 blend of segment-mean excess and **stitched** excess vs equal-weight daily passive book, minus dispersion and p75 drawdown). Eval metrics are logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
+**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when the **robust eval score** improves **after `fee_ramp_end`** (50/50 blend of segment-mean excess and **stitched** excess vs equal-weight daily passive book, minus dispersion and p75 drawdown). Stitched metrics remain in `eval_nav_history.npz` / TensorBoard; the **training plot** shows robust score on its own panel (not overlaid on NAV). Eval metrics are logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
 
 ### 6. Target-weight inference (optional)
 
@@ -121,7 +121,7 @@ Writes audited JSON (executed target weights after action smoothing, live mask, 
 
 ## Walk-forward windows
 
-Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. **No OOS results are published yet** under the current pipeline — backtest only after a fresh run under the current `config/config.yaml` completes; record numbers in RESEARCH.md with the actual `<RUN_ID>`.
+Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. Published OOS cohorts **`W*_612`**, **`W*_613`**, and **`W*_614`** are recorded in [RESEARCH.md](RESEARCH.md#current-published-cohorts); backtest new runs with the commands below and copy durable headline metrics into that doc.
 
 ```bash
 python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2>,<RUN_ID_3> --checkpoint best
@@ -156,7 +156,7 @@ Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 | `config.yaml` | Snapshot of training config |
 | `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
 | `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair) |
-| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (return, benchmark, sortino, participation, inactivity, churn, drawdown amp, drawdown penalty, concentration) |
+| `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (return, benchmark, sortino, participation, inactivity, churn, turnover, drawdown amp, drawdown penalty, concentration, exposure risk) |
 | `backtest_summary.json` | OOS metrics, `portfolio_diagnostics` (cash, gross exposure, HHI, eff-N, cap hits, turnover, per-asset weights), config/data hashes |
 | `training_summary.json` | Training-end summary (after train completes) |
 

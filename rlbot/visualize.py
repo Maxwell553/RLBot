@@ -83,8 +83,6 @@ def plot_training_progress(
     eval_std_navs: Optional[np.ndarray] = None,
     eval_robust_scores: Optional[np.ndarray] = None,
     eval_mean_max_dd_pct: Optional[np.ndarray] = None,
-    eval_stitched_agent_nav: Optional[np.ndarray] = None,
-    eval_stitched_excess_nav: Optional[np.ndarray] = None,
     episode_navs: Optional[Sequence[float]] = None,
     episode_nav_ts: Optional[Sequence[int]] = None,
     episode_lengths: Optional[Sequence[int]] = None,
@@ -92,26 +90,41 @@ def plot_training_progress(
     title: str = "RL portfolio training",
     save_path: str | Path = "plots/training.png",
 ) -> Path:
-    """Episode rewards + eval NAV/score/drawdown + training episode-end NAV ($).
+    """Episode rewards + eval NAV/drawdown + robust score + training episode-end NAV ($).
 
-    Top panel: per-step training reward. Middle: eval mean ending NAV (green),
-    ±1σ band, robust score (dashed), p75 max drawdown (%) on secondary axis,
-    stitched validation NAV (compounded eval blocks). Bottom: training NAV.
+    Panels (top → bottom): per-step training reward; eval mean ending NAV (green) with
+    ±1σ band and p75 max drawdown (%) on secondary axis; robust eval score (own panel
+    when present); episode-end training NAV.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     has_nav = episode_navs is not None and len(episode_navs) > 0
-    n_panels = 3 if has_nav else 2
+    has_eval = (
+        eval_timesteps is not None
+        and eval_ending_navs is not None
+        and len(eval_ending_navs) > 0
+    )
+    has_robust = (
+        has_eval
+        and eval_robust_scores is not None
+        and len(eval_robust_scores) == len(eval_ending_navs)
+    )
+    n_panels = 1 + (1 if has_eval else 0) + (1 if has_robust else 0) + (1 if has_nav else 0)
 
     fig, axes = plt.subplots(
-        n_panels, 1, figsize=(11, 3.5 * n_panels),
+        n_panels, 1, figsize=(11, 3.2 * n_panels),
         sharex=False, constrained_layout=True,
     )
+    if n_panels == 1:
+        axes = [axes]
     fig.suptitle(title, fontsize=13)
 
-    # ── Panel 0: Training per-step reward ────────────────────────────
-    ax0 = axes[0]
+    panel = 0
+
+    # ── Panel: Training per-step reward ──────────────────────────────
+    ax0 = axes[panel]
+    panel += 1
     if episode_timesteps and episode_rewards:
         ts = np.asarray(episode_timesteps, dtype=np.int64)
         rew = np.asarray(episode_rewards, dtype=np.float64)
@@ -133,9 +146,10 @@ def plot_training_progress(
     ax0.set_title("Training episodes — per-step avg reward")
     ax0.grid(True, alpha=0.25)
 
-    # ── Panel 1: Eval NAV, robust score, dispersion, drawdown ───────────
-    ax1 = axes[1]
-    if eval_timesteps is not None and eval_ending_navs is not None and len(eval_ending_navs) > 0:
+    # ── Panel: Eval mean NAV + dispersion + drawdown ─────────────────
+    if has_eval:
+        ax1 = axes[panel]
+        panel += 1
         ts = np.asarray(eval_timesteps, dtype=np.int64)
         nav = np.asarray(eval_ending_navs, dtype=np.float64)
         ax1.plot(
@@ -159,44 +173,8 @@ def plot_training_progress(
                 label="mean NAV ± std",
                 zorder=1,
             )
-        if eval_robust_scores is not None and len(eval_robust_scores) == len(nav):
-            ax1.plot(
-                ts,
-                np.asarray(eval_robust_scores, dtype=np.float64),
-                color="#1a4d1a",
-                ls="--",
-                lw=1.8,
-                marker=".",
-                ms=4,
-                label="robust score",
-                zorder=4,
-            )
-        if eval_stitched_agent_nav is not None and len(eval_stitched_agent_nav) == len(nav):
-            ax1.plot(
-                ts,
-                np.asarray(eval_stitched_agent_nav, dtype=np.float64),
-                color="#ff7f0e",
-                ls="-",
-                lw=1.5,
-                marker="s",
-                ms=2.5,
-                alpha=0.9,
-                label="stitched validation NAV",
-                zorder=3,
-            )
-        if eval_stitched_excess_nav is not None and len(eval_stitched_excess_nav) == len(nav):
-            ax1.plot(
-                ts,
-                100_000.0 + np.asarray(eval_stitched_excess_nav, dtype=np.float64),
-                color="#9467bd",
-                ls=":",
-                lw=1.3,
-                alpha=0.85,
-                label="stitched bench + excess",
-                zorder=2,
-            )
         ax1.axhline(100_000, color="gray", ls=":", lw=0.8, alpha=0.6, label="$100k start")
-        ax1.set_ylabel("Portfolio value / score ($)")
+        ax1.set_ylabel("Portfolio value ($)")
         ax1.yaxis.set_major_formatter(_dollar_formatter())
         if eval_mean_max_dd_pct is not None and len(eval_mean_max_dd_pct) == len(nav):
             ax1_dd = ax1.twinx()
@@ -221,16 +199,40 @@ def plot_training_progress(
             ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
         else:
             ax1.legend(loc="upper left", fontsize=8)
-    else:
-        ax1.text(0.5, 0.5, "No eval checkpoints yet", ha="center", va="center", transform=ax1.transAxes)
-    ax1.set_xlabel("timesteps")
-    ax1.xaxis.set_major_formatter(_timestep_formatter())
-    ax1.set_title("Periodic evaluation — NAV, robust score, dispersion, drawdown")
-    ax1.grid(True, alpha=0.25)
+        ax1.set_xlabel("timesteps")
+        ax1.xaxis.set_major_formatter(_timestep_formatter())
+        ax1.set_title("Periodic evaluation — mean NAV, dispersion, drawdown")
+        ax1.grid(True, alpha=0.25)
 
-    # ── Panel 2: Episode-end NAV in dollars ──────────────────────────
+    # ── Panel: Robust eval score (selection metric) ──────────────────
+    if has_robust:
+        ax_score = axes[panel]
+        panel += 1
+        ts = np.asarray(eval_timesteps, dtype=np.int64)
+        score = np.asarray(eval_robust_scores, dtype=np.float64)
+        ax_score.plot(
+            ts,
+            score,
+            color="#1a4d1a",
+            ls="-",
+            lw=2.0,
+            marker="o",
+            ms=3,
+            label="robust score",
+            zorder=3,
+        )
+        ax_score.axhline(0.0, color="gray", ls=":", lw=0.8, alpha=0.6)
+        ax_score.set_ylabel("Robust score ($)")
+        ax_score.yaxis.set_major_formatter(_k_formatter())
+        ax_score.set_xlabel("timesteps")
+        ax_score.xaxis.set_major_formatter(_timestep_formatter())
+        ax_score.set_title("Periodic evaluation — robust score (checkpoint selection)")
+        ax_score.legend(loc="upper left", fontsize=8)
+        ax_score.grid(True, alpha=0.25)
+
+    # ── Panel: Episode-end NAV in dollars ────────────────────────────
     if has_nav:
-        ax2 = axes[2]
+        ax2 = axes[panel]
         nav_arr = np.asarray(episode_navs, dtype=np.float64)
         nav_ts = np.asarray(episode_nav_ts if episode_nav_ts is not None else episode_timesteps[:len(nav_arr)], dtype=np.int64)
         ax2.scatter(nav_ts, nav_arr, s=8, alpha=0.35, c="#9467bd", label="episode-end NAV")
@@ -626,8 +628,6 @@ def regenerate_training_plot(run_dir: str | Path, *, title: str | None = None) -
         eval_std_navs=hist.get("std_ending_nav"),
         eval_robust_scores=hist.get("robust_scores"),
         eval_mean_max_dd_pct=hist.get("mean_max_drawdown_pct"),
-        eval_stitched_agent_nav=hist.get("stitched_agent_nav"),
-        eval_stitched_excess_nav=hist.get("stitched_excess_nav"),
         episode_navs=ep_nav,
         episode_nav_ts=ep_nav_ts,
         episode_lengths=ep_len if ep_len else None,
@@ -639,8 +639,8 @@ def regenerate_training_plot(run_dir: str | Path, *, title: str | None = None) -
 class TrainingVizCallback(BaseCallback):
     """
     Collect Monitor episode stats during PPO rollouts and refresh a PNG on a fixed step cadence.
-    Middle panel reads ``eval_nav_history.npz`` (mean ending NAV, ±std band, robust score,
-    p75 max drawdown (%) on secondary axis).
+    Middle panel: eval mean ending NAV (±std, p75 drawdown). When present, robust score
+    gets its own panel below eval NAV.
     Also tracks episode-end portfolio NAV for the bottom training panel.
 
     Episode series are persisted next to the PNG (``training_episodes.npz``) so the training
@@ -740,8 +740,6 @@ class TrainingVizCallback(BaseCallback):
             ev_std = hist.get("std_ending_nav")
             ev_score = hist.get("robust_scores")
             ev_dd_pct = hist.get("mean_max_drawdown_pct")
-            ev_stitched = hist.get("stitched_agent_nav")
-            ev_stitched_ex = hist.get("stitched_excess_nav")
         plot_training_progress(
             self._episode_ts,
             self._episode_rewards,
@@ -750,8 +748,6 @@ class TrainingVizCallback(BaseCallback):
             eval_std_navs=ev_std,
             eval_robust_scores=ev_score,
             eval_mean_max_dd_pct=ev_dd_pct,
-            eval_stitched_agent_nav=ev_stitched,
-            eval_stitched_excess_nav=ev_stitched_ex,
             episode_navs=self._episode_navs if self._episode_navs else None,
             episode_nav_ts=self._episode_nav_ts if self._episode_nav_ts else None,
             episode_lengths=self._episode_lengths if self._episode_lengths else None,

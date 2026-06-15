@@ -1,6 +1,8 @@
-# Configuration
+# Configuration Reference
 
 `config.yaml` is the single source of truth for the **tradeable universe**, environment, reward, transaction costs, curriculum, and PPO defaults. Loaded by `rlbot.rl_config.load_config()`; each training run copies the file to `Runs/<run_id>/config.yaml`.
+
+This file is intentionally a compact field reference. Use [docs/TRAINING.md](../docs/TRAINING.md) for operations/checklists and [../README.md](../README.md) for the full environment and reward explanation.
 
 Override at runtime:
 
@@ -31,23 +33,19 @@ To use **N = 20**, add ten more `LABEL: yfinance_symbol` pairs and extend every 
 
 | Key | Purpose |
 |-----|---------|
-| `benchmark` | Label of the Sortino / SPY buy-and-hold sleeve (must be a key in `assets`) |
+| `benchmark` | Reporting sleeve for benchmark-only buy-and-hold and 60/40 diagnostics (default `SP500`; normally a key in `assets`). It does **not** define reward benchmark excess or robust eval selection. |
 | `assets` | Ordered map `LABEL → yfinance_symbol` (YAML key order = OHLCV axis order) |
 
 ## Per-asset lists (must match N)
 
 | Section | Keys |
 |---------|------|
-| `reward` | `benchmark_cap_weights` |
+| `reward` | `benchmark_cap_weights` (reward/Sortino passive book; sliced and renormalized by `--n-assets`) |
 | `transaction_costs` | `slippage`, `tx_fee`, `annual_holding_cost` |
 
 ## Changing the universe
 
-1. Edit `universe.assets` and all per-asset lists (length **N**, same order).
-2. Run `python scripts/train.py --refresh-data --timesteps 1000 --run-id _data_refresh --no-viz`.
-3. Train with a **new** `--run-id` or `--window` (new `obs_dim = 10N + 28`; new VecNormalize + LSTM weights).
-
-Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
+Edit `universe.assets` and all per-asset lists (length **N**, same order), refresh data, and train under a new run id. Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 
 ## `data` (feature pipeline)
 
@@ -55,18 +53,20 @@ Full checklist: [docs/TRAINING.md](../docs/TRAINING.md).
 |-----|---------|
 | `feature_split_mode` | `independent` (default) or `continuous` — how walk-forward blocks get RSI/MACD/fracdiff/trend/vol features |
 | `feature_purge_warmup` | Bars neutralized at segment starts in `independent` mode (default 25) |
+| `feature_preroll_bars` | Causal warmup bars for independent segment features (default 252) |
 
 ## `reward` (key knobs)
 
 | Key | Purpose |
 |-----|---------|
 | `risk_bonus_scale` | Sortino differential multiplier (default **2.5**) |
-| `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware passive benchmark (`benchmark_cap_weights`; default equal 1/N) |
+| `benchmark_cap_weights` | Passive book used by reward benchmark excess and Sortino diff (default equal 1/N; feasible under the 20% asset cap) |
+| `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware passive book above |
 | `benchmark_combined_abs_cap` | Constant cap on combined \|sortino+benchmark\| per step in reward units (default **24.0**; `0` disables both; never relative to the other terms) |
 | `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 0.35 + 0.15 tail above 90% cash; max ~0.50 at 100% cash) |
 | `participation_bonus` / `participation_reward_scale` | Gross-exposure bonus (default 0.02 × 10) |
 | `turnover_penalty` | Direct `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` (default **0.007**; ramps with churn, off during fee-free) |
-| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **80.0** for realized vol — use **~1–3** if switching to `vix_positive`) |
+| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **90.0** for realized vol — use **~1–3** if switching to `vix_positive`) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
 | `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults 0.75, 3.0, 0.08) |
 | `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (defaults 0.75, 6.0 effective assets) |
