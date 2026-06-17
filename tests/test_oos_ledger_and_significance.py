@@ -99,6 +99,21 @@ def test_success_gates_pass_fail_inconclusive() -> None:
     assert evaluate_success_gates(gates_cfg, [_row(1, 120)])["verdict"] == "inconclusive"
 
 
+def test_success_gates_support_robust_eval_score() -> None:
+    rows = [
+        _row(1, 300, best_eval_score=-20.0),
+        _row(2, 90, best_eval_score=10.0),
+    ]
+    verdict = evaluate_success_gates(
+        {"min_seeds": 2, "eval_score_median_min": -5.0},
+        rows,
+    )
+    assert verdict["verdict"] == "pass"
+    assert verdict["checks"]["eval_score_median_min"]["observed"] == pytest.approx(-5.0)
+    failed = evaluate_success_gates({"eval_score_mean_min": 0.0}, rows)
+    assert failed["verdict"] == "fail"
+
+
 def test_success_gates_oos_keys_need_tier4_evidence() -> None:
     cfg = {"deflated_sharpe_min": 0.95}
     assert evaluate_success_gates(cfg, [_row(1, 120, tier=3)])["verdict"] == "inconclusive"

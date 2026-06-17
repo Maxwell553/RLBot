@@ -212,3 +212,41 @@ def test_holding_cost_on_pre_rebalance_units_at_close_t() -> None:
     # and NOT charged at the rebalance price open[t+1] of step 2
     wrong_cost = u * ohlcv[t0 + 2, 0, 0] * daily
     assert abs((navs["free"] - navs["costly"]) - wrong_cost) > 1e-6
+
+
+# ── (d) agent / benchmark execution alignment (H1) ───────────────────────
+def _multi_asset_prices(t: int = 30, n_assets: int = 4) -> np.ndarray:
+    """Distinct per-asset open/close paths so the friction model is discriminating."""
+    rng = np.random.default_rng(0)
+    ohlcv = np.zeros((t, n_assets, 5), dtype=np.float64)
+    for j in range(n_assets):
+        steps = 1.0 + 0.3 * (j + 1) + rng.normal(0.0, 0.5, size=t)
+        close = 100.0 + np.cumsum(np.abs(steps))
+        open_ = close * (1.0 + 0.001 * (j + 1))  # open != prior close, asset-specific gap
+        ohlcv[:, j, 0] = open_
+        ohlcv[:, j, 1] = np.maximum(open_, close) + 0.5
+        ohlcv[:, j, 2] = np.minimum(open_, close) - 0.5
+        ohlcv[:, j, 3] = close
+        ohlcv[:, j, 4] = 1e6
+    return ohlcv
+
+
+def test_agent_holding_benchmark_weights_has_zero_excess() -> None:
+    """An agent that holds the benchmark weights reproduces the benchmark NAV path, so
+    per-step excess (log_ret - market_ret) is ~0. This is the H1 alignment guarantee:
+    the in-env benchmark uses the same unit-level execution engine as the agent."""
+    n_assets = 4
+    # nonzero, per-asset-asymmetric costs so any model mismatch would surface
+    with _installed_config(n_assets, slippage=0.0008, tx_fee=0.0005, annual_holding=0.01, cap=1.0):
+        ohlcv = _multi_asset_prices(n_assets=n_assets)
+        env = _make_env(ohlcv, obs_lag_default=1)
+        env.reset()
+        # cash logit -60 (softmax floor) + equal risky logits → ~0 cash, equal-weight risky,
+        # which equals the equal benchmark_cap_weights (1/N) restricted to live assets.
+        action = np.concatenate(([-60.0], np.zeros(n_assets)))
+        for _ in range(12):
+            _, _, term, trunc, info = env.step(action)
+            market_ret = env._market_return_buffer[-1]
+            assert abs(info["log_ret"] - market_ret) < 1e-9
+            if term or trunc:
+                break

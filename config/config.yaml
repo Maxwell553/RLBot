@@ -79,7 +79,7 @@ reward:
   # Cut gross exposure when realized vol (or VIX+) is elevated: gross * vol_or_vix * scale
   exposure_risk_mode: realized_vol  # realized_vol | vix_positive
   # realized_vol: ~90 is default. vix_positive needs ~1–3 (NOT 90: VIX 36 + full gross ≈ 36 units)
-  exposure_risk_penalty_scale: 90.0
+  exposure_risk_penalty_scale: 80.0
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
@@ -118,6 +118,8 @@ training:
   block_size: 126
   eval_stride: 4
   eval_n_episodes: 1  # fallback if segment list empty; train.py sets n_eval = #eval blocks
+  eval_freq_steps: 500000          # post fee-ramp eval cadence (global timesteps)
+  eval_freq_pre_gate_steps: 3000000  # pre fee-ramp cadence (best saves gated until ramp end)
   holdout_days: 365
   viz_freq: 500000
   curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)

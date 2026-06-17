@@ -164,6 +164,8 @@ class TrainingConfig:
     viz_freq: int
     curriculum_update_freq: int
     checkpoint_save_freq_steps: int
+    eval_freq_steps: int
+    eval_freq_pre_gate_steps: int
     # When True, training envs use deterministic per-env seed streams (seed + env index)
     # instead of fresh OS entropy per episode reset (reseed_on_reset). Default False keeps
     # the diversity behavior; True makes same-seed runs reproducible.
@@ -559,6 +561,8 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             checkpoint_save_freq_steps=int(
                 _req(tr, "checkpoint_save_freq_steps", "training")
             ),
+            eval_freq_steps=int(tr.get("eval_freq_steps", 500_000)),
+            eval_freq_pre_gate_steps=int(tr.get("eval_freq_pre_gate_steps", 3_000_000)),
             reproducible=bool(tr.get("reproducible", False)),
             early_stop_patience=int(tr.get("early_stop_patience", 0)),
             best_model_score_std_coef=float(tr.get("best_model_score_std_coef", 0.75)),
@@ -678,6 +682,44 @@ def write_config_snapshot(cfg: RLConfig, path: Path | str) -> None:
     p = Path(path)
     with p.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg.to_dict(), f, sort_keys=False, default_flow_style=None)
+
+
+def trade_curriculum_milestones(
+    learn_budget: int,
+    cur: CurriculumConfig | None = None,
+) -> tuple[int, int]:
+    """Return ``(fee_free_until, fee_ramp_end)`` in environment steps."""
+    if cur is None:
+        cur = get_config().curriculum
+    lb = max(1, int(learn_budget))
+    if lb <= cur.budget_short:
+        fee_free = max(1, int(cur.fee_free_fraction * lb))
+        fee_ramp = max(fee_free + 1, int(cur.fee_ramp_fraction * lb))
+        return fee_free, fee_ramp
+    ff_short = max(1, int(cur.fee_free_fraction * cur.budget_short))
+    fr_short = max(ff_short + 1, int(cur.fee_ramp_fraction * cur.budget_short))
+    if lb >= cur.budget_long:
+        return cur.fee_free_long, cur.fee_ramp_end_long
+    t = (lb - cur.budget_short) / (cur.budget_long - cur.budget_short)
+    ff = int(ff_short + t * (cur.fee_free_long - ff_short))
+    fr = int(fr_short + t * (cur.fee_ramp_end_long - fr_short))
+    fee_free = max(1, ff)
+    fee_ramp = max(fee_free + 1, fr)
+    return fee_free, fee_ramp
+
+
+def resolve_best_model_min_step(
+    learn_budget: int,
+    cur: CurriculumConfig | None = None,
+) -> int:
+    """Step before which ``models/best/`` is not updated (``0`` disables the gate)."""
+    if cur is None:
+        cur = get_config().curriculum
+    explicit = cur.best_model_min_step
+    if explicit is not None:
+        return max(0, int(explicit))
+    _, fee_ramp_end = trade_curriculum_milestones(learn_budget, cur=cur)
+    return fee_ramp_end
 
 
 def apply_deterministic_seeds(seed: int) -> None:

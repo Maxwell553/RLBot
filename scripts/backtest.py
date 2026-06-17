@@ -90,7 +90,7 @@ MultiAssetPortfolioEnv = None
 portfolio_weights_from_action = None
 freeze_vec_normalize_for_inference = None
 _DEPS_LOADED = False
-_PANEL_CACHE: tuple | None = None
+_PANEL_CACHE: dict | None = None
 _INFERENCE_POLICY: object | None = None  # RecurrentPPO shell reused across checkpoints in batch
 _INFERENCE_POLICY_KEY: str | None = None
 ROOT = PROJECT_ROOT
@@ -734,6 +734,21 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     _z = (log_rets - float(np.mean(log_rets))) / _sd
     ret_skew = float(np.mean(_z**3)) if log_rets.size >= 3 else float("nan")
     ret_kurt = float(np.mean(_z**4)) if log_rets.size >= 4 else float("nan")
+    prefix = getattr(args, "ensemble_prefix", "") or ""
+    result = BacktestResult(
+        run_id=run_id,
+        model_path=model_path,
+        checkpoint_label=ckpt_label,
+        total_return=total_return,
+        sharpe=sharpe,
+        max_drawdown=_max_drawdown(navs),
+        n_bars=len(test_idx),
+        seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
+        n_rets=int(log_rets.size),
+        ret_skew=ret_skew,
+        ret_kurt=ret_kurt,
+        portfolio_diagnostics=portfolio_diagnostics,
+    )
 
     if not args.no_viz and not getattr(args, "_ensemble_mode", False):
         _bt_log("[backtest] Building plot...")
@@ -757,6 +772,9 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         nav_ew = equal_weight_daily_cost_aware_nav(
             navs, test_ohlcv, start_bar, asset_live=test_live
         )
+        ew_return = float(nav_ew[-1] / max(nav_ew[0], 1e-12) - 1.0)
+        n_trials_plot = _oos_trials_for_args(args, manifest)
+        dsr_plot = _deflated_sharpe_for_result(result, n_trials_plot)
         try:
             nav_6040 = balanced_6040_nav(
                 navs,
@@ -787,6 +805,14 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
             asset_labels=["Cash"] + list(panel_tickers),
             model_label=model_label,
             title="OOS backtest vs benchmarks",
+            metrics={
+                "total_return": result.total_return,
+                "sharpe": result.sharpe,
+                "max_drawdown": result.max_drawdown,
+                "deflated_sharpe": dsr_plot,
+                "oos_trials_for_window": n_trials_plot,
+                "excess_equal_weight": result.total_return - ew_return,
+            },
             save_path=out,
         )
         print(f"Backtest plot: {out}")
@@ -813,21 +839,6 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         )
         _bt_log(f"[backtest] Detailed stats done ({time.perf_counter() - t_det:.1f}s).")
 
-    prefix = getattr(args, "ensemble_prefix", "") or ""
-    result = BacktestResult(
-        run_id=run_id,
-        model_path=model_path,
-        checkpoint_label=ckpt_label,
-        total_return=total_return,
-        sharpe=sharpe,
-        max_drawdown=_max_drawdown(navs),
-        n_bars=len(test_idx),
-        seed_label=_seed_from_run_id(run_id, prefix) if prefix else "",
-        n_rets=int(log_rets.size),
-        ret_skew=ret_skew,
-        ret_kurt=ret_kurt,
-        portfolio_diagnostics=portfolio_diagnostics,
-    )
     _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
     return result
 
@@ -867,34 +878,13 @@ def _write_backtest_summary(
         ch = (manifest or {}).get("chronological_holdout") or {}
         if ch.get("holdout_start") and ch.get("holdout_end"):
             window = oos_ledger.window_key(ch["holdout_start"], ch["holdout_end"])
-    n_trials = 1
-    if window:
-        # A batch/ensemble is ONE selection event: every seed's DSR must use the same
-        # trial count (prior burns ∪ the whole invocation), not an order-dependent
-        # running count.
-        prior = oos_ledger.distinct_models_for_window(
-            oos_ledger.read_ledger(on_corrupt="raise"), window
+    n_trials = _oos_trials_for_args(args, manifest)
+    dsr = _deflated_sharpe_for_result(result, n_trials)
+    if dsr is not None:
+        print(
+            f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
+            f"window): {dsr:.3f} (>0.95 = significant after selection)"
         )
-        invocation = {str(r) for r in getattr(args, "_invocation_run_ids", [])}
-        n_trials = max(1, len(prior | invocation))
-    dsr = None
-    if result.n_rets >= 4 and np.isfinite(result.sharpe):
-        dsr = float(
-            deflated_sharpe_ratio(
-                result.sharpe,
-                n_obs=result.n_rets,
-                n_trials=n_trials,
-                skew=result.ret_skew if np.isfinite(result.ret_skew) else 0.0,
-                kurt=result.ret_kurt if np.isfinite(result.ret_kurt) else 3.0,
-            )
-        )
-        if not np.isfinite(dsr):
-            dsr = None
-        else:
-            print(
-                f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
-                f"window): {dsr:.3f} (>0.95 = significant after selection)"
-            )
     payload = {
         **asdict(result),
         "config_path": str(cfg.path),
@@ -923,6 +913,37 @@ def _write_backtest_summary(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(f"Backtest summary: {out}")
+
+
+def _oos_trials_for_args(args: argparse.Namespace, manifest: dict | None) -> int:
+    """Selection-aware trial count for the OOS window read by this invocation."""
+    window = getattr(args, "_ledger_window", None)
+    if window is None:
+        ch = (manifest or {}).get("chronological_holdout") or {}
+        if ch.get("holdout_start") and ch.get("holdout_end"):
+            window = oos_ledger.window_key(ch["holdout_start"], ch["holdout_end"])
+    if not window:
+        return 1
+    prior = oos_ledger.distinct_models_for_window(
+        oos_ledger.read_ledger(on_corrupt="raise"), window
+    )
+    invocation = {str(r) for r in getattr(args, "_invocation_run_ids", [])}
+    return max(1, len(prior | invocation))
+
+
+def _deflated_sharpe_for_result(result: BacktestResult, n_trials: int) -> float | None:
+    if result.n_rets < 4 or not np.isfinite(result.sharpe):
+        return None
+    dsr = float(
+        deflated_sharpe_ratio(
+            result.sharpe,
+            n_obs=result.n_rets,
+            n_trials=n_trials,
+            skew=result.ret_skew if np.isfinite(result.ret_skew) else 0.0,
+            kurt=result.ret_kurt if np.isfinite(result.ret_kurt) else 3.0,
+        )
+    )
+    return dsr if np.isfinite(dsr) else None
 
 
 def _print_ensemble_summary(prefix: str, checkpoint_label: str, results: list[BacktestResult]) -> None:
@@ -1055,8 +1076,8 @@ def _find_vec_normalize(
     if run_hint:
         md = RunPaths(run_hint).models_dir
         for candidate in (
-            md / "vec_normalize.pkl",
             md / "best" / "vec_normalize.pkl",
+            md / "vec_normalize.pkl",
         ):
             if candidate.is_file():
                 return candidate
@@ -1530,7 +1551,7 @@ def main() -> None:
         "--checkpoint",
         default="best",
         choices=("best", "latest", "both"),
-        help="Which weights to evaluate: eval-NAV-best (default; holdout not used to pick "
+        help="Which weights to evaluate: robust-eval-score-best (default; holdout not used to pick "
         "weights), latest step checkpoint, or both.",
     )
     parser.add_argument(
@@ -1647,7 +1668,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-latest-checkpoint",
         action="store_true",
-        help="Allow ppo_portfolio_final.zip on holdout (breaks ex-ante eval-NAV-best rule).",
+        help="Allow ppo_portfolio_final.zip on holdout (breaks ex-ante robust-score-best rule).",
     )
     parser.add_argument(
         "--stochastic-paths",
@@ -1762,7 +1783,7 @@ def main() -> None:
 def _print_single_result(result: BacktestResult) -> None:
     print(f"Model: {result.model_path}")
     if result.checkpoint_label == "best":
-        print("Ex-ante checkpoint: eval-NAV-best (best_model.zip) — holdout not used to pick weights.")
+        print("Ex-ante checkpoint: robust-eval-score-best (best_model.zip) — holdout not used to pick weights.")
     print(f"OOS bars: {result.n_bars}")
     print(f"Total return: {result.total_return * 100:.2f}%")
     print(f"Approx. annualized Sharpe (log-ret, daily): {result.sharpe:.2f}")

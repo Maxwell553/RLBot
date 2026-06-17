@@ -741,8 +741,16 @@ def cmd_run_queue(args: argparse.Namespace) -> None:
         print(f"[research] queue: {spec_path.name} → done/")
 
 
+def _screen_metric(record: dict) -> float | None:
+    """Robust eval score for new records; eval NAV fallback for legacy records."""
+    raw = record.get("best_eval_score")
+    if raw is None:
+        raw = record.get("best_eval_nav")
+    return None if raw is None else float(raw)
+
+
 def screen_ranking(records: list[dict], keep_top: float) -> tuple[list[tuple[str, float]], list[str]]:
-    """Rank seed-groups by median best_eval_nav (descending); return the ranking
+    """Rank seed-groups by median robust best_eval_score (descending); return the ranking
     and the advancing top fraction (always at least one group when any ranked)."""
     import statistics as _st
 
@@ -751,8 +759,7 @@ def screen_ranking(records: list[dict], keep_top: float) -> tuple[list[tuple[str
         by_group.setdefault(str(r.get("group_id") or r.get("variant_id")), []).append(r)
     ranked = sorted(
         (
-            (gid, _st.median([float(r["best_eval_nav"]) for r in rows
-                              if r.get("best_eval_nav") is not None] or [float("-inf")]))
+            (gid, _st.median([m for r in rows if (m := _screen_metric(r)) is not None] or [float("-inf")]))
             for gid, rows in by_group.items()
         ),
         key=lambda kv: kv[1],
@@ -764,7 +771,7 @@ def screen_ranking(records: list[dict], keep_top: float) -> tuple[list[tuple[str
 
 def cmd_screen(args: argparse.Namespace) -> None:
     """Successive-halving screen: run EVERY grid combo at tier 1 with a tiny budget,
-    rank seed-groups by median best_eval_nav, and write screen_ranking.json naming
+    rank seed-groups by median robust best_eval_score, and write screen_ranking.json naming
     the top fraction to advance to a full-tier launch. Never touches the holdout."""
     spec = load_spec(args.spec)
     if not spec.grid:
@@ -823,7 +830,7 @@ def cmd_screen(args: argparse.Namespace) -> None:
     out = {
         "screen_timesteps": ts,
         "keep_top": float(args.keep_top),
-        "ranking": [{"group_id": g, "median_best_eval_nav": v} for g, v in ranked],
+        "ranking": [{"group_id": g, "median_best_eval_score": v} for g, v in ranked],
         "advance": advance,
     }
     out_path = _cohort_dir(spec.id) / "screen_ranking.json"

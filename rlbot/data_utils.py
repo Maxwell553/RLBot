@@ -1203,6 +1203,9 @@ def load_cache(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
     List[str],
 ]:
     z = np.load(path, allow_pickle=True)

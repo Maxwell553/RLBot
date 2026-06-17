@@ -44,71 +44,65 @@ walk-forward protocol, OOS results, and interpretation caveats.
 
 ## Current Published Cohorts
 
-The latest copied cohort comparison covers `W*_612`, `W*_613`, and `W*_614`.
-Each cohort is one seed per window, 50M steps, `feature_split_mode:
-independent`, `max_single_asset_weight: 0.20`, turnover penalty `0.007`, equal
-passive reward benchmark, and robust eval selection after `fee_ramp_end`.
+The current complete cohort is `W*_615`: one seed (42) per window, 50M steps,
+`feature_split_mode: independent`, `obs_lag: 1`, `max_single_asset_weight: 0.20`,
+turnover penalty `0.007`, equal passive reward benchmark, robust eval selection
+after `fee_ramp_end`, and `reward.exposure_risk_penalty_scale: 90`. A follow-on
+cohort `W*_616` (`exposure_risk_penalty_scale: 80`, same protocol) is in progress
+(W1-W3 complete; W4 training, W5 pending) and is not yet a published result.
 
-The intended single changed knob was `reward.exposure_risk_penalty_scale`:
+Both cohorts run under the reworked reward structure introduced after the earlier
+`W*_612/613/614` exposure-scale sweep. Those older cohorts are superseded and
+their numbers are not comparable to the tables below.
 
-| Cohort | Exposure risk scale | Chained W1-W5 return | Mean Sharpe | Mean max DD | Beat equal-weight |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `W*_612` | 80 | +140.7% | 1.12 | -10.7% | 3/5 |
-| `W*_613` | 100 | +186.2% | 1.05 | -11.2% | 4/5 |
-| `W*_614` | 90 | +110.7% | 0.66 | -16.0% | 2/5 |
+| Cohort | Exposure risk scale | Status | Chained return | Mean Sharpe | Mean max DD | Beat equal-weight |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| `W*_615` | 90 | Complete (5/5) | +135.2% (W1-W5) | 0.84 | -15.0% | 3/5 |
+| `W*_616` | 80 | In progress (3/5) | +56.4% (W1-W3 only) | 0.80 (W1-W3) | -13.1% (W1-W3) | 2/3 |
 
-The exposure-scale sweep is exploratory. The middle setting underperformed both
-80 and 100, so the stronger 612/613 outcomes should be treated as promising but
-not yet stable evidence.
+The `W*_616` row covers only W1-W3 and must not be read as a cohort result until
+W4-W5 complete. Numbers below are copied from each run's
+`Runs/<run_id>/backtest_summary.json` (`--checkpoint best`).
 
 ## Per-Window OOS Results
 
-### Cohort `W*_612` (`exposure_risk_penalty_scale: 80`)
+### Cohort `W*_615` (`exposure_risk_penalty_scale: 90`, seed 42) — complete
 
-| Window | Agent return | Sharpe | Max DD | DSR | Equal-weight | SP500 sleeve | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| W1 | +22.0% | 1.41 | -5.3% | 0.78 | +28.4% | +46.4% | Trailed strong equity regime |
-| W2 | +9.6% | 0.58 | -10.8% | 0.35 | +3.0% | +18.7% | Beat equal-weight, lagged 60/40/SP500 |
-| W3 | +33.6% | 0.88 | -26.3% | 0.88 | +17.1% | +52.9% | Strong return, drawdown too high |
-| W4 | +8.1% | 0.42 | -8.9% | 0.72 | +5.3% | +7.3% | Beat listed benchmarks on return |
-| W5 | +24.7% | 2.30 | -2.3% | 0.999 | +33.2% | +45.7% | Excellent risk-adjusted profile, lower raw return |
+| Window | Agent return | Sharpe | Max DD | DSR | Equal-weight | SP500 sleeve | 60/40 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | +26.7% | 1.42 | -6.7% | 0.70 | +28.4% | +46.4% | +25.7% |
+| W2 | +10.9% | 0.49 | -15.1% | 0.22 | +3.0% | +18.7% | +16.9% |
+| W3 | +17.8% | 0.60 | -21.6% | 0.33 | +17.1% | +52.9% | +31.9% |
+| W4 | +1.6% | 0.07 | -17.9% | 0.11 | +5.3% | +7.3% | +1.3% |
+| W5 | +39.9% | 1.60 | -13.6% | 0.80 | +33.2% | +45.7% | +29.6% |
 
-### Cohort `W*_613` (`exposure_risk_penalty_scale: 100`)
+### Cohort `W*_616` (`exposure_risk_penalty_scale: 80`, seed 42) — in progress
 
-| Window | Agent return | Sharpe | Max DD | DSR | Equal-weight | SP500 sleeve | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| W1 | +29.5% | 1.51 | -6.7% | 0.79 | +28.4% | +46.4% | Beat equal-weight, lagged SP500 |
-| W2 | +1.0% | 0.07 | -12.3% | 0.12 | +3.0% | +18.7% | Weak window |
-| W3 | +54.4% | 1.93 | -6.7% | 0.96 | +17.1% | +52.9% | Best cohort/window result |
-| W4 | +5.8% | 0.23 | -17.5% | 0.30 | +5.3% | +7.3% | Higher drawdown than desired |
-| W5 | +34.0% | 1.52 | -12.8% | 0.928 | +33.2% | +45.7% | Beat equal-weight on return, worse risk than 612 |
-
-### Cohort `W*_614` (`exposure_risk_penalty_scale: 90`)
-
-| Window | Agent return | Sharpe | Max DD | DSR | Equal-weight | SP500 sleeve | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| W1 | +28.4% | 1.38 | -7.1% | 0.70 | +28.4% | +46.4% | Near equal-weight return |
-| W2 | +0.1% | 0.01 | -18.0% | 0.08 | +3.0% | +18.7% | Poor |
-| W3 | +20.7% | 0.53 | -26.4% | 0.33 | +17.1% | +52.9% | Return acceptable, drawdown poor |
-| W4 | +7.9% | 0.30 | -12.8% | 0.22 | +5.3% | +7.3% | Beat listed benchmarks on return |
-| W5 | +25.9% | 1.06 | -15.7% | 0.61 | +33.2% | +45.7% | Lagged equity-heavy benchmarks |
+| Window | Agent return | Sharpe | Max DD | DSR | Equal-weight | SP500 sleeve | 60/40 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | +28.4% | 1.57 | -5.1% | 0.73 | +28.4% | +46.4% | +25.7% |
+| W2 | +3.3% | 0.17 | -16.1% | 0.09 | +2.7% | +18.0% | +16.4% |
+| W3 | +17.9% | 0.66 | -18.2% | 0.32 | +17.3% | +52.5% | +31.9% |
+| W4 | training | — | — | — | — | — | — |
+| W5 | pending | — | — | — | — | — | — |
 
 ## Interpretation
 
 The current evidence suggests the environment can learn useful allocation
-behavior: across these cohorts it often beats equal-weight, sometimes beats the
-SP500 sleeve, and can materially reduce drawdown in some regimes. It is not yet
+behavior: in `W*_615` the agent beats equal-weight on chained return
+(+135.2% vs the per-window equal-weight book) and on 3/5 windows, with strong
+risk-adjusted profiles in W1 and W5 (Sharpe 1.42 and 1.60). It is not yet
 publication-ready or tradeable evidence on its own.
 
 Main caveats:
 
-- Single seed per cohort/window is too thin for a stochastic RL claim.
-- W1-W5 have now been used repeatedly; DSR helps, but local trial accounting is
-  incomplete for informal experiments before the ledger existed.
-- The best cohort is not monotonic in the tested exposure-risk scale, which
-  weakens the case that the result is a clean knob effect.
-- The strategy can still underperform simple passive books in strong equity
-  regimes and can carry unacceptable drawdown in stress regimes.
+- Single seed (42) per window is too thin for a stochastic RL claim.
+- W1-W5 have now been used repeatedly; per-window DSR (shown above) stays well
+  below the usual 0.95 bar, and trial counts per window are already 6-10.
+- The agent still lags the SP500 sleeve in strong-equity windows (W1, W3, W5)
+  and carries large drawdown in stress regimes (W3 -21.6%, W4 -17.9%).
+- W4 (2022-2023) remains the hardest window: near-flat return and the weakest
+  risk-adjusted profile in both cohorts.
 - yfinance daily bars, simple transaction-cost modeling, and no capacity model
   are not sufficient for live trading claims.
 
@@ -150,33 +144,3 @@ Negative robust scores are expected when the agent is behind the benchmark after
 dispersion and drawdown penalties. A downward robust-score line means later
 checkpoints are less attractive under the selection rule, even if training
 reward or raw episode NAV remains high.
-
-## Suggested Plot Improvements
-
-Concise changes that would make `training.png` more useful:
-
-1. Add a vertical marker at the current `best_eval_step` on every eval panel,
-   with a small label like `best @ 31.0M`.
-2. Plot the running maximum robust score as a faint line, so the selected
-   checkpoint is visually obvious even when the raw robust score trends down.
-3. Rename the mean-NAV eval panel to `validation diagnostics` and avoid implying
-   it estimates OOS return.
-4. Replace or de-emphasize stitched validation NAV unless it is used directly in
-   the selection score; show `stitched excess vs eval benchmark` as a compact
-   subplot or annotation instead.
-5. Add an optional small text box with the current score formula and benchmark:
-   `0.5 segment excess + 0.5 stitched excess - 0.75 std - 2.0 p75 DD`.
-6. Show post-gate region shading (`fee_ramp_end` onward), because only that
-   region can update `models/best/`.
-7. Add eval diagnostics that have explained failures in practice: mean cash,
-   effective N, top-3 concentration, cap-hit fraction, and turnover.
-
-## Result Reporting Rules
-
-- Copy headline metrics into this tracked document; do not point readers at
-  `Runs/` as the only source.
-- If a plot is needed in a durable report, export it to a tracked report
-  directory, not `Runs/`.
-- Always state checkpoint (`best`), stochastic path count if used, cohort
-  changes, and trial/seed context.
-- Never compare runs without checking their snapshotted configs.

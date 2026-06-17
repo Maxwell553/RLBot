@@ -34,7 +34,6 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from rlbot.baselines import portfolio_step_nav
 from rlbot.reward_terms import (
     concentration_penalty_from_weights,
     drawdown_penalty_from_nav,
@@ -67,6 +66,88 @@ def _enforce_long_only_simplex(w: np.ndarray) -> np.ndarray:
         w = np.zeros_like(w)
         w[0] = 1.0
     return w
+
+
+def _holding_cost_for_book(
+    units: np.ndarray,
+    close: np.ndarray,
+    daily_holding: np.ndarray,
+    fee_scale: float,
+) -> float:
+    """Daily holding cost on a long-only unit book marked at ``close``."""
+    notional = np.abs(np.asarray(units, dtype=np.float64) * close)
+    daily_costs = notional * daily_holding * float(fee_scale)
+    return float(np.maximum(daily_costs, 0.0).sum())
+
+
+def _rebalance_unit_book(
+    units: np.ndarray,
+    cash: float,
+    price: np.ndarray,
+    target_w: np.ndarray,
+    *,
+    slippage: np.ndarray,
+    tx_fee: np.ndarray,
+    fee_scale: float,
+) -> Tuple[np.ndarray, float, float, float]:
+    """Sell-then-buy, cash-constrained unit-level rebalance to ``target_w`` at ``price``.
+
+    Shared by the agent book and the in-env benchmark book so both price execution
+    identically (per-asset slippage + fees, scaled by ``fee_scale``, with buys scaled
+    down if cash is short). Returns ``(units, cash, turnover_dollars, tx_cost_dollars)``.
+    """
+    tw = _enforce_long_only_simplex(np.asarray(target_w, dtype=np.float64))
+    units = np.asarray(units, dtype=np.float64).copy()
+    price = np.asarray(price, dtype=np.float64)
+    nav = float(np.sum(units * price) + cash)
+    if nav <= 1e-12:
+        return units, float(cash), 0.0, 0.0
+
+    fs = float(fee_scale)
+    target_units = (tw[1:] * nav) / (price + 1e-12)
+    delta = target_units - units
+    turnover = 0.0
+    tx_cost = 0.0
+
+    for i in np.argsort(delta):
+        du = delta[i]
+        if du >= -1e-12:
+            continue
+        sell_u = -du
+        cost_rate = (slippage[i] + tx_fee[i]) * fs
+        notional = sell_u * price[i]
+        tx_cost += notional * cost_rate
+        cash += notional * (1.0 - cost_rate)
+        units[i] -= sell_u
+        turnover += notional
+
+    buy_idxs = np.where(delta > 1e-12)[0]
+    if buy_idxs.size > 0:
+        du = delta[buy_idxs]
+        cost_rate = (slippage[buy_idxs] + tx_fee[buy_idxs]) * fs
+        unit_cost = price[buy_idxs] * (1.0 + cost_rate)
+        need = du * unit_cost
+        buy_cash_need = float(need.sum())
+        scale = (
+            min(1.0, max(0.0, cash / (buy_cash_need + 1e-12)))
+            if buy_cash_need > 1e-12
+            else 1.0
+        )
+        buy_u = du * scale
+        filled = buy_u > 1e-12
+        if np.any(filled):
+            idx_f = buy_idxs[filled]
+            bu = buy_u[filled]
+            uc = unit_cost[filled]
+            cr = cost_rate[filled]
+            pr = price[idx_f]
+            tx_cost += float((bu * pr * cr).sum())
+            cash -= float((bu * uc).sum())
+            units[idx_f] += bu
+            turnover += float((bu * pr).sum())
+
+    units = np.maximum(units, 0.0)
+    return units, float(cash), turnover, tx_cost
 
 
 def portfolio_weights_from_action(
@@ -422,8 +503,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._reset_count = 0
         self._return_buffer: list[float] = []
         self._market_return_buffer: list[float] = []
-        self._bench_nav = 1.0
-        self._bench_w_prev: np.ndarray | None = None
+        self._bench_units = np.zeros(self.n_assets, dtype=np.float64)
+        self._bench_cash = self.initial_cash
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
         alpha = (
@@ -549,13 +630,17 @@ class MultiAssetPortfolioEnv(gym.Env):
         bounds = sorted(set(block_boundaries))
         edges = [self._min_t] + bounds + [self._max_t + 2]
         segments = []
+        warmup = self.lookback + self._env_cfg.max_obs_lag
         for i in range(len(edges) - 1):
             seg_raw_start = edges[i]
             seg_end = edges[i + 1]
-            earliest = max(
-                seg_raw_start + self.lookback + self._env_cfg.max_obs_lag,
-                seg_raw_start,
-            )
+            # _min_t already includes the lookback/obs-lag warmup, so only interior
+            # segment heads (after a block join) need the extra offset to keep
+            # _build_obs from reading across the discontinuity.
+            if seg_raw_start == self._min_t:
+                earliest = seg_raw_start
+            else:
+                earliest = seg_raw_start + warmup
             usable = seg_end - earliest - 1
             if usable >= self.MIN_SEGMENT_BARS:
                 segments.append((earliest, seg_end))
@@ -651,12 +736,6 @@ class MultiAssetPortfolioEnv(gym.Env):
             w[1:] = (pos.astype(np.float32) / np.float32(v))
         return w
 
-    def _log_returns(self, t: int, horizon: int) -> np.ndarray:
-        t0 = max(t - horizon, 0)
-        c_now = self.ohlcv[t, :, 3]
-        c_prev = self.ohlcv[t0, :, 3]
-        return np.log((c_now + 1e-12) / (c_prev + 1e-12))
-
     def _realized_vol(self, t: int) -> np.ndarray:
         start = max(t - self.lookback, 1)
         closes = self.ohlcv[start : t + 1, :, 3]
@@ -664,12 +743,6 @@ class MultiAssetPortfolioEnv(gym.Env):
             return np.zeros(self.n_assets, dtype=np.float64)
         rets = np.diff(np.log(closes + 1e-12), axis=0)
         return rets.std(axis=0)
-
-    def _macro_log_returns(self, t: int, horizon: int) -> np.ndarray:
-        t0 = max(t - horizon, 0)
-        c_now = self.macro[t]
-        c_prev = self.macro[t0]
-        return np.log((c_now + 1e-12) / (c_prev + 1e-12))
 
     def _macro_realized_vol(self, t: int) -> np.ndarray:
         start = max(t - self.lookback, 1)
@@ -764,92 +837,64 @@ class MultiAssetPortfolioEnv(gym.Env):
         return out
 
     def _benchmark_log_return_step(self, t: int, live: np.ndarray) -> float:
-        """Cap-weight benchmark log return with same friction model as ``portfolio_step_nav``."""
-        w_tgt = self._benchmark_weights_live(live)
-        nav_pre = max(self._bench_nav, 1e-12)
-        nav_next = portfolio_step_nav(
-            nav_pre,
-            self.ohlcv,
-            t,
-            w_tgt,
-            prev_weights=self._bench_w_prev,
+        """Per-step benchmark log return on a shadow book run through the **same**
+        unit-level execution engine as the agent: holding cost on pre-rebalance units
+        at ``close[t]``, fill at ``open[t+1]``, mark at ``close[t+1]``.
+
+        Because the benchmark book is priced identically to the agent's, an agent that
+        holds these weights reproduces this NAV path (to floating point), so the reward's
+        ``benchmark_excess`` and Sortino-diff terms measure allocation skill rather than an
+        accounting mismatch between two different execution models.
+        """
+        close_t = self.ohlcv[t, :, 3]
+        open_next = self.ohlcv[t + 1, :, 0]
+        close_next = self.ohlcv[t + 1, :, 3]
+        nav_pre = max(float(np.sum(self._bench_units * close_t) + self._bench_cash), 1e-12)
+        self._bench_cash -= _holding_cost_for_book(
+            self._bench_units, close_t, self._daily_holding_cost, self.fee_scale
+        )
+        # Fully-invested passive book: cash leg weight is 0, risky legs are the
+        # feasible benchmark weights restricted to live assets.
+        target_w = np.concatenate(([0.0], self._benchmark_weights_live(live)))
+        self._bench_units, self._bench_cash, _, _ = _rebalance_unit_book(
+            self._bench_units,
+            self._bench_cash,
+            open_next,
+            target_w,
             slippage=self._asset_slippage,
             tx_fee=self._asset_tx_fee,
-            daily_holding=self._daily_holding_cost,
             fee_scale=self.fee_scale,
-            asset_live=self.asset_live,
         )
-        self._bench_nav = nav_next
-        self._bench_w_prev = w_tgt.copy()
-        return float(np.log(max(nav_next, 1e-12) / nav_pre))
+        nav_next = max(float(np.sum(self._bench_units * close_next) + self._bench_cash), 1e-12)
+        return float(np.log(nav_next / nav_pre))
 
     def _rebalance(self, price: np.ndarray, target_w: np.ndarray) -> Tuple[float, float]:
-        """Execute trades at given prices with per-asset slippage and fees.
+        """Execute trades at ``price`` with per-asset slippage and fees (curriculum-scaled).
 
-        Scales transaction costs by self.fee_scale (for curriculum learning).
-        Target weights are long-only (cash + nonnegative asset notionals).
-
-        Returns ``(turnover_frac, tx_cost_frac)`` where ``tx_cost_frac`` is total
-        slippage + fee dollars paid this step divided by pre-rebalance NAV.
+        Target weights are long-only (cash + nonnegative asset notionals). Returns
+        ``(turnover_frac, tx_cost_frac)`` where ``tx_cost_frac`` is total slippage + fee
+        dollars paid this step divided by pre-rebalance NAV.
         """
-        tw = _enforce_long_only_simplex(np.asarray(target_w, dtype=np.float64))
         nav = self._nav(price)
         if nav <= 1e-12:
             return 0.0, 0.0
-
-        fs = self.fee_scale
-        target_units = (tw[1:] * nav) / (price + 1e-12)
-        delta = target_units - self._units
-        turnover = 0.0
-        tx_cost = 0.0
-
-        for i in np.argsort(delta):
-            du = delta[i]
-            if du >= -1e-12:
-                continue
-            sell_u = -du
-            cost_rate = (self._asset_slippage[i] + self._asset_tx_fee[i]) * fs
-            notional = sell_u * price[i]
-            tx_cost += notional * cost_rate
-            self._cash += notional * (1.0 - cost_rate)
-            self._units[i] -= sell_u
-            turnover += notional
-
-        buy_idxs = np.where(delta > 1e-12)[0]
-        if buy_idxs.size > 0:
-            du = delta[buy_idxs]
-            cost_rate = (self._asset_slippage[buy_idxs] + self._asset_tx_fee[buy_idxs]) * fs
-            unit_cost = price[buy_idxs] * (1.0 + cost_rate)
-            need = du * unit_cost
-            buy_cash_need = float(need.sum())
-            scale = (
-                min(1.0, max(0.0, self._cash / (buy_cash_need + 1e-12)))
-                if buy_cash_need > 1e-12
-                else 1.0
-            )
-            buy_u = du * scale
-            filled = buy_u > 1e-12
-            if np.any(filled):
-                idx_f = buy_idxs[filled]
-                bu = buy_u[filled]
-                uc = unit_cost[filled]
-                cr = cost_rate[filled]
-                pr = price[idx_f]
-                tx_cost += float((bu * pr * cr).sum())
-                self._cash -= float((bu * uc).sum())
-                self._units[idx_f] += bu
-                turnover += float((bu * pr).sum())
-
-        self._units = np.maximum(self._units, 0.0)
+        self._units, self._cash, turnover, tx_cost = _rebalance_unit_book(
+            self._units,
+            self._cash,
+            price,
+            target_w,
+            slippage=self._asset_slippage,
+            tx_fee=self._asset_tx_fee,
+            fee_scale=self.fee_scale,
+        )
         nav_denom = max(nav, 1e-12)
         return turnover / nav_denom, tx_cost / nav_denom
 
     def _apply_holding_costs(self, close: np.ndarray) -> float:
         """Deduct daily holding on pre-rebalance units (call before ``_rebalance``)."""
-        position_values = self._units * close
-        notional = np.abs(position_values)
-        daily_costs = notional * self._daily_holding_cost * self.fee_scale
-        total_cost = float(np.maximum(daily_costs, 0.0).sum())
+        total_cost = _holding_cost_for_book(
+            self._units, close, self._daily_holding_cost, self.fee_scale
+        )
         if total_cost > 0:
             self._cash -= total_cost
         return total_cost
@@ -877,8 +922,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._steps = 0
         self._return_buffer = []
         self._market_return_buffer = []
-        self._bench_nav = 1.0
-        self._bench_w_prev = None
+        self._bench_units = np.zeros(self.n_assets, dtype=np.float64)
+        self._bench_cash = self.initial_cash
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
         self._smoothed_action = None
@@ -968,8 +1013,10 @@ class MultiAssetPortfolioEnv(gym.Env):
             asset_live=live_t,
         )
         rwd = self._reward_cfg
-        # Scale churn with live VIX (same series as obs macro block; undifferenced close).
-        current_vix = float(self.macro[self._t, MACRO_VIX_INDEX])
+        # Scale churn with live VIX, read at the same obs_lag the observation uses
+        # (undifferenced close) so churn shaping is causally consistent with policy input.
+        vix_t = max(self._t - self.obs_lag, 0)
+        current_vix = float(self.macro[vix_t, MACRO_VIX_INDEX])
         if current_vix > 1.0:
             vix_multiplier = float(
                 np.clip(current_vix / VIX_CHURN_BASELINE, VIX_CHURN_MULT_MIN, VIX_CHURN_MULT_MAX)
@@ -977,7 +1024,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         else:
             vix_multiplier = 1.0
         active_churn_scale = vix_multiplier * self._churn_scale
-        # Holding on pre-rebalance units at close[t] (matches portfolio_step_nav w_prev).
+        # Holding on pre-rebalance units at close[t] (same basis as the benchmark book).
         self._apply_holding_costs(close_t)
         turnover_frac, tx_cost_frac = self._rebalance(open_next, w)
         self._prev_target_w = w.copy()

@@ -20,7 +20,16 @@ if os.environ.get("MPLBACKEND") is None:
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from stable_baselines3.common.callbacks import BaseCallback
+
+try:  # Keep pure plotting helpers importable without the RL training stack installed.
+    from stable_baselines3.common.callbacks import BaseCallback
+except ModuleNotFoundError:  # pragma: no cover - exercised in lightweight envs
+    class BaseCallback:  # type: ignore[no-redef]
+        def __init__(self, *_, **__):
+            raise ModuleNotFoundError(
+                "stable_baselines3 is required for TrainingVizCallback; "
+                "pure plotting helpers remain available."
+            )
 
 from rlbot.modal_cloud import mark_plot_saved
 
@@ -75,6 +84,182 @@ def _percent_formatter() -> mticker.FuncFormatter:
     return mticker.FuncFormatter(fmt)
 
 
+def robust_score_delta_from_best(scores: np.ndarray) -> np.ndarray:
+    """``score[i] - max(score[: i + 1])`` — running best is always 0, later evals ≤ 0."""
+    s = np.asarray(scores, dtype=np.float64)
+    if s.size == 0:
+        return s
+    return s - np.maximum.accumulate(s)
+
+
+def robust_score_delta_post_gate(
+    scores: np.ndarray,
+    timesteps: np.ndarray,
+    gate_step: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Score delta with running max reset at ``gate_step``.
+
+    Returns ``(pre_gate_mask, delta, post_gate_mask)``. Pre-gate entries in ``delta`` are
+    NaN; post-gate uses ``score - max(score since gate)``. When ``gate_step <= 0``, all
+    points use the full-series delta (no gate split).
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    t = np.asarray(timesteps, dtype=np.int64)
+    if s.size == 0:
+        empty = np.zeros(0, dtype=bool)
+        return empty, s, empty
+    gate = int(gate_step)
+    if gate <= 0:
+        delta = robust_score_delta_from_best(s)
+        mask = np.ones(s.shape, dtype=bool)
+        return np.zeros(s.shape, dtype=bool), delta, mask
+    pre_mask = t < gate
+    post_mask = ~pre_mask
+    delta = np.full(s.shape, np.nan, dtype=np.float64)
+    if post_mask.any():
+        post_scores = s[post_mask]
+        delta[post_mask] = post_scores - np.maximum.accumulate(post_scores)
+    return pre_mask, delta, post_mask
+
+
+def _scalar_from_npz(z, key: str) -> int | None:
+    arr = z.get(key)
+    if arr is None:
+        return None
+    flat = np.asarray(arr).reshape(-1)
+    if flat.size == 0:
+        return None
+    return int(flat[0])
+
+
+def resolve_eval_plot_milestones(
+    hist: dict[str, np.ndarray],
+    *,
+    run_dir: Path | None = None,
+) -> tuple[int | None, int | None]:
+    """Return ``(best_model_min_step, best_eval_step)`` for training-plot annotations."""
+    best_model_min_step: int | None = None
+    best_eval_step: int | None = None
+    if "best_model_min_step" in hist:
+        best_model_min_step = int(hist["best_model_min_step"])
+    if "best_eval_step" in hist:
+        best_eval_step = int(hist["best_eval_step"])
+
+    manifest: dict | None = None
+    if run_dir is not None:
+        manifest_path = Path(run_dir) / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = None
+
+    if best_eval_step is None and manifest is not None:
+        raw = manifest.get("best_eval_step")
+        if raw is not None:
+            best_eval_step = int(raw)
+
+    if best_model_min_step is None:
+        if manifest is not None and run_dir is not None:
+            args = manifest.get("args") or {}
+            learn_budget = args.get("timesteps")
+            cfg_path = Path(run_dir) / "config.yaml"
+            if learn_budget is not None and cfg_path.is_file():
+                try:
+                    from rlbot.rl_config import load_config, resolve_best_model_min_step
+
+                    cfg = load_config(cfg_path)
+                    best_model_min_step = resolve_best_model_min_step(
+                        int(learn_budget), cur=cfg.curriculum
+                    )
+                except (ValueError, TypeError, OSError):
+                    pass
+
+    scores = hist.get("robust_scores")
+    ts = hist.get("timesteps")
+    if best_eval_step is None and scores is not None and ts is not None and len(scores) == len(ts):
+        steps = np.asarray(ts, dtype=np.int64)
+        navs = np.asarray(scores, dtype=np.float64)
+        gate = int(best_model_min_step or 0)
+        post = steps >= gate if gate > 0 else np.ones(len(steps), dtype=bool)
+        if post.any():
+            j = int(np.argmax(navs[post]))
+            best_eval_step = int(steps[post][j])
+
+    return best_model_min_step, best_eval_step
+
+
+def _shade_best_model_eligible(
+    ax: plt.Axes,
+    best_model_min_step: int | None,
+    xmax: float,
+    *,
+    labeled: bool,
+) -> None:
+    if best_model_min_step is None or best_model_min_step <= 0 or xmax <= best_model_min_step:
+        return
+    ax.axvspan(
+        best_model_min_step,
+        xmax,
+        color="#2ca02c",
+        alpha=0.07,
+        zorder=0,
+        label="best-model eligible" if labeled else "_best-model eligible",
+    )
+
+
+def _mark_saved_best_checkpoint(
+    ax: plt.Axes,
+    best_eval_step: int | None,
+    y: float | None,
+) -> None:
+    if best_eval_step is None:
+        return
+    ax.axvline(
+        best_eval_step,
+        color="#ff7f0e",
+        ls="--",
+        lw=1.3,
+        alpha=0.9,
+        zorder=4,
+        label="saved best",
+    )
+    if y is not None and np.isfinite(y):
+        ax.plot(
+            best_eval_step,
+            y,
+            marker="*",
+            ms=14,
+            color="#ff7f0e",
+            markeredgecolor="#333333",
+            markeredgewidth=0.6,
+            zorder=5,
+            linestyle="None",
+        )
+
+
+def _score_formula_from_run(run_dir: str | Path | None) -> str | None:
+    """Compact eval-score formula from a run-local config snapshot."""
+    if run_dir is None:
+        return None
+    cfg_path = Path(run_dir) / "config.yaml"
+    if not cfg_path.is_file():
+        return None
+    try:
+        from rlbot.rl_config import load_config
+
+        cfg = load_config(cfg_path)
+        tr = cfg.training
+        blend = float(tr.best_model_score_stitched_blend)
+        return (
+            f"score: {1.0 - blend:g} segment excess + {blend:g} stitched excess "
+            f"- {tr.best_model_score_std_coef:g} std - "
+            f"{tr.best_model_score_dd_coef:g} p75 DD; bench={tr.best_model_benchmark}"
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def plot_training_progress(
     episode_timesteps: Sequence[int],
     episode_rewards: Sequence[float],
@@ -83,18 +268,28 @@ def plot_training_progress(
     eval_std_navs: Optional[np.ndarray] = None,
     eval_robust_scores: Optional[np.ndarray] = None,
     eval_mean_max_dd_pct: Optional[np.ndarray] = None,
+    eval_mean_excess_nav: Optional[np.ndarray] = None,
+    eval_stitched_excess_nav: Optional[np.ndarray] = None,
+    eval_diag: Optional[dict[str, np.ndarray]] = None,
+    eval_benchmark_label: str = "eval benchmark",
+    eval_score_formula: str | None = None,
     episode_navs: Optional[Sequence[float]] = None,
     episode_nav_ts: Optional[Sequence[int]] = None,
     episode_lengths: Optional[Sequence[int]] = None,
     smooth_window: int = 15,
     title: str = "RL portfolio training",
     save_path: str | Path = "plots/training.png",
+    best_model_min_step: int | None = None,
+    best_eval_step: int | None = None,
 ) -> Path:
-    """Episode rewards + eval NAV/drawdown + robust score + training episode-end NAV ($).
+    """Episode rewards + eval NAV/drawdown + score delta + training episode-end NAV ($).
 
     Panels (top → bottom): per-step training reward; eval mean ending NAV (green) with
-    ±1σ band and p75 max drawdown (%) on secondary axis; robust eval score (own panel
-    when present); episode-end training NAV.
+    ±1σ band and p75 max drawdown (%) on secondary axis; post-gate score delta (running
+    max resets at fee ramp; pre-gate evals grayed); episode-end training NAV.
+
+    When ``best_model_min_step`` is set (fee ramp end / best-save gate), eval panels and
+    the score panel shade the eligible region; ``best_eval_step`` marks the saved checkpoint.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +305,14 @@ def plot_training_progress(
         and eval_robust_scores is not None
         and len(eval_robust_scores) == len(eval_ending_navs)
     )
-    n_panels = 1 + (1 if has_eval else 0) + (1 if has_robust else 0) + (1 if has_nav else 0)
+    has_diag = bool(eval_diag) and has_eval
+    n_panels = (
+        1
+        + (1 if has_eval else 0)
+        + (1 if has_robust else 0)
+        + (1 if has_diag else 0)
+        + (1 if has_nav else 0)
+    )
 
     fig, axes = plt.subplots(
         n_panels, 1, figsize=(11, 3.2 * n_panels),
@@ -121,6 +323,25 @@ def plot_training_progress(
     fig.suptitle(title, fontsize=13)
 
     panel = 0
+    score_delta: np.ndarray | None = None
+    pre_gate_mask: np.ndarray | None = None
+    post_gate_mask: np.ndarray | None = None
+    best_delta_y: float | None = None
+    if has_robust and eval_robust_scores is not None and eval_timesteps is not None:
+        score = np.asarray(eval_robust_scores, dtype=np.float64)
+        ts_arr = np.asarray(eval_timesteps, dtype=np.int64)
+        gate = int(best_model_min_step or 0)
+        pre_gate_mask, score_delta, post_gate_mask = robust_score_delta_post_gate(
+            score, ts_arr, gate
+        )
+        if best_eval_step is not None:
+            hits = np.nonzero(ts_arr == int(best_eval_step))[0]
+            if hits.size:
+                val = float(score_delta[int(hits[0])])
+                if np.isfinite(val):
+                    best_delta_y = val
+
+    ax_eval_nav: plt.Axes | None = None
 
     # ── Panel: Training per-step reward ──────────────────────────────
     ax0 = axes[panel]
@@ -149,6 +370,7 @@ def plot_training_progress(
     # ── Panel: Eval mean NAV + dispersion + drawdown ─────────────────
     if has_eval:
         ax1 = axes[panel]
+        ax_eval_nav = ax1
         panel += 1
         ts = np.asarray(eval_timesteps, dtype=np.int64)
         nav = np.asarray(eval_ending_navs, dtype=np.float64)
@@ -162,6 +384,32 @@ def plot_training_progress(
             label="mean ending NAV",
             zorder=3,
         )
+        if eval_mean_excess_nav is not None and len(eval_mean_excess_nav) == len(nav):
+            ax1.plot(
+                ts,
+                np.asarray(eval_mean_excess_nav, dtype=np.float64),
+                color="#111111",
+                ls="--",
+                lw=1.2,
+                marker=".",
+                ms=3,
+                alpha=0.85,
+                label=f"mean excess vs {eval_benchmark_label}",
+                zorder=3,
+            )
+        if eval_stitched_excess_nav is not None and len(eval_stitched_excess_nav) == len(nav):
+            ax1.plot(
+                ts,
+                np.asarray(eval_stitched_excess_nav, dtype=np.float64),
+                color="#6f4e7c",
+                ls=":",
+                lw=1.5,
+                marker=".",
+                ms=3,
+                alpha=0.9,
+                label="stitched excess",
+                zorder=3,
+            )
         if eval_std_navs is not None and len(eval_std_navs) == len(nav):
             std = np.asarray(eval_std_navs, dtype=np.float64)
             ax1.fill_between(
@@ -201,34 +449,111 @@ def plot_training_progress(
             ax1.legend(loc="upper left", fontsize=8)
         ax1.set_xlabel("timesteps")
         ax1.xaxis.set_major_formatter(_timestep_formatter())
-        ax1.set_title("Periodic evaluation — mean NAV, dispersion, drawdown")
+        if eval_score_formula:
+            ax1.text(
+                0.99,
+                0.02,
+                eval_score_formula,
+                transform=ax1.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=7,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#cccccc", alpha=0.85),
+            )
+        ax1.set_title("Periodic validation diagnostics — NAV, benchmark excess, drawdown")
         ax1.grid(True, alpha=0.25)
 
-    # ── Panel: Robust eval score (selection metric) ──────────────────
-    if has_robust:
+    # ── Panel: Post-gate score delta (running max resets at fee ramp) ─
+    if has_robust and score_delta is not None and eval_timesteps is not None:
         ax_score = axes[panel]
         panel += 1
         ts = np.asarray(eval_timesteps, dtype=np.int64)
-        score = np.asarray(eval_robust_scores, dtype=np.float64)
-        ax_score.plot(
-            ts,
-            score,
-            color="#1a4d1a",
-            ls="-",
-            lw=2.0,
-            marker="o",
-            ms=3,
-            label="robust score",
-            zorder=3,
-        )
+        if pre_gate_mask is not None and np.any(pre_gate_mask):
+            ax_score.scatter(
+                ts[pre_gate_mask],
+                np.zeros(int(np.sum(pre_gate_mask)), dtype=np.float64),
+                marker="|",
+                s=120,
+                color="#999999",
+                alpha=0.55,
+                linewidths=1.2,
+                label="pre-gate eval (excluded)",
+                zorder=2,
+            )
+        if post_gate_mask is not None and np.any(post_gate_mask):
+            post_ts = ts[post_gate_mask]
+            post_delta = score_delta[post_gate_mask]
+            ax_score.plot(
+                post_ts,
+                post_delta,
+                color="#1a4d1a",
+                ls="-",
+                lw=2.0,
+                marker="o",
+                ms=3,
+                label="post-gate delta from best",
+                zorder=3,
+            )
         ax_score.axhline(0.0, color="gray", ls=":", lw=0.8, alpha=0.6)
-        ax_score.set_ylabel("Robust score ($)")
+        _mark_saved_best_checkpoint(ax_score, best_eval_step, best_delta_y)
+        ax_score.set_ylabel("Score delta ($)")
         ax_score.yaxis.set_major_formatter(_k_formatter())
         ax_score.set_xlabel("timesteps")
         ax_score.xaxis.set_major_formatter(_timestep_formatter())
-        ax_score.set_title("Periodic evaluation — robust score (checkpoint selection)")
-        ax_score.legend(loc="upper left", fontsize=8)
+        gate_label = (
+            f"gate {_timestep_formatter()(best_model_min_step, None)}"
+            if best_model_min_step and best_model_min_step > 0
+            else "no gate"
+        )
+        ax_score.set_title(
+            "Periodic evaluation — post-gate score delta "
+            f"(0 = new save-eligible best; {gate_label})"
+        )
+        ax_score.legend(loc="lower left", fontsize=8)
         ax_score.grid(True, alpha=0.25)
+
+    # ── Panel: Eval portfolio diagnostics ───────────────────────────────
+    if has_diag and eval_diag is not None and eval_timesteps is not None:
+        ax_diag = axes[panel]
+        panel += 1
+        ts = np.asarray(eval_timesteps, dtype=np.int64)
+
+        def _arr(key: str) -> np.ndarray | None:
+            val = eval_diag.get(key)
+            if val is None or len(val) != len(ts):
+                return None
+            return np.asarray(val, dtype=np.float64)
+
+        pct_series = [
+            ("mean_cash_frac", "cash", "#1f77b4"),
+            ("mean_gross_exposure", "gross exposure", "#2ca02c"),
+            ("mean_turnover", "turnover", "#ff7f0e"),
+            ("cap_hit_fraction", "cap hits", "#d62728"),
+        ]
+        plotted = False
+        for key, label, color in pct_series:
+            arr = _arr(key)
+            if arr is not None:
+                ax_diag.plot(ts, 100.0 * arr, lw=1.5, marker=".", ms=3, color=color, label=label)
+                plotted = True
+        ax_diag.set_ylabel("%")
+        ax_diag.yaxis.set_major_formatter(_percent_formatter())
+        ax_diag.xaxis.set_major_formatter(_timestep_formatter())
+        ax_diag.set_xlabel("timesteps")
+        ax_diag.grid(True, alpha=0.25)
+
+        eff = _arr("mean_effective_n_assets")
+        if eff is not None:
+            ax_eff = ax_diag.twinx()
+            ax_eff.plot(ts, eff, lw=1.5, marker=".", ms=3, color="#9467bd", label="effective N")
+            ax_eff.set_ylabel("effective N", color="#9467bd")
+            ax_eff.tick_params(axis="y", labelcolor="#9467bd")
+            lines1, labels1 = ax_diag.get_legend_handles_labels()
+            lines2, labels2 = ax_eff.get_legend_handles_labels()
+            ax_diag.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7, ncol=2)
+        elif plotted:
+            ax_diag.legend(loc="upper left", fontsize=7, ncol=2)
+        ax_diag.set_title("Periodic validation diagnostics — allocation behavior")
 
     # ── Panel: Episode-end NAV in dollars ────────────────────────────
     if has_nav:
@@ -258,8 +583,28 @@ def plot_training_progress(
         xmax = max(xmax, float(np.max(np.asarray(episode_nav_ts, dtype=np.float64))))
     if xmax > 0:
         pad = max(xmax * 0.01, 1.0)
+        x_hi = xmax + pad
         for ax in axes:
-            ax.set_xlim(0.0, xmax + pad)
+            ax.set_xlim(0.0, x_hi)
+        shaded = False
+        for ax in axes:
+            _shade_best_model_eligible(
+                ax,
+                best_model_min_step,
+                x_hi,
+                labeled=not shaded,
+            )
+            if best_model_min_step is not None and best_model_min_step > 0:
+                shaded = True
+        if ax_eval_nav is not None and best_eval_step is not None:
+            best_nav_y: float | None = None
+            if eval_timesteps is not None and eval_ending_navs is not None:
+                ts_arr = np.asarray(eval_timesteps, dtype=np.int64)
+                nav_arr = np.asarray(eval_ending_navs, dtype=np.float64)
+                hits = np.nonzero(ts_arr == int(best_eval_step))[0]
+                if hits.size:
+                    best_nav_y = float(nav_arr[int(hits[0])])
+            _mark_saved_best_checkpoint(ax_eval_nav, best_eval_step, best_nav_y)
 
     fig.savefig(save_path, dpi=140)
     plt.close(fig)
@@ -311,7 +656,7 @@ def _plot_equity_drawdown_benchmarks(
     if nav_risk_parity is not None:
         bench_series.append((nav_risk_parity, "Naive risk parity", COLOR_RP, "-", 1.5))
     if nav_equal_weight is not None:
-        bench_series.append((nav_equal_weight, "Equal-weight buy & hold", COLOR_EW, "-", 1.4))
+        bench_series.append((nav_equal_weight, "Equal-weight daily rebalanced", COLOR_EW, "-", 1.4))
 
     eq_lines: list[tuple[np.ndarray, str, str, str, float]] = []
     z = 2
@@ -409,6 +754,7 @@ def plot_backtest_dashboard(
     asset_labels: Optional[Sequence[str]] = None,
     model_label: str = "Model",
     title: str = "OOS backtest vs benchmarks",
+    metrics: Optional[dict] = None,
     save_path: str | Path = "plots/backtest.png",
 ) -> Path:
     """
@@ -452,6 +798,31 @@ def plot_backtest_dashboard(
         nav_stochastic_ensemble=nav_stochastic_ensemble,
         model_label=model_label,
     )
+    if metrics:
+        def _pct(v):
+            return "n/a" if v is None else f"{float(v) * 100:+.1f}%"
+
+        def _num(v):
+            return "n/a" if v is None else f"{float(v):.2f}"
+
+        text = (
+            f"Return {_pct(metrics.get('total_return'))}   "
+            f"Sharpe {_num(metrics.get('sharpe'))}   "
+            f"Max DD {_pct(metrics.get('max_drawdown'))}   "
+            f"DSR {_num(metrics.get('deflated_sharpe'))} "
+            f"(trials={metrics.get('oos_trials_for_window', 'n/a')})   "
+            f"Excess vs EW {_pct(metrics.get('excess_equal_weight'))}"
+        )
+        axes[0].text(
+            0.99,
+            0.02,
+            text,
+            transform=axes[0].transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.9),
+        )
 
     if weights is not None and weights.size > 0:
         w = np.asarray(weights, dtype=np.float64)
@@ -545,6 +916,34 @@ def _mean_max_dd_frac_from_diagnostics_jsonl(path: Path) -> np.ndarray | None:
     return np.asarray(fracs, dtype=np.float64) if fracs else None
 
 
+def _portfolio_diagnostics_from_jsonl(path: Path) -> dict[str, np.ndarray] | None:
+    """One portfolio-diagnostic scalar series per eval cycle from diagnostics JSONL."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    keys = (
+        "mean_cash_frac",
+        "mean_gross_exposure",
+        "mean_effective_n_assets",
+        "mean_turnover",
+        "cap_hit_fraction",
+    )
+    rows: dict[str, list[float]] = {k: [] for k in keys}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            panel = rec.get("portfolio") or {}
+            for k in keys:
+                rows[k].append(float(panel.get(k, np.nan)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if not any(rows.values()):
+        return None
+    return {k: np.asarray(v, dtype=np.float64) for k, v in rows.items()}
+
+
 def load_eval_history_npz(path: Path) -> dict[str, np.ndarray] | None:
     """Load full eval history arrays for plotting (backward-compatible with older npz)."""
     path = Path(path)
@@ -587,6 +986,17 @@ def load_eval_history_npz(path: Path) -> dict[str, np.ndarray] | None:
                 out["mean_max_drawdown_pct"] = (
                     100.0 * dd_nav / np.maximum(out["mean_ending_nav"], 1e-12)
                 )
+        for scalar_key in ("best_eval_step", "best_model_min_step"):
+            val = _scalar_from_npz(z, scalar_key)
+            if val is not None:
+                out[scalar_key] = val
+        jsonl = path.parent / "eval_portfolio_diagnostics.jsonl"
+        diag = _portfolio_diagnostics_from_jsonl(jsonl)
+        if diag is not None:
+            n = len(out["timesteps"])
+            out["portfolio_diagnostics"] = {
+                k: v for k, v in diag.items() if len(v) == n
+            }
         return out
     except (OSError, ValueError, KeyError):
         return None
@@ -620,6 +1030,7 @@ def regenerate_training_plot(run_dir: str | Path, *, title: str | None = None) -
         except (OSError, ValueError, KeyError):
             pass
     run_id = run_dir.name
+    gate_step, best_step = resolve_eval_plot_milestones(hist, run_dir=run_dir)
     return plot_training_progress(
         ep_ts,
         ep_rew,
@@ -628,11 +1039,17 @@ def regenerate_training_plot(run_dir: str | Path, *, title: str | None = None) -
         eval_std_navs=hist.get("std_ending_nav"),
         eval_robust_scores=hist.get("robust_scores"),
         eval_mean_max_dd_pct=hist.get("mean_max_drawdown_pct"),
+        eval_mean_excess_nav=hist.get("mean_excess_nav"),
+        eval_stitched_excess_nav=hist.get("stitched_excess_nav"),
+        eval_diag=hist.get("portfolio_diagnostics"),
+        eval_score_formula=_score_formula_from_run(run_dir),
         episode_navs=ep_nav,
         episode_nav_ts=ep_nav_ts,
         episode_lengths=ep_len if ep_len else None,
         title=title or f"RL portfolio training — {run_id}",
         save_path=plot_path,
+        best_model_min_step=gate_step,
+        best_eval_step=best_step,
     )
 
 
@@ -740,6 +1157,16 @@ class TrainingVizCallback(BaseCallback):
             ev_std = hist.get("std_ending_nav")
             ev_score = hist.get("robust_scores")
             ev_dd_pct = hist.get("mean_max_drawdown_pct")
+            ev_excess = hist.get("mean_excess_nav")
+            ev_stitched = hist.get("stitched_excess_nav")
+            ev_diag = hist.get("portfolio_diagnostics")
+        else:
+            ev_excess = ev_stitched = ev_diag = None
+        gate_step, best_step = (
+            resolve_eval_plot_milestones(hist, run_dir=self.plot_path.parent.parent)
+            if hist is not None
+            else (None, None)
+        )
         plot_training_progress(
             self._episode_ts,
             self._episode_rewards,
@@ -748,11 +1175,17 @@ class TrainingVizCallback(BaseCallback):
             eval_std_navs=ev_std,
             eval_robust_scores=ev_score,
             eval_mean_max_dd_pct=ev_dd_pct,
+            eval_mean_excess_nav=ev_excess,
+            eval_stitched_excess_nav=ev_stitched,
+            eval_diag=ev_diag,
+            eval_score_formula=_score_formula_from_run(self.plot_path.parent.parent),
             episode_navs=self._episode_navs if self._episode_navs else None,
             episode_nav_ts=self._episode_nav_ts if self._episode_nav_ts else None,
             episode_lengths=self._episode_lengths if self._episode_lengths else None,
             smooth_window=self.smooth_window,
             save_path=self.plot_path,
+            best_model_min_step=gate_step,
+            best_eval_step=best_step,
         )
         self._save_episode_history()
         mark_plot_saved(self.plot_path)

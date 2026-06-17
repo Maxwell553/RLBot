@@ -137,7 +137,7 @@ def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "
         f"{len(records)} run record(s) across {n_variants} variant(s) "
         f"({n_groups} seed-group(s)); "
         f"{n_oos_reads} holdout read(s) recorded. OOS metrics shown only for promoted "
-        "(tier ≥ 4) runs; checkpoint rule = eval-NAV-best. Any OOS number below was "
+        "(tier ≥ 4) runs; checkpoint rule = robust-eval-score-best. Any OOS number below was "
         f"selected from {n_variants} variant(s) — interpret with that multiplicity in mind. "
         "Generated from registry.jsonl — do not edit by hand.",
         "",

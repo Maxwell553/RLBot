@@ -116,12 +116,13 @@ SUPPORTED_SUCCESS_GATES = {
     "eval_nav_mean_min",       # mean best_eval_nav across seeds >= x
     "eval_nav_median_min",     # median best_eval_nav across seeds >= x
     "eval_nav_spread_max_frac",  # (max-min)/|median| of best_eval_nav <= x (seed stability)
+    "eval_score_mean_min",       # mean robust best_eval_score across seeds >= x
+    "eval_score_median_min",     # median robust best_eval_score across seeds >= x
+    "eval_score_spread_max_frac",  # (max-min)/|median| of robust score <= x
     "oos_sharpe_min",          # tier>=4 rows only
     "oos_max_drawdown_floor",  # tier>=4: max_drawdown >= x (x negative, e.g. -0.25)
     "deflated_sharpe_min",     # tier>=4: selection-aware significance bar
 }
-
-_OOS_GATES = {"oos_sharpe_min", "oos_max_drawdown_floor", "deflated_sharpe_min"}
 
 
 def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> dict:
@@ -159,6 +160,11 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
     rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 2]
 
     navs = [float(r["best_eval_nav"]) for r in rows if r.get("best_eval_nav") is not None]
+    scores = [
+        float(r["best_eval_score"])
+        for r in rows
+        if r.get("best_eval_score") is not None
+    ]
     seeds = {r.get("seed") for r in rows if r.get("seed") is not None}
     n_seeds = len(seeds) if seeds else len(rows)
     if "min_seeds" in gates:
@@ -181,6 +187,34 @@ def evaluate_success_gates(success_gates: Mapping, rows: Iterable[Mapping]) -> d
                    obs, float(gates["eval_nav_spread_max_frac"]))
         else:
             _check("eval_nav_spread_max_frac", None, None, float(gates["eval_nav_spread_max_frac"]))
+    if "eval_score_mean_min" in gates:
+        obs = sum(scores) / len(scores) if scores else None
+        _check(
+            "eval_score_mean_min",
+            None if obs is None else obs >= float(gates["eval_score_mean_min"]),
+            obs,
+            float(gates["eval_score_mean_min"]),
+        )
+    if "eval_score_median_min" in gates:
+        obs = float(statistics.median(scores)) if scores else None
+        _check(
+            "eval_score_median_min",
+            None if obs is None else obs >= float(gates["eval_score_median_min"]),
+            obs,
+            float(gates["eval_score_median_min"]),
+        )
+    if "eval_score_spread_max_frac" in gates:
+        if len(scores) >= 2:
+            med = float(statistics.median(scores))
+            obs = (max(scores) - min(scores)) / max(abs(med), 1e-9)
+            _check(
+                "eval_score_spread_max_frac",
+                obs <= float(gates["eval_score_spread_max_frac"]),
+                obs,
+                float(gates["eval_score_spread_max_frac"]),
+            )
+        else:
+            _check("eval_score_spread_max_frac", None, None, float(gates["eval_score_spread_max_frac"]))
     oos_rows = [r for r in rows if int(r.get("evaluation_tier", 0)) >= 4]
     for key, field in (
         ("oos_sharpe_min", "oos_sharpe"),

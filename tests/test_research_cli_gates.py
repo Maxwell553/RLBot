@@ -333,20 +333,32 @@ def test_screen_ranking_orders_and_advances_top_fraction() -> None:
     import scripts.research as research
 
     records = [
-        {"group_id": "a", "best_eval_nav": 100.0},
-        {"group_id": "a", "best_eval_nav": 110.0},
-        {"group_id": "b", "best_eval_nav": 300.0},
-        {"group_id": "c", "best_eval_nav": 200.0},
-        {"group_id": "d", "best_eval_nav": None},  # never trained far enough
+        {"group_id": "a", "best_eval_nav": 100.0, "best_eval_score": 10.0},
+        {"group_id": "a", "best_eval_nav": 110.0, "best_eval_score": 12.0},
+        {"group_id": "b", "best_eval_nav": 300.0, "best_eval_score": -5.0},
+        {"group_id": "c", "best_eval_nav": 200.0, "best_eval_score": 20.0},
+        {"group_id": "d", "best_eval_nav": None, "best_eval_score": None},  # never trained far enough
     ]
     ranked, advance = research.screen_ranking(records, keep_top=0.25)
-    assert [g for g, _ in ranked][:3] == ["b", "c", "a"]
-    assert advance == ["b"]  # round(4 * 0.25) = 1
-    assert ranked[-1][1] == float("-inf")  # nav-less group sinks to the bottom
+    assert [g for g, _ in ranked][:3] == ["c", "a", "b"]
+    assert advance == ["c"]  # round(4 * 0.25) = 1
+    assert ranked[-1][1] == float("-inf")  # score/nav-less group sinks to the bottom
     # at least one group always advances
     _, adv2 = research.screen_ranking(records[:2], keep_top=0.01)
     assert adv2 == ["a"]
     assert research.screen_ranking([], keep_top=0.5) == ([], [])
+
+
+def test_screen_ranking_falls_back_to_eval_nav_for_legacy_records() -> None:
+    import scripts.research as research
+
+    records = [
+        {"group_id": "a", "best_eval_nav": 100.0},
+        {"group_id": "b", "best_eval_nav": 300.0},
+    ]
+    ranked, advance = research.screen_ranking(records, keep_top=0.5)
+    assert [g for g, _ in ranked] == ["b", "a"]
+    assert advance == ["b"]
 
 
 def test_screen_uses_isolated_run_ids() -> None:

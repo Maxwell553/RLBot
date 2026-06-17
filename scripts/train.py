@@ -110,6 +110,8 @@ from rlbot.eval_selection import (
     append_eval_diagnostics_jsonl,
     compute_robust_eval_score,
 )
+from rlbot.eval_schedule import eval_freq_vector_steps, should_run_scheduled_eval
+from rlbot.research.spec import CANONICAL_WINDOWS
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
 from rlbot.reward_logging import RewardDecompAccumulator
 from rlbot.modal_cloud import commit_modal_volumes
@@ -225,6 +227,9 @@ class EvalNavBestModelCallback(EvalCallback):
         score_std_coef: float = 0.75,
         score_dd_coef: float = 2.0,
         score_stitched_blend: float = 0.5,
+        eval_freq_steps: int = 500_000,
+        eval_freq_pre_gate_steps: int = 3_000_000,
+        n_envs: int = 16,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
@@ -248,6 +253,12 @@ class EvalNavBestModelCallback(EvalCallback):
         self._stitched_agent_nav: list[float] = []
         self._stitched_excess_nav: list[float] = []
         self._stitched_max_dd_frac: list[float] = []
+        self._best_eval_step: int | None = None
+        self._eval_freq_steps_post = int(eval_freq_steps)
+        self._eval_freq_pre_gate_steps = int(eval_freq_pre_gate_steps)
+        self._n_envs = max(int(n_envs), 1)
+        self._last_eval_n_calls = 0
+        self._post_gate_eval_forced = False
         self._train_vec_env = train_vec_env
         self.patience = int(patience)
         self.curriculum_end_step = int(curriculum_end_step)
@@ -256,7 +267,28 @@ class EvalNavBestModelCallback(EvalCallback):
         self._evals_since_best = 0
         self.early_stop_reason: str | None = None
         self._load_nav_history()
-        super().__init__(eval_env, best_model_save_path=None, **kwargs)
+        vec_post = eval_freq_vector_steps(self._eval_freq_steps_post, self._n_envs)
+        super().__init__(eval_env, best_model_save_path=None, eval_freq=vec_post, **kwargs)
+
+    def _should_run_eval(self) -> bool:
+        return should_run_scheduled_eval(
+            n_calls=int(self.n_calls),
+            last_eval_n_calls=int(self._last_eval_n_calls),
+            num_timesteps=int(self.num_timesteps),
+            post_gate_global_freq=self._eval_freq_steps_post,
+            pre_gate_global_freq=self._eval_freq_pre_gate_steps,
+            best_model_min_step=int(self.best_model_min_step),
+            n_envs=self._n_envs,
+            post_gate_eval_forced=self._post_gate_eval_forced,
+        )
+
+    def _mark_eval_ran(self) -> None:
+        self._last_eval_n_calls = int(self.n_calls)
+        if (
+            self.best_model_min_step > 0
+            and self.num_timesteps >= self.best_model_min_step
+        ):
+            self._post_gate_eval_forced = True
 
     def _best_model_gate_open(self) -> bool:
         return self.best_model_min_step <= 0 or self.num_timesteps >= self.best_model_min_step
@@ -270,6 +302,30 @@ class EvalNavBestModelCallback(EvalCallback):
             if t >= self.best_model_min_step
         ]
         return float(max(post)) if post else -np.inf
+
+    def _restore_best_selection_from_history(self) -> None:
+        if not self._robust_scores:
+            return
+        n = min(len(self._robust_scores), len(self._nav_timesteps))
+        if n <= 0:
+            return
+        scores = np.asarray(self._robust_scores[:n], dtype=np.float64)
+        steps = np.asarray(self._nav_timesteps[:n], dtype=np.int64)
+        if self.best_model_min_step > 0:
+            mask = steps >= self.best_model_min_step
+        else:
+            mask = np.ones(n, dtype=bool)
+        if not np.any(mask):
+            self.best_selection_score = -np.inf
+            self.best_mean_nav = -np.inf
+            return
+        masked_scores = scores[mask]
+        j_masked = int(np.argmax(masked_scores))
+        idx = int(np.nonzero(mask)[0][j_masked])
+        self.best_selection_score = float(scores[idx])
+        if idx < len(self._mean_ending_nav):
+            self.best_mean_nav = float(self._mean_ending_nav[idx])
+        self._best_eval_step = int(steps[idx])
 
     def _load_nav_history(self) -> None:
         if not self.nav_history_path.is_file():
@@ -296,35 +352,45 @@ class EvalNavBestModelCallback(EvalCallback):
             ):
                 if key in z:
                     setattr(self, attr, list(np.asarray(z[key], dtype=np.float64)))
+            bes = z.get("best_eval_step")
+            if bes is not None:
+                self._best_eval_step = int(np.asarray(bes).reshape(-1)[0])
+            if self._nav_timesteps:
+                if self.best_model_min_step > 0:
+                    self._post_gate_eval_forced = any(
+                        int(t) >= self.best_model_min_step for t in self._nav_timesteps
+                    )
+                self._last_eval_n_calls = int(self._nav_timesteps[-1] // self._n_envs)
             if self._robust_scores:
                 if self.best_model_min_step > 0:
-                    self.best_selection_score = self._post_gate_best_score()
                     self._post_gate_tracking_started = any(
                         t >= self.best_model_min_step for t in self._nav_timesteps
                     )
-                else:
-                    self.best_selection_score = float(max(self._robust_scores))
-                if self._mean_ending_nav:
-                    j = int(np.argmax(self._robust_scores))
-                    self.best_mean_nav = float(self._mean_ending_nav[j])
+                self._restore_best_selection_from_history()
         except (OSError, ValueError, KeyError):
             pass
 
     def _save_nav_history(self) -> None:
         self.nav_history_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            self.nav_history_path,
-            timesteps=np.asarray(self._nav_timesteps, dtype=np.int64),
-            mean_ending_nav=np.asarray(self._mean_ending_nav, dtype=np.float64),
-            robust_scores=np.asarray(self._robust_scores, dtype=np.float64),
-            std_ending_nav=np.asarray(self._std_ending_nav, dtype=np.float64),
-            mean_max_drawdown_nav=np.asarray(self._mean_max_dd_nav, dtype=np.float64),
-            mean_max_drawdown_frac=np.asarray(self._mean_max_dd_frac, dtype=np.float64),
-            mean_excess_nav=np.asarray(self._mean_excess_nav, dtype=np.float64),
-            stitched_agent_nav=np.asarray(self._stitched_agent_nav, dtype=np.float64),
-            stitched_excess_nav=np.asarray(self._stitched_excess_nav, dtype=np.float64),
-            stitched_max_drawdown_frac=np.asarray(self._stitched_max_dd_frac, dtype=np.float64),
-        )
+        payload: dict[str, np.ndarray] = {
+            "timesteps": np.asarray(self._nav_timesteps, dtype=np.int64),
+            "mean_ending_nav": np.asarray(self._mean_ending_nav, dtype=np.float64),
+            "robust_scores": np.asarray(self._robust_scores, dtype=np.float64),
+            "std_ending_nav": np.asarray(self._std_ending_nav, dtype=np.float64),
+            "mean_max_drawdown_nav": np.asarray(self._mean_max_dd_nav, dtype=np.float64),
+            "mean_max_drawdown_frac": np.asarray(self._mean_max_dd_frac, dtype=np.float64),
+            "mean_excess_nav": np.asarray(self._mean_excess_nav, dtype=np.float64),
+            "stitched_agent_nav": np.asarray(self._stitched_agent_nav, dtype=np.float64),
+            "stitched_excess_nav": np.asarray(self._stitched_excess_nav, dtype=np.float64),
+            "stitched_max_drawdown_frac": np.asarray(self._stitched_max_dd_frac, dtype=np.float64),
+        }
+        if self.best_model_min_step > 0:
+            payload["best_model_min_step"] = np.asarray(
+                [self.best_model_min_step], dtype=np.int64
+            )
+        if self._best_eval_step is not None:
+            payload["best_eval_step"] = np.asarray([self._best_eval_step], dtype=np.int64)
+        np.savez_compressed(self.nav_history_path, **payload)
 
     def _collect_eval_episodes(self) -> list[dict]:
         episodes: list[dict] = []
@@ -363,14 +429,19 @@ class EvalNavBestModelCallback(EvalCallback):
         )
 
     def _on_step(self) -> bool:
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+        run_eval = self._should_run_eval()
+        if run_eval:
             if self._train_vec_env is not None:
                 sync_vecnormalize_stats(self._train_vec_env, self.eval_env)
             self.eval_env.env_method("pop_eval_episodes")
 
+        old_freq = self.eval_freq
+        self.eval_freq = 1 if run_eval else max(int(self.n_calls) + 1, 2)
         continue_training = super()._on_step()
+        self.eval_freq = old_freq
 
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+        if run_eval:
+            self._mark_eval_ran()
             episodes = self._collect_eval_episodes()
             if episodes:
                 metrics = compute_robust_eval_score(
@@ -424,6 +495,7 @@ class EvalNavBestModelCallback(EvalCallback):
                     if score > self.best_selection_score:
                         self.best_selection_score = score
                         self.best_mean_nav = mean_nav
+                        self._best_eval_step = int(self.num_timesteps)
                         self._evals_since_best = 0
                         if self.verbose >= 1:
                             print(
@@ -438,6 +510,7 @@ class EvalNavBestModelCallback(EvalCallback):
                             self._train_vec_env.save(
                                 str(self._best_model_dir / "vec_normalize.pkl")
                             )
+                        self._save_nav_history()
                     elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
                         self._evals_since_best += 1
                         self.logger.record("eval/evals_since_best", self._evals_since_best)
@@ -914,6 +987,30 @@ def main() -> None:
         set_config(load_config(args.config))
         cfg = get_config()
 
+    if args.window is not None:
+        window_name = f"W{int(args.window)}"
+        canonical = CANONICAL_WINDOWS.get(window_name)
+        if canonical is None:
+            raise SystemExit(
+                f"--window {args.window} is not canonical; choose one of "
+                f"{', '.join(sorted(CANONICAL_WINDOWS))}."
+            )
+        for attr, value in canonical.items():
+            current = getattr(args, attr)
+            if current is None:
+                setattr(args, attr, value)
+            elif str(current) != str(value):
+                raise SystemExit(
+                    f"--window {args.window} implies --{attr.replace('_', '-')} {value}, "
+                    f"but got {current}. Omit the explicit date flag or choose the "
+                    "matching canonical window."
+                )
+        _startup_log(
+            f"[train] --window {args.window}: using canonical {window_name} "
+            f"train_end={args.train_end}, holdout_start={args.holdout_start}, "
+            f"holdout_end={args.holdout_end}"
+        )
+
     if args.n_assets is not None:
         cfg = slice_config_to_n_assets(get_config(), args.n_assets)
         set_config(cfg)
@@ -1313,7 +1410,7 @@ def main() -> None:
     print(f"  split=alternating walk-forward (block={args.block_size}, stride={args.eval_stride}) on trainable-only data")
     print(f"  train={len(train_idx)} bars ({len(train_boundaries)} boundaries), eval={len(eval_idx)} bars ({len(eval_boundaries)} boundaries)")
     if args.resume:
-        print(f"  MODE: fine-tune from {args.resume}")
+        print(f"  MODE: crash-resume from {args.resume}")
 
     # ── envs ─────────────────────────────────────────────────────────────
     n_envs = args.n_envs
@@ -1490,8 +1587,9 @@ def main() -> None:
     print(f"  total params: {total_params:,}  (trainable: {trainable_params:,})")
 
     # ── callbacks ────────────────────────────────────────────────────────
-    # Evaluate every 500k global timesteps (500k / n_envs vector steps; decoupled from n_steps).
-    eval_freq = max(500_000 // n_envs, 1)
+    eval_freq_steps = int(tr_cfg.eval_freq_steps)
+    eval_freq_pre_gate = int(tr_cfg.eval_freq_pre_gate_steps)
+    eval_freq = eval_freq_vector_steps(eval_freq_steps, n_envs)
     validation_segments = eval_env.env_method("get_segments")[0]
     n_validation_blocks = (
         len(validation_segments) if validation_segments else tr_cfg.eval_n_episodes
@@ -1515,6 +1613,10 @@ def main() -> None:
     curriculum_end_step = dr_widen_end_milestone(args.timesteps)
     early_stop_patience = int(tr_cfg.early_stop_patience)
     best_model_min_step = resolve_best_model_min_step(args.timesteps)
+    print(
+        f"  eval cadence: {eval_freq_pre_gate:,} global steps pre fee-ramp, "
+        f"{eval_freq_steps:,} after (gate {best_model_min_step:,})"
+    )
     eval_benchmark_ctx = EvalBenchmarkContext(
         ohlcv=eval_pack.ohlcv,
         idx=eval_pack.idx,
@@ -1538,8 +1640,10 @@ def main() -> None:
         score_std_coef=tr_cfg.best_model_score_std_coef,
         score_dd_coef=tr_cfg.best_model_score_dd_coef,
         score_stitched_blend=tr_cfg.best_model_score_stitched_blend,
+        eval_freq_steps=eval_freq_steps,
+        eval_freq_pre_gate_steps=eval_freq_pre_gate,
+        n_envs=n_envs,
         log_path=str(paths.eval_log_dir),
-        eval_freq=eval_freq,
         n_eval_episodes=n_validation_blocks,
         deterministic=True,
         render=False,

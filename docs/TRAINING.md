@@ -121,7 +121,7 @@ Writes audited JSON (executed target weights after action smoothing, live mask, 
 
 ## Walk-forward windows
 
-Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. Published OOS cohorts **`W*_612`**, **`W*_613`**, and **`W*_614`** are recorded in [RESEARCH.md](RESEARCH.md#current-published-cohorts); backtest new runs with the commands below and copy durable headline metrics into that doc.
+Calendar presets are documented in [RESEARCH.md](RESEARCH.md). Pass `--train-end`, `--holdout-start`, `--holdout-end`, and `--until` on `train.py`; backtest reads them from `Runs/<run-id>/manifest.json`. Published OOS cohorts are recorded in [RESEARCH.md](RESEARCH.md#current-published-cohorts); backtest new runs with the commands below and copy durable headline metrics into that doc.
 
 ```bash
 python scripts/backtest.py --run-ids <RUN_ID_1>,<RUN_ID_2>,<RUN_ID_3> --checkpoint best

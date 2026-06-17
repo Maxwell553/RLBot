@@ -69,8 +69,8 @@ use [scripts/research.py](scripts/research.py) and the workflow in
 - **Observation size:** `10 * N + 28`; derive it from the active universe
   instead of hard-coding dimensions.
 - **Data split:** chronological OOS holdout is reserved before train/eval
-  splitting. Default feature split mode is `independent`, with causal preroll for
-  slow indicators.
+  splitting. Default `feature_split_mode` is `independent`, with
+  `feature_preroll_bars` causal preroll for slow indicators.
 - **Execution timing:** observations use data available through the configured
   lag; rebalance fills occur at the next open and are marked to the next close.
 - **Reward:** return, feasible benchmark excess, Sortino difference,
@@ -121,6 +121,17 @@ The research loop is intentionally gated:
 
 Use small screens and seed repeats before promoting expensive full-cohort runs.
 Do not judge a configuration from one lucky window.
+
+Canonical windows used by `--window N`:
+
+| Window | Train through | OOS holdout |
+| --- | --- | --- |
+| W1 | 2015-12-31 | 2016-01-01 to 2017-12-31 |
+| W2 | 2017-12-31 | 2018-01-01 to 2019-12-31 |
+| W3 | 2019-12-31 | 2020-01-01 to 2021-12-31 |
+| W4 | 2021-12-31 | 2022-01-01 to 2023-12-31 |
+| W5 | 2023-12-31 | 2024-01-01 to 2025-12-31 |
+| W6 | 2025-12-31 | 2026-01-01 to 2027-12-31 |
 
 ## Development Notes
 

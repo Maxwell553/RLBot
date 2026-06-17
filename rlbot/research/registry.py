@@ -152,6 +152,8 @@ def build_record(
         # training selection signal
         "best_eval_nav": training_summary.get("best_eval_nav")
         or manifest.get("best_eval_nav"),
+        "best_eval_score": training_summary.get("best_eval_score")
+        or manifest.get("best_eval_score"),
         "best_eval_step": training_summary.get("best_eval_step")
         or manifest.get("best_eval_step"),
         "early_stop_reason": training_summary.get("early_stop_reason"),
