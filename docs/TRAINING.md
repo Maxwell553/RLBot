@@ -6,9 +6,9 @@
 
 **CLI shortcut:** `scripts/train.py --n-assets N` uses the **first N keys** from that block (YAML order), slices `benchmark_cap_weights` and `transaction_costs.*`, and renormalizes cap weights. You cannot set **N** larger than the number of keys in the file — add symbols to the YAML first. The benchmark label (`universe.benchmark`, usually `SP500`) is used for benchmark-only/SPY and 60/40 reporting, but the reward/eval benchmark is now driven by `reward.benchmark_cap_weights` and `training.best_model_benchmark`.
 
-**Cache rule when changing N:** Training always writes the **effective** sliced panel to `Runs/<run_id>/data_cache.npz` (width **N**). The global `.cache/data_cache.npz` may still be wider until you refresh. After changing `--n-assets` or editing `universe.assets`, run **`--refresh-data`** before the next study so the global cache, config lists, and panel width stay aligned. Backtest loads the run-local snapshot by default and will error if manifest `n_assets` ≠ cache width.
+**Cache rule when changing N:** Training always writes the **effective** sliced panel to `Runs/<run_id>/data_cache.npz` (width **N**). The global `.cache/data_cache.npz` may still be wider until you refresh. After changing `--n-assets` or editing `universe.assets`, run `**--refresh-data`** before the next study so the global cache, config lists, and panel width stay aligned. Backtest loads the run-local snapshot by default and will error if manifest `n_assets` ≠ cache width.
 
-To change **which** assets are in the panel (not just how many), edit the YAML and run `--refresh-data` to update the cache.
+To change **which** assets are in the panel (not just how many), edit the YAML and run training with the `--refresh-data flag` to update the cache.
 
 ```yaml
 # config/config.yaml — full list; --n-assets 7 keeps SP500 … BOND10Y
@@ -29,7 +29,7 @@ For each asset key you must provide **one float** in each of (length **N**, same
 - `transaction_costs.tx_fee`
 - `transaction_costs.annual_holding_cost`
 
-Observation size: **`obs_dim = 10 × N + 28`** (includes per-asset live mask in the vector). Action size: **`N + 1`**.
+Observation size: `**obs_dim = 10 × N + 28`** (includes per-asset live mask in the vector). Action size: `**N + 1**`.
 
 See also [config/README.md](../config/README.md).
 
@@ -41,7 +41,7 @@ See also [config/README.md](../config/README.md).
 
 1. **PyTorch / Stable-Baselines3 import** — often 1–5 minutes the first time (SymPy and related deps).
 2. **Walk-forward feature panels** — per-block RSI/MACD/fracdiff on the trainable window (~1–3 minutes).
-3. **`SubprocVecEnv` spawn** — each of the `n_envs` workers reloads the stack on macOS (~1–3 minutes).
+3. `**SubprocVecEnv` spawn** — each of the `n_envs` workers reloads the stack on macOS (~1–3 minutes).
 
 Later runs in the **same** terminal are usually faster (imports already cached). Use `PYTHONUNBUFFERED=1` if your terminal still buffers stdout.
 
@@ -60,7 +60,7 @@ Kill active `scripts/train.py` processes so checkpoints are not written mid-step
 ### 2. Edit `config/config.yaml`
 
 - Set `universe.assets` to your target **N** labels (5–55).
-- Align `benchmark_cap_weights` and all `transaction_costs.*` lists to **N** values in the **same key order**.
+- Align `benchmark_cap_weights` and all `transaction_costs.`* lists to **N** values in the **same key order**.
 - Keep `universe.benchmark` as one of the asset keys if you want benchmark-only/SPY and 60/40 diagnostics. It does **not** define the reward or robust eval benchmark.
 
 ### 3. Refresh the data cache
@@ -132,10 +132,12 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 ## Crash resume vs fine-tune
 
-| Flag | Use when | Behavior |
-|------|----------|----------|
-| `--resume PATH` | Modal/local crash after preemption | Load weights + VecNormalize; **continue** curriculum + adaptive-entropy callbacks from checkpoint timestep |
-| `--finetune PATH` | Experimental second stage | Lower LR / entropy / clip; **skips** curriculum + entropy callbacks |
+
+| Flag              | Use when                           | Behavior                                                                                                   |
+| ----------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `--resume PATH`   | Modal/local crash after preemption | Load weights + VecNormalize; **continue** curriculum + adaptive-entropy callbacks from checkpoint timestep |
+| `--finetune PATH` | Experimental second stage          | Lower LR / entropy / clip; **skips** curriculum + entropy callbacks                                        |
+
 
 Do not pass both flags. See [MODAL.md](MODAL.md) for preemption resume examples.
 
@@ -150,15 +152,17 @@ Do not pass both flags. See [MODAL.md](MODAL.md) for preemption resume examples.
 
 Each run lives under `Runs/<run_id>/` (see `rlbot/run_artifacts.py`):
 
-| Path | Contents |
-|------|----------|
-| `manifest.json` | Dates, `chronological_holdout`, tickers, `n_assets`, `obs_dim` (holdout block preserved through training) |
-| `config.yaml` | Snapshot of training config |
-| `data_cache.npz` | Run-local OHLCV panel snapshot (preferred by backtest/infer) |
-| `models/` | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair) |
+
+| Path                                        | Contents                                                                                                                                                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `manifest.json`                             | Dates, `chronological_holdout`, tickers, `n_assets`, `obs_dim` (holdout block preserved through training)                                                                                                        |
+| `config.yaml`                               | Snapshot of training config                                                                                                                                                                                      |
+| `data_cache.npz`                            | Run-local OHLCV panel snapshot (preferred by backtest/infer)                                                                                                                                                     |
+| `models/`                                   | `ppo_portfolio_final.zip`, `vec_normalize.pkl` (final step), `best/best_model.zip` + `best/vec_normalize.pkl` (matched pair)                                                                                     |
 | `plots/`, `logs/`, `tb_logs/`, `eval_logs/` | Training visuals, text logs, TensorBoard, eval NAV + `reward_decomp.json` (return, benchmark, sortino, participation, inactivity, churn, turnover, drawdown amp, drawdown penalty, concentration, exposure risk) |
-| `backtest_summary.json` | OOS metrics, `portfolio_diagnostics` (cash, gross exposure, HHI, eff-N, cap hits, turnover, per-asset weights), config/data hashes |
-| `training_summary.json` | Training-end summary (after train completes) |
+| `backtest_summary.json`                     | OOS metrics, `portfolio_diagnostics` (cash, gross exposure, HHI, eff-N, cap hits, turnover, per-asset weights), config/data hashes                                                                               |
+| `training_summary.json`                     | Training-end summary (after train completes)                                                                                                                                                                     |
+
 
 Migrate legacy scattered dirs once: `python scripts/migrate_runs_layout.py`.
 

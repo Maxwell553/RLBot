@@ -1,13 +1,15 @@
 # Training on Modal
 
-Run long GPU training jobs on [Modal](https://modal.com) while keeping the same artifact layout as local training: `Runs/<run_id>/` (models, plots, logs, TensorBoard, manifest).
+Run long GPU training jobs on [Modal](https://modal.com) while keeping the same artifact layout as local training: `Runs/<run_id>/` (models, plots, logs, TensorBoard, manifest). Note: runs are long and training can be potentially very expensive. 
 
 ## Code layout
 
-| File | Role |
-|------|------|
+
+| File                   | Role                                                                                                |
+| ---------------------- | --------------------------------------------------------------------------------------------------- |
 | `scripts/modal_app.py` | Modal App: remote train, web endpoints, `upload_cache` / `list_runs` / `serve_plot`, and `sync` CLI |
-| `rlbot/modal_cloud.py` | Volume commit hooks (used by `train.py` on Modal) and artifact sync helpers |
+| `rlbot/modal_cloud.py` | Volume commit hooks (used by `train.py` on Modal) and artifact sync helpers                         |
+
 
 `modal_cloud` stays separate from the App file so local `train.py` can import volume-commit hooks without loading the Modal SDK at import time.
 
@@ -43,20 +45,24 @@ modal run scripts/modal_app.py::train -- \
 
 Pick a GPU (default `A10G`). The launch broker scales vCPUs, `n_envs`, and `batch_size` to match:
 
-| GPU | vCPUs | `n_envs` | `batch_size` (auto) |
-|-----|-------|----------|---------------------|
-| T4 | 4 | 8 | 8,192 |
-| A10G / L4 | 16 | 16 | 16,384 |
-| A100 | 32 | 32 | 32,768 |
-| H100 | 64 | 64 | 65,536 |
+
+| GPU       | vCPUs | `n_envs` | `batch_size` (auto) |
+| --------- | ----- | -------- | ------------------- |
+| T4        | 4     | 8        | 8,192               |
+| A10G / L4 | 16    | 16       | 16,384              |
+| A100      | 32    | 32       | 32,768              |
+| H100      | 64    | 64       | 65,536              |
+
 
 GPU choice is fixed at launch (`--modal-gpu`); SB3 cannot rescale `n_envs` mid-run. To train faster, pick a bigger card before starting (or stop and `--resume` from the latest checkpoint on a faster tier). Rough wall-clock vs ~6h on a Mac:
 
-| `--modal-gpu` | Parallel envs | Typical speedup |
-|---------------|---------------|-----------------|
-| A10G (default) | 16 | ~1× |
-| A100 | 32 | ~1.5–2× |
-| H100 | 64 | ~2–3× |
+
+| `--modal-gpu`  | Parallel envs | Typical speedup |
+| -------------- | ------------- | --------------- |
+| A10G (default) | 16            | ~1×             |
+| A100           | 32            | ~1.5–2×         |
+| H100           | 64            | ~2–3×           |
+
 
 `config.yaml` sets `n_epochs: 3` and a baseline `batch_size: 16384` for local 16-env training (~12 backprop loops per PPO pause). Modal overrides `n_envs` and `batch_size` at launch; `n_epochs` stays in config.
 
@@ -78,10 +84,12 @@ modal run scripts/modal_app.py::train -- --run-id <RUN_ID> --timesteps 50000000 
 
 Remote writes go to Modal volumes:
 
-| Volume | Mount | Contents |
-|--------|-------|----------|
-| `rlbot-runs` | `/workspace/Runs` | Per-run tree (`manifest.json`, `models/`, `plots/`, …) |
-| `rlbot-cache` | `/workspace/.cache` | Shared `data_cache.npz` |
+
+| Volume        | Mount               | Contents                                               |
+| ------------- | ------------------- | ------------------------------------------------------ |
+| `rlbot-runs`  | `/workspace/Runs`   | Per-run tree (`manifest.json`, `models/`, `plots/`, …) |
+| `rlbot-cache` | `/workspace/.cache` | Shared `data_cache.npz`                                |
+
 
 After each training plot refresh, the job commits the runs volume so local sync and web endpoints can see updates.
 
@@ -162,3 +170,4 @@ modal run scripts/modal_app.py::train -- \
 - **Costs:** 50M-step jobs are long; pick GPU in `rlbot/modal_cloud.py` (`DEFAULT_GPU` or `--modal-gpu`) to match your budget.
 - **n_envs:** Linux Modal containers usually spawn `SubprocVecEnv` faster than macOS; you can still tune `--n-envs` if memory is tight.
 - **Local vs remote:** Local `Runs/` is gitignored. After `--pull-all`, local backtest uses the same paths as a local training run.
+
