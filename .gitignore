@@ -27,6 +27,7 @@ build/
 data_cache.npz
 Runs/
 config/cohorts/
+paper/
 
 # Broker credentials and local execution state (reserved for the tier-5 shadow
 # ledger and any future broker integration; never tracked)

@@ -18,6 +18,7 @@ for another reader.
 | Config fields and defaults                  | [config/config.yaml](config/config.yaml), [config/README.md](config/README.md) |
 | Training, checkpoint selection, backtesting | [docs/TRAINING.md](docs/TRAINING.md)                                           |
 | Walk-forward results and research notes     | [docs/RESEARCH.md](docs/RESEARCH.md)                                           |
+| Quick review path for outside collaborators | [docs/REVIEW_GUIDE.md](docs/REVIEW_GUIDE.md)                                   |
 | Modal/cloud runs                            | [docs/MODAL.md](docs/MODAL.md)                                                 |
 | Agent/coding invariants                     | [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md)                                 |
 | Research automation CLI                     | [scripts/research.py](scripts/research.py)                                     |
@@ -62,8 +63,9 @@ use [scripts/research.py](scripts/research.py) and the workflow in
 
 ## Current Method At A Glance
 
-- **Universe:** by default 10 tradeable assets (though one can use anywhere between 5 and 55 assets): `SP500`, `GOLD`, `OIL`,
-`EURUSD`, `USDJPY`, `NIKKEI`, `FTSE`, `BOND10Y`, `COPPER`, `EM`. Macro series such as VIX/DXY/rates are observation inputs only. 
+- **Universe:** by default 10 tradeable assets, with support for 5 to 55:
+`SP500`, `GOLD`, `OIL`, `EURUSD`, `USDJPY`, `NIKKEI`, `FTSE`, `BOND10Y`,
+`COPPER`, `EM`. Macro series such as VIX/DXY/rates are observation inputs only.
 - **Action space:** `N + 1` weights, where cash competes with risky assets.
 Risky allocations are long-only and capped by `environment.max_single_asset_weight`
 after softmax projection.
@@ -75,8 +77,9 @@ splitting. Default `feature_split_mode` is `independent`, with
 - **Execution timing:** observations use data available through the configured
 lag; rebalance fills occur at the next open and are marked to the next close.
 - **Reward:** return, feasible benchmark excess, Sortino difference,
-participation/inactivity, churn, turnover, drawdown, concentration, and
-exposure-risk terms. `cash_daily_yield` defaults to `0.0`.
+participation/inactivity, churn, turnover, drawdown, concentration, excess
+downside volatility, and exposure-risk terms. `cash_daily_yield` defaults to
+`0.0`.
 - **Benchmark semantics:** `universe.benchmark` is for reporting only. Reward
 shaping uses `reward.benchmark_cap_weights`; checkpoint selection uses
 `training.best_model_benchmark`.
@@ -141,11 +144,15 @@ Canonical windows used by `--window N`:
 - Editable install: `pip install -e ".[dev]"`.
 - Main CLIs: `scripts/train.py`, `scripts/backtest.py`,
 `scripts/research.py`, `scripts/infer_weights.py`.
+- Diagnostic CLIs: `scripts/compare_checkpoints.py` compares earliest/latest
+step checkpoints with the robust-score-selected best checkpoint for completed
+runs. It performs additional OOS backtests, so use it only when intentionally
+spending holdout reads.
 - Installed entry points: `market-trainer-train`,
 `market-trainer-backtest`.
 - There is no top-level `train.py`/`backtest.py`; use the scripts above.
-- `.cache/`, `data_cache.npz`, `Runs/`, and execution/shadow-trading state are
-ignored.
+- `.cache/`, `data_cache.npz`, `Runs/`, `paper/`, and execution/shadow-trading
+state are ignored.
 
 Before changing data handling, environment execution, checkpoint selection, or
 OOS accounting, read [AGENTS.md](AGENTS.md) for invariants that span files.

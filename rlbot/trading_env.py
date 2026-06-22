@@ -3,6 +3,7 @@ Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / co
 
 Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
   - inactivity - cost-linked churn - drawdown penalty - concentration penalty
+  - volatility penalty - exposure risk penalty
   - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
   - drawdown penalty: dd_increase * reward_scale * drawdown_increase_penalty
     + max(dd_next - drawdown_level_floor, 0) * drawdown_level_penalty
@@ -36,8 +37,10 @@ from gymnasium import spaces
 
 from rlbot.reward_terms import (
     concentration_penalty_from_weights,
+    downside_vol_from_returns,
     drawdown_penalty_from_nav,
     exposure_risk_penalty_from_state,
+    vol_penalty_from_returns,
 )
 from rlbot.data_utils import MACRO_VIX_INDEX, N_MACRO
 from rlbot.rl_config import get_config
@@ -814,14 +817,7 @@ class MultiAssetPortfolioEnv(gym.Env):
 
     def _compute_sortino(self, rets: np.ndarray) -> float:
         m = float(rets.mean())
-        downside_elements = np.minimum(rets, 0.0) ** 2
-        # The floor is the economic resolution of "downside": without it, any no-loss
-        # window (cash returns are exactly 0) divides by ~0 and saturates the clipped
-        # Sortino differential, turning the risk bonus into a binary exploit.
-        dv = max(
-            float(np.sqrt(downside_elements.mean())),
-            float(self._reward_cfg.sortino_downside_floor),
-        )
+        dv = downside_vol_from_returns(rets, self._reward_cfg.sortino_downside_floor)
         return m / dv
 
     def _benchmark_weights_live(self, live: np.ndarray) -> np.ndarray:
@@ -1108,6 +1104,15 @@ class MultiAssetPortfolioEnv(gym.Env):
             cap_abs=rwd.benchmark_combined_abs_cap,
         )
 
+        vol_penalty_component = 0.0
+        if rwd.vol_penalty_scale > 0.0 and available_steps >= rwd.sortino_min_steps:
+            active_lookback = min(available_steps, rwd.risk_window)
+            vol_penalty_component, _, _ = vol_penalty_from_returns(
+                np.array(self._return_buffer[-active_lookback:], dtype=np.float64),
+                np.array(self._market_return_buffer[-active_lookback:], dtype=np.float64),
+                rwd,
+            )
+
         drawdown_penalty_component, dd_next, _ = drawdown_penalty_from_nav(
             peak_before=peak_before,
             v_pre=v_pre,
@@ -1135,6 +1140,7 @@ class MultiAssetPortfolioEnv(gym.Env):
             - drawdown_penalty_component
             - concentration_component
             - exposure_risk_component
+            - vol_penalty_component
         )
 
         self._episode_peak_nav = max(peak_before, v_next)
@@ -1170,6 +1176,7 @@ class MultiAssetPortfolioEnv(gym.Env):
             "rew_decomp/drawdown_penalty": -drawdown_penalty_component,
             "rew_decomp/concentration": -concentration_component,
             "rew_decomp/exposure_risk": -exposure_risk_component,
+            "rew_decomp/volatility": -vol_penalty_component,
             "rew_decomp/effective_n_assets": eff_n,
         }
 

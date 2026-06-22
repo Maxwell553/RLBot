@@ -97,6 +97,7 @@ class RewardConfig:
     participation_reward_scale: float
     exposure_risk_mode: str
     exposure_risk_penalty_scale: float
+    vol_penalty_scale: float
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -398,6 +399,10 @@ def _validate_reward_config(rew: RewardConfig) -> None:
             "reward.exposure_risk_penalty_scale must be >= 0, "
             f"got {rew.exposure_risk_penalty_scale}"
         )
+    if rew.vol_penalty_scale < 0.0:
+        raise ValueError(
+            f"reward.vol_penalty_scale must be >= 0, got {rew.vol_penalty_scale}"
+        )
     if rew.turnover_penalty < 0.0:
         raise ValueError(
             f"reward.turnover_penalty must be >= 0, got {rew.turnover_penalty}"
@@ -510,6 +515,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             ),
             exposure_risk_mode=str(rew.get("exposure_risk_mode", "realized_vol")),
             exposure_risk_penalty_scale=float(rew.get("exposure_risk_penalty_scale", 0.0)),
+            vol_penalty_scale=float(rew.get("vol_penalty_scale", 0.0)),
         ),
         transaction_costs=TransactionCostsConfig(
             slippage=_float_list(
@@ -740,5 +746,4 @@ def apply_deterministic_seeds(seed: int) -> None:
         th.use_deterministic_algorithms(True)
     except Exception:
         th.use_deterministic_algorithms(True, warn_only=True)
-
 

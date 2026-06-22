@@ -7,7 +7,9 @@ import pytest
 
 from rlbot.reward_terms import (
     concentration_penalty_from_weights,
+    downside_vol_from_returns,
     drawdown_penalty_from_nav,
+    vol_penalty_from_returns,
 )
 from rlbot.rl_config import RewardConfig, get_config
 
@@ -59,3 +61,27 @@ def test_concentration_penalty_shortfall() -> None:
     pen2, eff2 = concentration_penalty_from_weights(w2, rwd)
     assert eff2 == pytest.approx(5.0, rel=1e-6)
     assert pen2 == pytest.approx(0.35 * 0.5, rel=1e-6)
+
+
+def test_downside_vol_uses_floor_on_no_losses() -> None:
+    rets = np.array([0.01, 0.02, 0.015], dtype=np.float64)
+    assert downside_vol_from_returns(rets, floor=0.001) == pytest.approx(0.001)
+
+
+def test_vol_penalty_only_on_excess_downside_vol() -> None:
+    rwd = _reward_cfg(vol_penalty_scale=300.0, sortino_downside_floor=0.001)
+    agent = np.array([-0.02, -0.01, 0.01, 0.0], dtype=np.float64)
+    bench = np.array([-0.01, -0.005, 0.01, 0.0], dtype=np.float64)
+    agent_dv = downside_vol_from_returns(agent, rwd.sortino_downside_floor)
+    bench_dv = downside_vol_from_returns(bench, rwd.sortino_downside_floor)
+    pen, got_agent, got_bench = vol_penalty_from_returns(agent, bench, rwd)
+    assert got_agent == pytest.approx(agent_dv)
+    assert got_bench == pytest.approx(bench_dv)
+    assert pen == pytest.approx(300.0 * max(agent_dv - bench_dv, 0.0))
+
+    calmer = np.array([-0.005, 0.01, 0.0, 0.0], dtype=np.float64)
+    pen0, _, _ = vol_penalty_from_returns(calmer, bench, rwd)
+    assert pen0 == pytest.approx(0.0)
+
+    pen_off, _, _ = vol_penalty_from_returns(agent, bench, _reward_cfg(vol_penalty_scale=0.0))
+    assert pen_off == pytest.approx(0.0)

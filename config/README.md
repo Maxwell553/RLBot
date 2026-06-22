@@ -67,6 +67,7 @@ Edit `universe.assets` and all per-asset lists (length **N**, same order), refre
 | `participation_bonus` / `participation_reward_scale` | Gross-exposure bonus (default 0.02 × 10) |
 | `turnover_penalty` | Direct `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` (default **0.007**; ramps with churn, off during fee-free) |
 | `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **80.0** for realized vol — use **~1–3** if switching to `vix_positive`) |
+| `vol_penalty_scale` | Penalize excess downside vol vs the passive benchmark: `scale × max(agent_downside_vol − benchmark_downside_vol, 0)` over the Sortino window (default **300.0**; `0` disables) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
 | `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults 0.75, 3.0, 0.08) |
 | `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (defaults 0.75, 6.0 effective assets) |

@@ -64,13 +64,13 @@ Shared protocol except where noted:
 
 **Cohort caveats (read before comparing rows):**
 
-- `**W*_612` is mixed-era:** W1–W2 trained on pre-rebalance code (`fe6d923`, NAV-based
+- **`W*_612` is mixed-era:** W1–W2 trained on pre-rebalance code (`fe6d923`, NAV-based
 best checkpoint, cap-weighted reward benchmark); W3–W5 on post-rebalance code
 (`076137e`). Treat 612 as exploratory, not a clean replication cell.
-- `**W*_615` is split mid-cohort:** W1–W2 on `076137e`; W3–W5 on `a2cc773` (eval
+- **`W*_615` is split mid-cohort:** W1–W2 on `076137e`; W3–W5 on `a2cc773` (eval
 cadence fields added to the run snapshot). Exposure scale stayed at 90 throughout.
 - **612–614** were an exposure-scale sweep at seed 0; **615–617** repeat the
-90 / 80 / 100 grid at seed 42. `**W*_617`** completes the seed-42 row (100 was
+90 / 80 / 100 grid at seed 42. **`W*_617`** completes the seed-42 row (100 was
 missing until Jun 2026).
 
 Numbers below are copied from each run's `Runs/<run_id>/backtest_summary.json`
@@ -153,8 +153,8 @@ Main caveats:
 - **Two seeds per scale is still thin** for a stochastic RL claim; treat the grid
 as directional, not definitive.
 - W1–W5 have been read many times; per-window DSR stays well below the usual 0.95
-bar, and ledger trial counts are **~13 distinct models per window** after the
-617 backtests.
+bar, and ledger trial counts are roughly **10-13 distinct models per window**
+after the 617 backtests.
 - The agent still lags the SP500 sleeve in strong-equity windows (W1, W3, W5) and
 carries large drawdown in stress regimes (e.g. W3 -23.6% for 617).
 - W4 (2022–2023) remains hard: near-flat returns except 617 (+2.0%) and 616

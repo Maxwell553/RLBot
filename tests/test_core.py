@@ -103,11 +103,14 @@ def test_benchmark_combined_abs_cap_validation() -> None:
         participation_reward_scale=1.0,
         exposure_risk_mode="realized_vol",
         exposure_risk_penalty_scale=0.0,
+        vol_penalty_scale=0.0,
     )
     _validate_reward_config(RewardConfig(**base))
     _validate_reward_config(RewardConfig(**{**base, "benchmark_combined_abs_cap": 0.0}))
     with pytest.raises(ValueError, match="benchmark_combined_abs_cap"):
         _validate_reward_config(RewardConfig(**{**base, "benchmark_combined_abs_cap": -1.0}))
+    with pytest.raises(ValueError, match="vol_penalty_scale"):
+        _validate_reward_config(RewardConfig(**{**base, "vol_penalty_scale": -1.0}))
 
 
 def test_legacy_benchmark_relative_max_share_translates_to_constant_cap() -> None:

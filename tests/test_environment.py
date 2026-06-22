@@ -307,6 +307,62 @@ def test_sortino_bonus_requires_min_steps() -> None:
     assert not sortino_seen
 
 
+def test_volatility_penalty_logged_after_min_steps() -> None:
+    """Vol penalty activates on excess downside vol vs the passive benchmark window."""
+    n_assets = _N_ASSETS
+    t = 80
+    base = get_config()
+    close = np.full((t, n_assets), 100.0, dtype=np.float64)
+    close[:, 0] = 100.0 * np.power(0.96, np.arange(t, dtype=np.float64))
+    ohlcv = np.zeros((t, n_assets, 5), dtype=np.float64)
+    ohlcv[:, :, 0] = close
+    ohlcv[:, :, 1] = close
+    ohlcv[:, :, 2] = close
+    ohlcv[:, :, 3] = close
+    ohlcv[:, :, 4] = 1.0
+    rsi = np.full((t, n_assets), 50.0)
+    macd = np.zeros((t, n_assets))
+    fracdiff = np.zeros((t, n_assets))
+    fracdiff_macro = np.zeros((t, 4))
+    trend = np.zeros((t, n_assets))
+    macro = np.full((t, 4), 10.0)
+    try:
+        set_config(
+            replace(
+                base,
+                reward=replace(
+                    base.reward,
+                    sortino_min_steps=3,
+                    risk_window=10,
+                    vol_penalty_scale=300.0,
+                ),
+            )
+        )
+        env = MultiAssetPortfolioEnv(
+            ohlcv,
+            rsi,
+            macd,
+            macro=macro,
+            fracdiff=fracdiff,
+            fracdiff_macro=fracdiff_macro,
+            trend=trend,
+            random_start=False,
+            domain_randomize=False,
+            fee_scale_default=0.0,
+        )
+        env.reset()
+        action = np.full(env.action_space.shape, -3.0)
+        action[1] = 3.0
+        vols = []
+        for _ in range(6):
+            _, _, _, _, info = env.step(action)
+            vols.append(float(info["rew_decomp/volatility"]))
+        assert vols[0] == pytest.approx(0.0)
+        assert min(vols[3:]) < 0.0
+    finally:
+        set_config(base)
+
+
 def test_sortino_downside_floor_avoids_tiny_denominator() -> None:
     rets = np.full(63, 0.0001)
     downside_elements = np.minimum(rets, 0.0) ** 2

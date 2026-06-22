@@ -7,6 +7,29 @@ import numpy as np
 from rlbot.rl_config import RewardConfig
 
 
+def downside_vol_from_returns(rets: np.ndarray, floor: float) -> float:
+    """Root mean square of negative returns (Sortino downside deviation), floored."""
+    downside_elements = np.minimum(rets, 0.0) ** 2
+    return max(float(np.sqrt(downside_elements.mean())), float(floor))
+
+
+def vol_penalty_from_returns(
+    agent_rets: np.ndarray,
+    benchmark_rets: np.ndarray,
+    rwd: RewardConfig,
+) -> tuple[float, float, float]:
+    """Return (penalty, agent_downside_vol, benchmark_downside_vol).
+
+    Penalty is ``vol_penalty_scale * max(agent_downside_vol - benchmark_downside_vol, 0)``.
+    """
+    if rwd.vol_penalty_scale <= 0.0:
+        return 0.0, 0.0, 0.0
+    agent_dv = downside_vol_from_returns(agent_rets, rwd.sortino_downside_floor)
+    bench_dv = downside_vol_from_returns(benchmark_rets, rwd.sortino_downside_floor)
+    excess = max(agent_dv - bench_dv, 0.0)
+    return float(rwd.vol_penalty_scale * excess), agent_dv, bench_dv
+
+
 def concentration_penalty_from_weights(
     weights: np.ndarray,
     rwd: RewardConfig,

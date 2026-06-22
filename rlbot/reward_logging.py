@@ -24,6 +24,7 @@ REWARD_TERMS = (
     "drawdown_penalty",
     "concentration",
     "exposure_risk",
+    "volatility",
 )
 
 

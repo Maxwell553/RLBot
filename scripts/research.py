@@ -356,7 +356,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
             if w.get("holdout_start") and w.get("holdout_end"):
                 wkey = oos_ledger.window_key(w["holdout_start"], w["holdout_end"])
                 by_window.setdefault(wkey, []).append(e["run_id"])
-        ledger_records = oos_ledger.read_ledger(on_corrupt="raise")
+        ledger_records = oos_ledger.read_ledger(root=RUNS, on_corrupt="raise")
         for wkey, rids in by_window.items():
             oos_ledger.assert_window_budget(
                 ledger_records, wkey, rids,
@@ -364,7 +364,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
             )
         print(f"[research] WARNING: this launch will read the OOS holdout for "
               f"{len(pending)} variant(s) (budget {args.oos_budget}; cumulative "
-              "per-window budgets enforced from Runs/oos_ledger.jsonl).")
+              f"per-window budgets enforced from {RUNS / 'oos_ledger.jsonl'}).")
     failures: list[tuple[str, str]] = []
     cohort_t0 = time.perf_counter()
     for n, e in enumerate(variants, 1):
@@ -601,7 +601,7 @@ def cmd_promote(args: argparse.Namespace) -> None:
     if w.get("holdout_start") and w.get("holdout_end"):
         wkey = oos_ledger.window_key(w["holdout_start"], w["holdout_end"])
         oos_ledger.assert_window_budget(
-            oos_ledger.read_ledger(on_corrupt="raise"), wkey, [entry["run_id"]],
+            oos_ledger.read_ledger(root=RUNS, on_corrupt="raise"), wkey, [entry["run_id"]],
             budget=(args.window_budget if getattr(args, "window_budget", None) is not None else oos_ledger.DEFAULT_WINDOW_BUDGET),
         )
     bt = _backtest_cmd(entry)

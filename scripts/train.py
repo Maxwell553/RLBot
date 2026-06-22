@@ -91,6 +91,7 @@ from rlbot.rl_config import (
     validate_config_for_universe,
     write_config_snapshot,
 )
+from rlbot.training_progress import BudgetProgressBarCallback, resolve_learn_timesteps
 from rlbot.vecnorm_utils import sync_vecnormalize_stats
 from rlbot.run_artifacts import (
     DEFAULT_DATA_CACHE,
@@ -1340,6 +1341,7 @@ def main() -> None:
         f"lvl={cfg.reward.drawdown_level_penalty:g}@{cfg.reward.drawdown_level_floor:.0%}) "
         f"- concentration({cfg.reward.concentration_penalty:g}→{cfg.reward.concentration_target_eff_assets:g} eff) "
         f"- exposure_risk({cfg.reward.exposure_risk_mode}, scale={cfg.reward.exposure_risk_penalty_scale:g}) "
+        f"- vol_penalty(scale={cfg.reward.vol_penalty_scale:g}) "
         f"- tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g} "
         f"- turnover*{cfg.reward.turnover_penalty:g}*{cfg.reward.reward_scale:g} "
         f"(both × curriculum_churn_scale×VIX) "
@@ -1665,6 +1667,14 @@ def main() -> None:
         log_freq=callback_update_freq,
     )
     callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
+    resume_mode = bool(args.resume.strip())
+    learn_timesteps, reset_num_timesteps = resolve_learn_timesteps(
+        budget=int(args.timesteps),
+        start=int(model.num_timesteps),
+        resume=resume_mode,
+    )
+    if learn_timesteps > 0:
+        callbacks.append(BudgetProgressBarCallback(budget_timesteps=int(args.timesteps)))
     if not finetune_mode:
         callbacks.insert(
             0,
@@ -1697,16 +1707,28 @@ def main() -> None:
         )
 
     # ── train ────────────────────────────────────────────────────────────
-    _startup_log(f"[train] Starting PPO learning ({args.timesteps:,} timesteps)...")
+    if resume_mode and learn_timesteps == 0:
+        _startup_log(
+            f"[train] Already at budget ({args.timesteps:,} steps at "
+            f"{model.num_timesteps:,}); skipping learn()."
+        )
+    elif resume_mode:
+        _startup_log(
+            f"[train] Resuming PPO: {model.num_timesteps:,} / {args.timesteps:,} "
+            f"({learn_timesteps:,} steps remaining)..."
+        )
+    else:
+        _startup_log(f"[train] Starting PPO learning ({args.timesteps:,} timesteps)...")
     learn_error: BaseException | None = None
     interrupted = False
     try:
-        model.learn(
-            total_timesteps=args.timesteps,
-            callback=CallbackList(callbacks),
-            progress_bar=True,
-            reset_num_timesteps=not bool(args.resume),
-        )
+        if learn_timesteps > 0:
+            model.learn(
+                total_timesteps=learn_timesteps,
+                callback=CallbackList(callbacks),
+                progress_bar=False,
+                reset_num_timesteps=reset_num_timesteps,
+            )
     except KeyboardInterrupt:
         interrupted = True
         print("\n\nCtrl+C detected — saving current weights before exit…")
