@@ -77,7 +77,7 @@ def test_vol_penalty_only_on_excess_downside_vol() -> None:
     pen, got_agent, got_bench = vol_penalty_from_returns(agent, bench, rwd)
     assert got_agent == pytest.approx(agent_dv)
     assert got_bench == pytest.approx(bench_dv)
-    assert pen == pytest.approx(300.0 * max(agent_dv - bench_dv, 0.0))
+    assert pen == pytest.approx(300.0 * rwd.reward_scale * max(agent_dv - bench_dv, 0.0))
 
     calmer = np.array([-0.005, 0.01, 0.0, 0.0], dtype=np.float64)
     pen0, _, _ = vol_penalty_from_returns(calmer, bench, rwd)

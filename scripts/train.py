@@ -91,7 +91,14 @@ from rlbot.rl_config import (
     validate_config_for_universe,
     write_config_snapshot,
 )
-from rlbot.training_progress import BudgetProgressBarCallback, resolve_learn_timesteps
+from rlbot.training_progress import (
+    BudgetProgressBarCallback,
+    absolute_progress_done,
+    absolute_progress_remaining,
+    churn_scale_at_step,
+    lr_schedule_with_floor_for_budget,
+    resolve_learn_timesteps,
+)
 from rlbot.vecnorm_utils import sync_vecnormalize_stats
 from rlbot.run_artifacts import (
     DEFAULT_DATA_CACHE,
@@ -526,22 +533,6 @@ class EvalNavBestModelCallback(EvalCallback):
         return continue_training
 
 
-def _lr_schedule_with_floor(initial_lr: float, floor_lr: float = 1e-6):
-    """Cosine-annealing LR that decays to ``floor_lr``.
-
-    With initial_lr=3e-4 and floor_lr=1e-6, the final ~30% of training
-    runs at very low LR, letting the model settle into precise weights
-    that can beat transaction costs.
-    """
-    import math
-
-    def schedule(progress_remaining: float) -> float:
-        cosine = 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress_remaining)))
-        return floor_lr + (initial_lr - floor_lr) * cosine
-
-    return schedule
-
-
 class AdaptiveEntropyCallback(BaseCallback):
     """High entropy early, then mandatory cosine decay (not eval-gated).
 
@@ -561,10 +552,12 @@ class AdaptiveEntropyCallback(BaseCallback):
         early_floor_steps: int = 3_000_000,
         min_explore_steps: int = 15_000_000,
         decay_start_fraction: float = 0.585,
+        learn_budget: int = 50_000_000,
         warmup_improvements: int = 3,
         eval_log_dir: str = "",
         eval_check_freq: int = 50_000,
         eval_nav_callback: "EvalNavBestModelCallback | None" = None,
+        lr_schedule=None,
     ):
         super().__init__()
         self.explore_ent = explore_ent
@@ -573,10 +566,12 @@ class AdaptiveEntropyCallback(BaseCallback):
         self.early_floor_steps = early_floor_steps
         self.min_explore_steps = int(min_explore_steps)
         self.decay_start_fraction = float(np.clip(decay_start_fraction, 0.0, 0.99))
+        self.learn_budget = max(1, int(learn_budget))
         self.warmup_improvements = warmup_improvements
         self.eval_log_dir = eval_log_dir
         self.eval_check_freq = max(1, int(eval_check_freq))
         self._eval_nav_callback = eval_nav_callback
+        self._lr_schedule = lr_schedule
         self._last_best: float = -float("inf")
         self._improvements: int = 0
 
@@ -600,14 +595,26 @@ class AdaptiveEntropyCallback(BaseCallback):
                 self._improvements += 1
             self._last_best = current_best
 
+    def _sync_absolute_progress(self) -> None:
+        """Keep LR + entropy on the global budget curve (resume-safe)."""
+        t = int(self.num_timesteps)
+        remaining = absolute_progress_remaining(t, self.learn_budget)
+        self.model._current_progress_remaining = remaining
+        if self._lr_schedule is not None and hasattr(self._lr_schedule, "sync_num_timesteps"):
+            self._lr_schedule.sync_num_timesteps(t)
+
+    def _on_training_start(self) -> None:
+        self._sync_absolute_progress()
+
     def _on_step(self) -> bool:
         import math
+
+        self._sync_absolute_progress()
 
         if self.n_calls % self.eval_check_freq == 0:
             self._sync_eval_improvements()
 
-        progress_remaining = self.model._current_progress_remaining
-        progress_done = 1.0 - float(progress_remaining)
+        progress_done = absolute_progress_done(int(self.num_timesteps), self.learn_budget)
 
         if progress_done >= self.decay_start_fraction:
             span = max(1.0 - self.decay_start_fraction, 1e-12)
@@ -716,8 +723,8 @@ class TradingCurriculumCallback(BaseCallback):
     - Steps ``[fee_free_until, fee_ramp_end)``: linear ramp to ``fee_scale = 1.0``.
     - Steps ``[fee_ramp_end, dr_widen_end)``: progressive widening of DR fee/lag bounds (train).
     - Steps ``>= dr_widen_end``: full DR on train (fee in config DR range, lag in {0, 1, 2}).
-    - Churn + turnover: ``churn_scale = 0`` before ``fee_free_until``; then ``churn_ramp_floor`` → ``1``
-      linearly over the fee-ramp window (train + eval).
+    - Churn + turnover: ``churn_scale = 0`` while frictionless; ramps ``churn_ramp_floor`` → ``1``
+      over the fee-ramp window only after fees turn on (train + eval).
     - Eval envs mirror the fee/churn schedule (no domain randomization).
     """
 
@@ -748,15 +755,13 @@ class TradingCurriculumCallback(BaseCallback):
         return None
 
     def _churn_scale(self, t: int) -> float:
-        """Churn penalty scale aligned with fee curriculum (0 → floor → 1)."""
-        floor = float(get_config().curriculum.churn_ramp_floor)
-        if t < self.fee_free_until:
-            return 0.0
-        if t >= self.fee_ramp_end:
-            return 1.0
-        span = max(self.fee_ramp_end - self.fee_free_until, 1)
-        progress = float(t - self.fee_free_until) / float(span)
-        return floor + (1.0 - floor) * progress
+        """Churn penalty scale aligned with fee curriculum (0 while frictionless)."""
+        return churn_scale_at_step(
+            t,
+            fee_free_until=self.fee_free_until,
+            fee_ramp_end=self.fee_ramp_end,
+            churn_ramp_floor=float(get_config().curriculum.churn_ramp_floor),
+        )
 
     def _dr_bounds(self, t: int) -> tuple[float, float, int, int]:
         """Progressive fee/lag bounds after fee curriculum releases DR."""
@@ -1512,7 +1517,11 @@ def main() -> None:
         optimizer_kwargs=dict(weight_decay=hp.weight_decay),
     )
 
-    lr_schedule = _lr_schedule_with_floor(args.learning_rate, floor_lr=hp.learning_rate_floor)
+    lr_schedule = lr_schedule_with_floor_for_budget(
+        args.learning_rate,
+        hp.learning_rate_floor,
+        int(args.timesteps),
+    )
 
     finetune_mode = bool(args.finetune.strip())
     checkpoint_arg = args.finetune.strip() or args.resume.strip()
@@ -1692,10 +1701,12 @@ def main() -> None:
             early_floor_steps=entropy_early_floor_milestones(args.timesteps),
             min_explore_steps=entropy_dr_lock_milestones(args.timesteps),
             decay_start_fraction=ent_cfg.decay_start_fraction,
+            learn_budget=int(args.timesteps),
             warmup_improvements=ent_cfg.warmup_improvements,
             eval_log_dir=str(paths.eval_log_dir),
             eval_check_freq=eval_freq,
             eval_nav_callback=eval_callback,
+            lr_schedule=lr_schedule,
         ))
     if not args.no_viz:
         callbacks.append(

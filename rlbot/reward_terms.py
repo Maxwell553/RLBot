@@ -20,14 +20,15 @@ def vol_penalty_from_returns(
 ) -> tuple[float, float, float]:
     """Return (penalty, agent_downside_vol, benchmark_downside_vol).
 
-    Penalty is ``vol_penalty_scale * max(agent_downside_vol - benchmark_downside_vol, 0)``.
+    Penalty is ``vol_penalty_scale * reward_scale
+    * max(agent_downside_vol - benchmark_downside_vol, 0)``.
     """
     if rwd.vol_penalty_scale <= 0.0:
         return 0.0, 0.0, 0.0
     agent_dv = downside_vol_from_returns(agent_rets, rwd.sortino_downside_floor)
     bench_dv = downside_vol_from_returns(benchmark_rets, rwd.sortino_downside_floor)
     excess = max(agent_dv - bench_dv, 0.0)
-    return float(rwd.vol_penalty_scale * excess), agent_dv, bench_dv
+    return float(rwd.vol_penalty_scale * rwd.reward_scale * excess), agent_dv, bench_dv
 
 
 def concentration_penalty_from_weights(
