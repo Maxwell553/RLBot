@@ -1,0 +1,177 @@
+universe:
+  benchmark: SP500
+  assets:
+    SP500: SPY
+    GOLD: GLD
+    OIL: USO
+    EURUSD: EURUSD=X
+    USDJPY: USDJPY=X
+    NIKKEI: ^N225
+    FTSE: ^FTSE
+    BOND10Y: IEF
+    COPPER: HG=F
+    EM: EEM
+environment:
+  initial_cash: 100000.0
+  max_episode_steps: 252
+  lookback: 20
+  obs_lag_default: 1
+  min_obs_lag: 0
+  max_obs_lag: 2
+  max_single_asset_weight: 0.25
+  fee_scale_default: 1.0
+  stop_loss_fraction: 0.45
+  domain_randomize_fee_dr_min: 0.75
+  domain_randomize_fee_dr_max: 1.1
+  action_smoothing_alpha: 0.15
+  domain_randomize_fee_beta_a: 5.0
+  domain_randomize_fee_beta_b: 5.0
+reward:
+  reward_scale: 2000.0
+  max_step_log_return: 0.06
+  max_step_log_return_downside: -0.12
+  risk_window: 63
+  sortino_min_steps: 20
+  sortino_downside_floor: 0.001
+  risk_bonus_scale: 2.5
+  benchmark_cap_weights:
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.1
+  benchmark_excess_scale: 600.0
+  benchmark_excess_clip: 0.04
+  benchmark_combined_abs_cap: 24.0
+  churn_penalty: 4.0
+  turnover_penalty: 0.007
+  drawdown_downside_gamma: 12.0
+  drawdown_increase_penalty: 0.75
+  drawdown_level_penalty: 3.0
+  drawdown_level_floor: 0.08
+  concentration_penalty: 0.75
+  concentration_target_eff_assets: 6.0
+  cash_daily_yield: 0.0
+  inactivity_penalty_over_50: 0.35
+  inactivity_penalty_over_90: 0.15
+  eval_inactivity_penalty_scale: 1.0
+  participation_bonus: 0.02
+  participation_reward_scale: 10.0
+  exposure_risk_mode: realized_vol
+  exposure_risk_penalty_scale: 60.0
+  vol_penalty_scale: 0.0
+transaction_costs:
+  slippage:
+  - 0.0001
+  - 0.0002
+  - 0.0003
+  - 0.0001
+  - 0.0001
+  - 0.0005
+  - 0.0005
+  - 0.0001
+  - 0.0008
+  - 0.0002
+  tx_fee:
+  - 0.0001
+  - 0.0002
+  - 0.0002
+  - 5.0e-05
+  - 5.0e-05
+  - 0.001
+  - 0.001
+  - 0.0001
+  - 0.0005
+  - 0.0002
+  annual_holding_cost:
+  - 0.0009
+  - 0.004
+  - 0.0083
+  - 0.0
+  - 0.0
+  - 0.001
+  - 0.001
+  - 0.0015
+  - 0.006
+  - 0.0067
+  trading_days_per_year: 252
+hyperparameters:
+  learning_rate: 0.0003
+  learning_rate_floor: 1.0e-06
+  batch_size: 16384
+  n_steps: 4096
+  n_epochs: 3
+  gamma: 0.975
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_finetune: 0.1
+  ent_coef_initial: 0.045
+  ent_coef_finetune: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  weight_decay: 0.001
+policy:
+  lstm_hidden_size: 64
+  n_lstm_layers: 2
+  net_arch_pi:
+  - 128
+  - 128
+  net_arch_vf:
+  - 128
+  - 128
+training:
+  timesteps: 50000000
+  n_envs: 16
+  obs_noise: 0.02
+  seed: 101
+  block_size: 126
+  eval_stride: 4
+  eval_n_episodes: 1
+  eval_freq_steps: 500000
+  eval_freq_pre_gate_steps: 3000000
+  holdout_days: 365
+  viz_freq: 500000
+  curriculum_update_freq: 50000
+  checkpoint_save_freq_steps: 1000000
+  reproducible: false
+  early_stop_patience: 8
+  best_model_score_std_coef: 0.75
+  best_model_score_dd_coef: 2.0
+  best_model_score_stitched_blend: 0.5
+  best_model_benchmark: equal_weight_daily
+vec_normalize:
+  norm_obs: true
+  norm_reward_train: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+entropy_schedule:
+  explore_ent: 0.045
+  final_ent: 0.001
+  early_floor: 0.01
+  early_floor_high: 0.02
+  warmup_improvements: 5
+  decay_start_fraction: 0.585
+  dr_lock_fraction: 0.1
+  early_floor_fraction: 0.585
+curriculum:
+  budget_short: 50000000
+  budget_long: 120000000
+  fee_free_fraction: 0.13
+  fee_ramp_fraction: 0.585
+  churn_ramp_floor: 0.1
+  dr_widen_span_fraction: 0.65
+  fee_free_long: 13300000
+  fee_ramp_end_long: 40000000
+  dr_widen_span_long: 30000000
+  best_model_min_step: null
+data:
+  since: '2005-01-01'
+  fracdiff_d: 0.4
+  feature_purge_warmup: 25
+  feature_preroll_bars: 252
+  feature_split_mode: independent

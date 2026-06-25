@@ -11,7 +11,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-outputs/
+outputs/    
 
 # OS / editor
 .DS_Store
@@ -29,6 +29,11 @@ data_cache.npz
 Runs/
 config/cohorts/
 paper/
+
+# Training-automation runtime state (regenerable; the queue writes these at run time)
+Automation/logs/
+Automation/queue_state.jsonl
+Automation/queue.lock
 
 # Broker credentials and local execution state (reserved for the tier-5 shadow
 # ledger and any future broker integration; never tracked)

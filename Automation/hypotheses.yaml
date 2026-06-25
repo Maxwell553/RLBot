@@ -1,0 +1,206 @@
+campaign: auto3w
+description: >
+  Three-week training-only automation plan. Runs 25 hypothesis variants across
+  canonical windows W1-W5 (125 total trainings). No backtests are launched.
+
+base_config: config/config.yaml
+windows: [1, 2, 3, 4, 5]
+
+# Default CLI arguments passed to scripts/train.py for every job. Keep timesteps
+# unset here so train.py uses config/config.yaml's 50M-step budget.
+train_args:
+  no_viz: false
+
+variants:
+  # Controls and direct comparators from known cohorts.
+  - id: v01_exp80_s42_vol0_cap20
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.0
+      environment.max_single_asset_weight: 0.20
+
+  - id: v02_exp80_s42_vol300_cap20
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+
+  - id: v03_exp60_s101_vol0_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 60.0
+      reward.vol_penalty_scale: 0.0
+      environment.max_single_asset_weight: 0.20
+
+  - id: v04_exp60_s101_vol300_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 60.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+
+  - id: v05_exp100_s0_vol0_cap20
+    seed: 0
+    patch:
+      reward.exposure_risk_penalty_scale: 100.0
+      reward.vol_penalty_scale: 0.0
+      environment.max_single_asset_weight: 0.20
+
+  - id: v06_exp100_s0_vol300_cap20
+    seed: 0
+    patch:
+      reward.exposure_risk_penalty_scale: 100.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+
+  - id: v07_exp120_s101_vol0_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 120.0
+      reward.vol_penalty_scale: 0.0
+      environment.max_single_asset_weight: 0.20
+
+  - id: v08_exp120_s101_vol300_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 120.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+
+  # Volatility penalty dose response on the promising exposure/seed families.
+  - id: v09_exp80_s42_vol150_cap20
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.075
+      environment.max_single_asset_weight: 0.20
+
+  - id: v10_exp80_s42_vol450_cap20
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.225
+      environment.max_single_asset_weight: 0.20
+
+  - id: v11_exp100_s0_vol150_cap20
+    seed: 0
+    patch:
+      reward.exposure_risk_penalty_scale: 100.0
+      reward.vol_penalty_scale: 0.075
+      environment.max_single_asset_weight: 0.20
+
+  - id: v12_exp100_s0_vol450_cap20
+    seed: 0
+    patch:
+      reward.exposure_risk_penalty_scale: 100.0
+      reward.vol_penalty_scale: 0.225
+      environment.max_single_asset_weight: 0.20
+
+  - id: v13_exp120_s101_vol150_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 120.0
+      reward.vol_penalty_scale: 0.075
+      environment.max_single_asset_weight: 0.20
+
+  - id: v14_exp120_s101_vol450_cap20
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 120.0
+      reward.vol_penalty_scale: 0.225
+      environment.max_single_asset_weight: 0.20
+
+  # Per-asset cap ablations. Tests whether the current 20% cap is constraining
+  # return, diversification, or Sharpe in the corrected-vol regime.
+  - id: v15_exp80_s42_vol300_cap15
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.15
+
+  - id: v16_exp80_s42_vol300_cap25
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.25
+
+  - id: v17_exp80_s42_vol300_cap30
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.30
+
+  - id: v18_exp60_s101_vol0_cap25
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 60.0
+      reward.vol_penalty_scale: 0.0
+      environment.max_single_asset_weight: 0.25
+
+  - id: v19_exp60_s101_vol300_cap25
+    seed: 101
+    patch:
+      reward.exposure_risk_penalty_scale: 60.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.25
+
+  # Checkpoint-selection benchmark ablations. Training reward stays equal-weight;
+  # only best_model selection benchmark changes.
+  - id: v20_exp80_s42_vol300_eval6040
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+      training.best_model_benchmark: balanced_6040
+
+  - id: v21_exp100_s0_vol300_eval6040
+    seed: 0
+    patch:
+      reward.exposure_risk_penalty_scale: 100.0
+      reward.vol_penalty_scale: 0.15
+      environment.max_single_asset_weight: 0.20
+      training.best_model_benchmark: balanced_6040
+
+  # Drawdown, Sortino, and trading-friction ablations.
+  - id: v22_exp80_s42_vol300_dd_tighter
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      reward.drawdown_increase_penalty: 1.25
+      reward.drawdown_level_floor: 0.04
+      environment.max_single_asset_weight: 0.20
+
+  - id: v23_exp80_s42_vol300_dd_strong
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      reward.drawdown_increase_penalty: 1.75
+      reward.drawdown_level_penalty: 5.0
+      reward.drawdown_level_floor: 0.04
+      environment.max_single_asset_weight: 0.20
+
+  - id: v24_exp80_s42_vol300_sortino126
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      reward.risk_window: 126
+      reward.risk_bonus_scale: 2.5
+      environment.max_single_asset_weight: 0.20
+
+  - id: v25_exp80_s42_vol300_friction_high
+    seed: 42
+    patch:
+      reward.exposure_risk_penalty_scale: 80.0
+      reward.vol_penalty_scale: 0.15
+      reward.turnover_penalty: 0.014
+      reward.churn_penalty: 6.0
+      environment.max_single_asset_weight: 0.20

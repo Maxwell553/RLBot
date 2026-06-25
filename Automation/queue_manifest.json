@@ -1,0 +1,1688 @@
+{
+  "base_config": "config/config.yaml",
+  "generated_at_utc": "2026-06-25T15:55:43.930357+00:00",
+  "jobs": [
+    {
+      "config_path": "Automation/generated_configs/v01_exp80_s42_vol0_cap20.yaml",
+      "ordinal": 1,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W1_625_a",
+      "seed": 42,
+      "variant_id": "v01_exp80_s42_vol0_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v01_exp80_s42_vol0_cap20.yaml",
+      "ordinal": 2,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W2_625_a",
+      "seed": 42,
+      "variant_id": "v01_exp80_s42_vol0_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v01_exp80_s42_vol0_cap20.yaml",
+      "ordinal": 3,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W3_625_a",
+      "seed": 42,
+      "variant_id": "v01_exp80_s42_vol0_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v01_exp80_s42_vol0_cap20.yaml",
+      "ordinal": 4,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W4_625_a",
+      "seed": 42,
+      "variant_id": "v01_exp80_s42_vol0_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v01_exp80_s42_vol0_cap20.yaml",
+      "ordinal": 5,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W5_625_a",
+      "seed": 42,
+      "variant_id": "v01_exp80_s42_vol0_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v02_exp80_s42_vol300_cap20.yaml",
+      "ordinal": 6,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_z",
+      "seed": 42,
+      "variant_id": "v02_exp80_s42_vol300_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v02_exp80_s42_vol300_cap20.yaml",
+      "ordinal": 7,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_z",
+      "seed": 42,
+      "variant_id": "v02_exp80_s42_vol300_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v02_exp80_s42_vol300_cap20.yaml",
+      "ordinal": 8,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_z",
+      "seed": 42,
+      "variant_id": "v02_exp80_s42_vol300_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v02_exp80_s42_vol300_cap20.yaml",
+      "ordinal": 9,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_z",
+      "seed": 42,
+      "variant_id": "v02_exp80_s42_vol300_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v02_exp80_s42_vol300_cap20.yaml",
+      "ordinal": 10,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_z",
+      "seed": 42,
+      "variant_id": "v02_exp80_s42_vol300_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v03_exp60_s101_vol0_cap20.yaml",
+      "ordinal": 11,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W1_625_c",
+      "seed": 101,
+      "variant_id": "v03_exp60_s101_vol0_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v03_exp60_s101_vol0_cap20.yaml",
+      "ordinal": 12,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W2_625_c",
+      "seed": 101,
+      "variant_id": "v03_exp60_s101_vol0_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v03_exp60_s101_vol0_cap20.yaml",
+      "ordinal": 13,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W3_625_c",
+      "seed": 101,
+      "variant_id": "v03_exp60_s101_vol0_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v03_exp60_s101_vol0_cap20.yaml",
+      "ordinal": 14,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W4_625_c",
+      "seed": 101,
+      "variant_id": "v03_exp60_s101_vol0_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v03_exp60_s101_vol0_cap20.yaml",
+      "ordinal": 15,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W5_625_c",
+      "seed": 101,
+      "variant_id": "v03_exp60_s101_vol0_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v04_exp60_s101_vol300_cap20.yaml",
+      "ordinal": 16,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_27",
+      "seed": 101,
+      "variant_id": "v04_exp60_s101_vol300_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v04_exp60_s101_vol300_cap20.yaml",
+      "ordinal": 17,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_27",
+      "seed": 101,
+      "variant_id": "v04_exp60_s101_vol300_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v04_exp60_s101_vol300_cap20.yaml",
+      "ordinal": 18,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_27",
+      "seed": 101,
+      "variant_id": "v04_exp60_s101_vol300_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v04_exp60_s101_vol300_cap20.yaml",
+      "ordinal": 19,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_27",
+      "seed": 101,
+      "variant_id": "v04_exp60_s101_vol300_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v04_exp60_s101_vol300_cap20.yaml",
+      "ordinal": 20,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_27",
+      "seed": 101,
+      "variant_id": "v04_exp60_s101_vol300_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v05_exp100_s0_vol0_cap20.yaml",
+      "ordinal": 21,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W1_625_e",
+      "seed": 0,
+      "variant_id": "v05_exp100_s0_vol0_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v05_exp100_s0_vol0_cap20.yaml",
+      "ordinal": 22,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W2_625_e",
+      "seed": 0,
+      "variant_id": "v05_exp100_s0_vol0_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v05_exp100_s0_vol0_cap20.yaml",
+      "ordinal": 23,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W3_625_e",
+      "seed": 0,
+      "variant_id": "v05_exp100_s0_vol0_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v05_exp100_s0_vol0_cap20.yaml",
+      "ordinal": 24,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W4_625_e",
+      "seed": 0,
+      "variant_id": "v05_exp100_s0_vol0_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v05_exp100_s0_vol0_cap20.yaml",
+      "ordinal": 25,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W5_625_e",
+      "seed": 0,
+      "variant_id": "v05_exp100_s0_vol0_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v06_exp100_s0_vol300_cap20.yaml",
+      "ordinal": 26,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_28",
+      "seed": 0,
+      "variant_id": "v06_exp100_s0_vol300_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v06_exp100_s0_vol300_cap20.yaml",
+      "ordinal": 27,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_28",
+      "seed": 0,
+      "variant_id": "v06_exp100_s0_vol300_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v06_exp100_s0_vol300_cap20.yaml",
+      "ordinal": 28,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_28",
+      "seed": 0,
+      "variant_id": "v06_exp100_s0_vol300_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v06_exp100_s0_vol300_cap20.yaml",
+      "ordinal": 29,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_28",
+      "seed": 0,
+      "variant_id": "v06_exp100_s0_vol300_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v06_exp100_s0_vol300_cap20.yaml",
+      "ordinal": 30,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_28",
+      "seed": 0,
+      "variant_id": "v06_exp100_s0_vol300_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v07_exp120_s101_vol0_cap20.yaml",
+      "ordinal": 31,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W1_625_g",
+      "seed": 101,
+      "variant_id": "v07_exp120_s101_vol0_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v07_exp120_s101_vol0_cap20.yaml",
+      "ordinal": 32,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W2_625_g",
+      "seed": 101,
+      "variant_id": "v07_exp120_s101_vol0_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v07_exp120_s101_vol0_cap20.yaml",
+      "ordinal": 33,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W3_625_g",
+      "seed": 101,
+      "variant_id": "v07_exp120_s101_vol0_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v07_exp120_s101_vol0_cap20.yaml",
+      "ordinal": 34,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W4_625_g",
+      "seed": 101,
+      "variant_id": "v07_exp120_s101_vol0_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v07_exp120_s101_vol0_cap20.yaml",
+      "ordinal": 35,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W5_625_g",
+      "seed": 101,
+      "variant_id": "v07_exp120_s101_vol0_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v08_exp120_s101_vol300_cap20.yaml",
+      "ordinal": 36,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_29",
+      "seed": 101,
+      "variant_id": "v08_exp120_s101_vol300_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v08_exp120_s101_vol300_cap20.yaml",
+      "ordinal": 37,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_29",
+      "seed": 101,
+      "variant_id": "v08_exp120_s101_vol300_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v08_exp120_s101_vol300_cap20.yaml",
+      "ordinal": 38,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_29",
+      "seed": 101,
+      "variant_id": "v08_exp120_s101_vol300_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v08_exp120_s101_vol300_cap20.yaml",
+      "ordinal": 39,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_29",
+      "seed": 101,
+      "variant_id": "v08_exp120_s101_vol300_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v08_exp120_s101_vol300_cap20.yaml",
+      "ordinal": 40,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_29",
+      "seed": 101,
+      "variant_id": "v08_exp120_s101_vol300_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v09_exp80_s42_vol150_cap20.yaml",
+      "ordinal": 41,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W1_625_30",
+      "seed": 42,
+      "variant_id": "v09_exp80_s42_vol150_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v09_exp80_s42_vol150_cap20.yaml",
+      "ordinal": 42,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W2_625_30",
+      "seed": 42,
+      "variant_id": "v09_exp80_s42_vol150_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v09_exp80_s42_vol150_cap20.yaml",
+      "ordinal": 43,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W3_625_30",
+      "seed": 42,
+      "variant_id": "v09_exp80_s42_vol150_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v09_exp80_s42_vol150_cap20.yaml",
+      "ordinal": 44,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W4_625_30",
+      "seed": 42,
+      "variant_id": "v09_exp80_s42_vol150_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v09_exp80_s42_vol150_cap20.yaml",
+      "ordinal": 45,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W5_625_30",
+      "seed": 42,
+      "variant_id": "v09_exp80_s42_vol150_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v10_exp80_s42_vol450_cap20.yaml",
+      "ordinal": 46,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W1_625_31",
+      "seed": 42,
+      "variant_id": "v10_exp80_s42_vol450_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v10_exp80_s42_vol450_cap20.yaml",
+      "ordinal": 47,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W2_625_31",
+      "seed": 42,
+      "variant_id": "v10_exp80_s42_vol450_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v10_exp80_s42_vol450_cap20.yaml",
+      "ordinal": 48,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W3_625_31",
+      "seed": 42,
+      "variant_id": "v10_exp80_s42_vol450_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v10_exp80_s42_vol450_cap20.yaml",
+      "ordinal": 49,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W4_625_31",
+      "seed": 42,
+      "variant_id": "v10_exp80_s42_vol450_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v10_exp80_s42_vol450_cap20.yaml",
+      "ordinal": 50,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W5_625_31",
+      "seed": 42,
+      "variant_id": "v10_exp80_s42_vol450_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v11_exp100_s0_vol150_cap20.yaml",
+      "ordinal": 51,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W1_625_32",
+      "seed": 0,
+      "variant_id": "v11_exp100_s0_vol150_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v11_exp100_s0_vol150_cap20.yaml",
+      "ordinal": 52,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W2_625_32",
+      "seed": 0,
+      "variant_id": "v11_exp100_s0_vol150_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v11_exp100_s0_vol150_cap20.yaml",
+      "ordinal": 53,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W3_625_32",
+      "seed": 0,
+      "variant_id": "v11_exp100_s0_vol150_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v11_exp100_s0_vol150_cap20.yaml",
+      "ordinal": 54,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W4_625_32",
+      "seed": 0,
+      "variant_id": "v11_exp100_s0_vol150_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v11_exp100_s0_vol150_cap20.yaml",
+      "ordinal": 55,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W5_625_32",
+      "seed": 0,
+      "variant_id": "v11_exp100_s0_vol150_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v12_exp100_s0_vol450_cap20.yaml",
+      "ordinal": 56,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W1_625_33",
+      "seed": 0,
+      "variant_id": "v12_exp100_s0_vol450_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v12_exp100_s0_vol450_cap20.yaml",
+      "ordinal": 57,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W2_625_33",
+      "seed": 0,
+      "variant_id": "v12_exp100_s0_vol450_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v12_exp100_s0_vol450_cap20.yaml",
+      "ordinal": 58,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W3_625_33",
+      "seed": 0,
+      "variant_id": "v12_exp100_s0_vol450_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v12_exp100_s0_vol450_cap20.yaml",
+      "ordinal": 59,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W4_625_33",
+      "seed": 0,
+      "variant_id": "v12_exp100_s0_vol450_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v12_exp100_s0_vol450_cap20.yaml",
+      "ordinal": 60,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W5_625_33",
+      "seed": 0,
+      "variant_id": "v12_exp100_s0_vol450_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v13_exp120_s101_vol150_cap20.yaml",
+      "ordinal": 61,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W1_625_34",
+      "seed": 101,
+      "variant_id": "v13_exp120_s101_vol150_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v13_exp120_s101_vol150_cap20.yaml",
+      "ordinal": 62,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W2_625_34",
+      "seed": 101,
+      "variant_id": "v13_exp120_s101_vol150_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v13_exp120_s101_vol150_cap20.yaml",
+      "ordinal": 63,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W3_625_34",
+      "seed": 101,
+      "variant_id": "v13_exp120_s101_vol150_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v13_exp120_s101_vol150_cap20.yaml",
+      "ordinal": 64,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W4_625_34",
+      "seed": 101,
+      "variant_id": "v13_exp120_s101_vol150_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v13_exp120_s101_vol150_cap20.yaml",
+      "ordinal": 65,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.075
+      },
+      "run_id": "W5_625_34",
+      "seed": 101,
+      "variant_id": "v13_exp120_s101_vol150_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v14_exp120_s101_vol450_cap20.yaml",
+      "ordinal": 66,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W1_625_35",
+      "seed": 101,
+      "variant_id": "v14_exp120_s101_vol450_cap20",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v14_exp120_s101_vol450_cap20.yaml",
+      "ordinal": 67,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W2_625_35",
+      "seed": 101,
+      "variant_id": "v14_exp120_s101_vol450_cap20",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v14_exp120_s101_vol450_cap20.yaml",
+      "ordinal": 68,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W3_625_35",
+      "seed": 101,
+      "variant_id": "v14_exp120_s101_vol450_cap20",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v14_exp120_s101_vol450_cap20.yaml",
+      "ordinal": 69,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W4_625_35",
+      "seed": 101,
+      "variant_id": "v14_exp120_s101_vol450_cap20",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v14_exp120_s101_vol450_cap20.yaml",
+      "ordinal": 70,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 120.0,
+        "reward.vol_penalty_scale": 0.225
+      },
+      "run_id": "W5_625_35",
+      "seed": 101,
+      "variant_id": "v14_exp120_s101_vol450_cap20",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v15_exp80_s42_vol300_cap15.yaml",
+      "ordinal": 71,
+      "patch": {
+        "environment.max_single_asset_weight": 0.15,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_36",
+      "seed": 42,
+      "variant_id": "v15_exp80_s42_vol300_cap15",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v15_exp80_s42_vol300_cap15.yaml",
+      "ordinal": 72,
+      "patch": {
+        "environment.max_single_asset_weight": 0.15,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_36",
+      "seed": 42,
+      "variant_id": "v15_exp80_s42_vol300_cap15",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v15_exp80_s42_vol300_cap15.yaml",
+      "ordinal": 73,
+      "patch": {
+        "environment.max_single_asset_weight": 0.15,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_36",
+      "seed": 42,
+      "variant_id": "v15_exp80_s42_vol300_cap15",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v15_exp80_s42_vol300_cap15.yaml",
+      "ordinal": 74,
+      "patch": {
+        "environment.max_single_asset_weight": 0.15,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_36",
+      "seed": 42,
+      "variant_id": "v15_exp80_s42_vol300_cap15",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v15_exp80_s42_vol300_cap15.yaml",
+      "ordinal": 75,
+      "patch": {
+        "environment.max_single_asset_weight": 0.15,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_36",
+      "seed": 42,
+      "variant_id": "v15_exp80_s42_vol300_cap15",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v16_exp80_s42_vol300_cap25.yaml",
+      "ordinal": 76,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_37",
+      "seed": 42,
+      "variant_id": "v16_exp80_s42_vol300_cap25",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v16_exp80_s42_vol300_cap25.yaml",
+      "ordinal": 77,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_37",
+      "seed": 42,
+      "variant_id": "v16_exp80_s42_vol300_cap25",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v16_exp80_s42_vol300_cap25.yaml",
+      "ordinal": 78,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_37",
+      "seed": 42,
+      "variant_id": "v16_exp80_s42_vol300_cap25",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v16_exp80_s42_vol300_cap25.yaml",
+      "ordinal": 79,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_37",
+      "seed": 42,
+      "variant_id": "v16_exp80_s42_vol300_cap25",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v16_exp80_s42_vol300_cap25.yaml",
+      "ordinal": 80,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_37",
+      "seed": 42,
+      "variant_id": "v16_exp80_s42_vol300_cap25",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v17_exp80_s42_vol300_cap30.yaml",
+      "ordinal": 81,
+      "patch": {
+        "environment.max_single_asset_weight": 0.3,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_38",
+      "seed": 42,
+      "variant_id": "v17_exp80_s42_vol300_cap30",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v17_exp80_s42_vol300_cap30.yaml",
+      "ordinal": 82,
+      "patch": {
+        "environment.max_single_asset_weight": 0.3,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_38",
+      "seed": 42,
+      "variant_id": "v17_exp80_s42_vol300_cap30",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v17_exp80_s42_vol300_cap30.yaml",
+      "ordinal": 83,
+      "patch": {
+        "environment.max_single_asset_weight": 0.3,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_38",
+      "seed": 42,
+      "variant_id": "v17_exp80_s42_vol300_cap30",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v17_exp80_s42_vol300_cap30.yaml",
+      "ordinal": 84,
+      "patch": {
+        "environment.max_single_asset_weight": 0.3,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_38",
+      "seed": 42,
+      "variant_id": "v17_exp80_s42_vol300_cap30",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v17_exp80_s42_vol300_cap30.yaml",
+      "ordinal": 85,
+      "patch": {
+        "environment.max_single_asset_weight": 0.3,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_38",
+      "seed": 42,
+      "variant_id": "v17_exp80_s42_vol300_cap30",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v18_exp60_s101_vol0_cap25.yaml",
+      "ordinal": 86,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W1_625_r",
+      "seed": 101,
+      "variant_id": "v18_exp60_s101_vol0_cap25",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v18_exp60_s101_vol0_cap25.yaml",
+      "ordinal": 87,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W2_625_r",
+      "seed": 101,
+      "variant_id": "v18_exp60_s101_vol0_cap25",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v18_exp60_s101_vol0_cap25.yaml",
+      "ordinal": 88,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W3_625_r",
+      "seed": 101,
+      "variant_id": "v18_exp60_s101_vol0_cap25",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v18_exp60_s101_vol0_cap25.yaml",
+      "ordinal": 89,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W4_625_r",
+      "seed": 101,
+      "variant_id": "v18_exp60_s101_vol0_cap25",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v18_exp60_s101_vol0_cap25.yaml",
+      "ordinal": 90,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.0
+      },
+      "run_id": "W5_625_r",
+      "seed": 101,
+      "variant_id": "v18_exp60_s101_vol0_cap25",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v19_exp60_s101_vol300_cap25.yaml",
+      "ordinal": 91,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_39",
+      "seed": 101,
+      "variant_id": "v19_exp60_s101_vol300_cap25",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v19_exp60_s101_vol300_cap25.yaml",
+      "ordinal": 92,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_39",
+      "seed": 101,
+      "variant_id": "v19_exp60_s101_vol300_cap25",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v19_exp60_s101_vol300_cap25.yaml",
+      "ordinal": 93,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_39",
+      "seed": 101,
+      "variant_id": "v19_exp60_s101_vol300_cap25",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v19_exp60_s101_vol300_cap25.yaml",
+      "ordinal": 94,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_39",
+      "seed": 101,
+      "variant_id": "v19_exp60_s101_vol300_cap25",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v19_exp60_s101_vol300_cap25.yaml",
+      "ordinal": 95,
+      "patch": {
+        "environment.max_single_asset_weight": 0.25,
+        "reward.exposure_risk_penalty_scale": 60.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_39",
+      "seed": 101,
+      "variant_id": "v19_exp60_s101_vol300_cap25",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v20_exp80_s42_vol300_eval6040.yaml",
+      "ordinal": 96,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W1_625_40",
+      "seed": 42,
+      "variant_id": "v20_exp80_s42_vol300_eval6040",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v20_exp80_s42_vol300_eval6040.yaml",
+      "ordinal": 97,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W2_625_40",
+      "seed": 42,
+      "variant_id": "v20_exp80_s42_vol300_eval6040",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v20_exp80_s42_vol300_eval6040.yaml",
+      "ordinal": 98,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W3_625_40",
+      "seed": 42,
+      "variant_id": "v20_exp80_s42_vol300_eval6040",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v20_exp80_s42_vol300_eval6040.yaml",
+      "ordinal": 99,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W4_625_40",
+      "seed": 42,
+      "variant_id": "v20_exp80_s42_vol300_eval6040",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v20_exp80_s42_vol300_eval6040.yaml",
+      "ordinal": 100,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W5_625_40",
+      "seed": 42,
+      "variant_id": "v20_exp80_s42_vol300_eval6040",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v21_exp100_s0_vol300_eval6040.yaml",
+      "ordinal": 101,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W1_625_41",
+      "seed": 0,
+      "variant_id": "v21_exp100_s0_vol300_eval6040",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v21_exp100_s0_vol300_eval6040.yaml",
+      "ordinal": 102,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W2_625_41",
+      "seed": 0,
+      "variant_id": "v21_exp100_s0_vol300_eval6040",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v21_exp100_s0_vol300_eval6040.yaml",
+      "ordinal": 103,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W3_625_41",
+      "seed": 0,
+      "variant_id": "v21_exp100_s0_vol300_eval6040",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v21_exp100_s0_vol300_eval6040.yaml",
+      "ordinal": 104,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W4_625_41",
+      "seed": 0,
+      "variant_id": "v21_exp100_s0_vol300_eval6040",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v21_exp100_s0_vol300_eval6040.yaml",
+      "ordinal": 105,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 100.0,
+        "reward.vol_penalty_scale": 0.15,
+        "training.best_model_benchmark": "balanced_6040"
+      },
+      "run_id": "W5_625_41",
+      "seed": 0,
+      "variant_id": "v21_exp100_s0_vol300_eval6040",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v22_exp80_s42_vol300_dd_tighter.yaml",
+      "ordinal": 106,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.25,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_42",
+      "seed": 42,
+      "variant_id": "v22_exp80_s42_vol300_dd_tighter",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v22_exp80_s42_vol300_dd_tighter.yaml",
+      "ordinal": 107,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.25,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_42",
+      "seed": 42,
+      "variant_id": "v22_exp80_s42_vol300_dd_tighter",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v22_exp80_s42_vol300_dd_tighter.yaml",
+      "ordinal": 108,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.25,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_42",
+      "seed": 42,
+      "variant_id": "v22_exp80_s42_vol300_dd_tighter",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v22_exp80_s42_vol300_dd_tighter.yaml",
+      "ordinal": 109,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.25,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_42",
+      "seed": 42,
+      "variant_id": "v22_exp80_s42_vol300_dd_tighter",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v22_exp80_s42_vol300_dd_tighter.yaml",
+      "ordinal": 110,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.25,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_42",
+      "seed": 42,
+      "variant_id": "v22_exp80_s42_vol300_dd_tighter",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v23_exp80_s42_vol300_dd_strong.yaml",
+      "ordinal": 111,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.75,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.drawdown_level_penalty": 5.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_43",
+      "seed": 42,
+      "variant_id": "v23_exp80_s42_vol300_dd_strong",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v23_exp80_s42_vol300_dd_strong.yaml",
+      "ordinal": 112,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.75,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.drawdown_level_penalty": 5.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_43",
+      "seed": 42,
+      "variant_id": "v23_exp80_s42_vol300_dd_strong",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v23_exp80_s42_vol300_dd_strong.yaml",
+      "ordinal": 113,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.75,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.drawdown_level_penalty": 5.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_43",
+      "seed": 42,
+      "variant_id": "v23_exp80_s42_vol300_dd_strong",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v23_exp80_s42_vol300_dd_strong.yaml",
+      "ordinal": 114,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.75,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.drawdown_level_penalty": 5.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_43",
+      "seed": 42,
+      "variant_id": "v23_exp80_s42_vol300_dd_strong",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v23_exp80_s42_vol300_dd_strong.yaml",
+      "ordinal": 115,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.drawdown_increase_penalty": 1.75,
+        "reward.drawdown_level_floor": 0.04,
+        "reward.drawdown_level_penalty": 5.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_43",
+      "seed": 42,
+      "variant_id": "v23_exp80_s42_vol300_dd_strong",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v24_exp80_s42_vol300_sortino126.yaml",
+      "ordinal": 116,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.risk_bonus_scale": 2.5,
+        "reward.risk_window": 126,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_44",
+      "seed": 42,
+      "variant_id": "v24_exp80_s42_vol300_sortino126",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v24_exp80_s42_vol300_sortino126.yaml",
+      "ordinal": 117,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.risk_bonus_scale": 2.5,
+        "reward.risk_window": 126,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_44",
+      "seed": 42,
+      "variant_id": "v24_exp80_s42_vol300_sortino126",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v24_exp80_s42_vol300_sortino126.yaml",
+      "ordinal": 118,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.risk_bonus_scale": 2.5,
+        "reward.risk_window": 126,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_44",
+      "seed": 42,
+      "variant_id": "v24_exp80_s42_vol300_sortino126",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v24_exp80_s42_vol300_sortino126.yaml",
+      "ordinal": 119,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.risk_bonus_scale": 2.5,
+        "reward.risk_window": 126,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_44",
+      "seed": 42,
+      "variant_id": "v24_exp80_s42_vol300_sortino126",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v24_exp80_s42_vol300_sortino126.yaml",
+      "ordinal": 120,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.risk_bonus_scale": 2.5,
+        "reward.risk_window": 126,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_44",
+      "seed": 42,
+      "variant_id": "v24_exp80_s42_vol300_sortino126",
+      "window": 5
+    },
+    {
+      "config_path": "Automation/generated_configs/v25_exp80_s42_vol300_friction_high.yaml",
+      "ordinal": 121,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.churn_penalty": 6.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.turnover_penalty": 0.014,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W1_625_45",
+      "seed": 42,
+      "variant_id": "v25_exp80_s42_vol300_friction_high",
+      "window": 1
+    },
+    {
+      "config_path": "Automation/generated_configs/v25_exp80_s42_vol300_friction_high.yaml",
+      "ordinal": 122,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.churn_penalty": 6.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.turnover_penalty": 0.014,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W2_625_45",
+      "seed": 42,
+      "variant_id": "v25_exp80_s42_vol300_friction_high",
+      "window": 2
+    },
+    {
+      "config_path": "Automation/generated_configs/v25_exp80_s42_vol300_friction_high.yaml",
+      "ordinal": 123,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.churn_penalty": 6.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.turnover_penalty": 0.014,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W3_625_45",
+      "seed": 42,
+      "variant_id": "v25_exp80_s42_vol300_friction_high",
+      "window": 3
+    },
+    {
+      "config_path": "Automation/generated_configs/v25_exp80_s42_vol300_friction_high.yaml",
+      "ordinal": 124,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.churn_penalty": 6.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.turnover_penalty": 0.014,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W4_625_45",
+      "seed": 42,
+      "variant_id": "v25_exp80_s42_vol300_friction_high",
+      "window": 4
+    },
+    {
+      "config_path": "Automation/generated_configs/v25_exp80_s42_vol300_friction_high.yaml",
+      "ordinal": 125,
+      "patch": {
+        "environment.max_single_asset_weight": 0.2,
+        "reward.churn_penalty": 6.0,
+        "reward.exposure_risk_penalty_scale": 80.0,
+        "reward.turnover_penalty": 0.014,
+        "reward.vol_penalty_scale": 0.15
+      },
+      "run_id": "W5_625_45",
+      "seed": 42,
+      "variant_id": "v25_exp80_s42_vol300_friction_high",
+      "window": 5
+    }
+  ],
+  "n_jobs": 125,
+  "spec_path": "Automation/hypotheses.yaml"
+}

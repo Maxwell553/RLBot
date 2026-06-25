@@ -82,7 +82,9 @@ reward:
   exposure_risk_penalty_scale: 80.0
   # Penalize excess downside vol vs the passive benchmark book (same window as Sortino):
   # -vol_penalty_scale * reward_scale * max(agent_downside_vol - benchmark_downside_vol, 0)
-  vol_penalty_scale: 300.0
+  # NOTE: scale is multiplied by reward_scale (2000), so keep this small to stay in band
+  # with the other reward terms (0.15 * 2000 ≈ a ~0.6/step penalty on typical excess vol).
+  vol_penalty_scale: 0.15
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
