@@ -69,23 +69,30 @@ use [scripts/research.py](scripts/research.py) and the workflow in
 - **Action space:** `N + 1` weights, where cash competes with risky assets.
 Risky allocations are long-only and capped by `environment.max_single_asset_weight`
 after softmax projection.
-- **Observation size:** `10 * N + 28`; derive it from the active universe
-instead of hard-coding dimensions.
+- **Observation size:** `10 * N + 28` base, plus 4 portfolio self-state
+features (realized vol, downside vol, rolling excess vs benchmark, near-cap
+fraction) when `environment.self_state_features` is on (the config default);
+derive it from `observation_dim_for_universe` instead of hard-coding dimensions.
 - **Data split:** chronological OOS holdout is reserved before train/eval
 splitting. Default `feature_split_mode` is `independent`, with
 `feature_preroll_bars` causal preroll for slow indicators.
 - **Execution timing:** observations use data available through the configured
 lag; rebalance fills occur at the next open and are marked to the next close.
-- **Reward:** return, feasible benchmark excess, Sortino difference,
-participation/inactivity, churn, turnover, drawdown, concentration, excess
-downside volatility, and exposure-risk terms. `cash_daily_yield` defaults to
-`0.0`.
+- **Reward:** return (downside amplification capped by `drawdown_amp_max`),
+feasible benchmark excess, Sortino difference, participation/inactivity
+(VIX-conditional relief via `inactivity_vix_relief` and
+`participation_vix_relief` — both shaping terms fade out in stress), churn, turnover,
+drawdown, concentration, excess downside volatility, and exposure-risk terms.
+`cash_daily_yield` defaults to `0.00015`/day (≈ 3.8% annualized).
 - **Benchmark semantics:** `universe.benchmark` is for reporting only. Reward
 shaping uses `reward.benchmark_cap_weights`; checkpoint selection uses
 `training.best_model_benchmark`.
 - **Best checkpoint:** selected after the fee/churn ramp gate by robust
-benchmark-relative eval score, not raw mean NAV. The selected weights and
-matching `VecNormalize` stats are saved together under `models/best/`.
+benchmark-relative eval score, not raw mean NAV. The default
+`training.best_model_score_mode: excess_sharpe` scores the annualized Sharpe
+of daily excess returns vs the eval benchmark (legacy `excess_nav` scores
+excess-NAV dollars). The selected weights and matching `VecNormalize` stats
+are saved together under `models/best/`.
 - **OOS evaluation:** use `scripts/backtest.py --run-id <RUN_ID>` so config,
 split metadata, VecNormalize, and cache provenance come from the run snapshot.
 

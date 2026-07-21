@@ -11,6 +11,7 @@ import pytest
 from rlbot.eval_selection import (
     EvalBenchmarkContext,
     aggregate_eval_portfolio_diagnostics,
+    annualized_sharpe,
     append_eval_diagnostics_jsonl,
     compute_robust_eval_score,
     compute_stitched_eval_metrics,
@@ -81,6 +82,95 @@ def test_compute_robust_eval_score_penalizes_drawdown_p75() -> None:
         high_dd, dd_coef=2.0
     )["score"]
     assert compute_robust_eval_score(high_dd)["p75_max_drawdown_nav"] == pytest.approx(10_000.0)
+
+
+def test_annualized_sharpe_scales_and_clips() -> None:
+    steady = np.full(64, 0.001)
+    assert annualized_sharpe(steady) == pytest.approx(10.0)  # zero-vol → clipped
+    noisy = np.array([0.01, -0.01] * 32)
+    assert abs(annualized_sharpe(noisy)) < 1.0
+    assert annualized_sharpe(np.array([0.01])) == 0.0  # too short
+
+
+def test_excess_sharpe_mode_prefers_high_sharpe_over_big_nav() -> None:
+    """excess_sharpe selection must rank a steady small edge above a volatile
+    large-NAV path (the legacy NAV-dollar score prefers the latter)."""
+    pd = pytest.importorskip("pandas")
+    rng = np.random.default_rng(0)
+    n = 64
+
+    def _episode(daily_rets: np.ndarray, start_bar: int) -> dict:
+        nav = 100_000.0 * np.exp(np.concatenate(([0.0], np.cumsum(daily_rets))))
+        peak = np.maximum.accumulate(nav)
+        dd = peak - nav
+        return {
+            "start_bar": start_bar,
+            "nav_path": nav.tolist(),
+            "ending_nav": float(nav[-1]),
+            "max_drawdown_nav": float(dd.max()),
+            "max_drawdown_frac": float((dd / peak).max()),
+        }
+
+    # Flat benchmark prices → benchmark NAV ~flat, excess ≈ agent returns.
+    ctx = EvalBenchmarkContext(
+        ohlcv=np.full((200, 10, 5), 100.0),
+        idx=pd.date_range("2020-01-01", periods=200),
+        tickers=[f"A{i}" for i in range(10)],
+        mode="equal_weight_daily",
+    )
+    steady = [_episode(np.full(n, 0.0004) + rng.normal(0, 0.0005, n), 10)]
+    swingy = [_episode(np.full(n, 0.002) + rng.normal(0, 0.02, n), 10)]
+
+    sharpe_steady = compute_robust_eval_score(
+        steady, benchmark_ctx=ctx, score_mode="excess_sharpe", std_coef=0.0, dd_coef=0.0
+    )
+    sharpe_swingy = compute_robust_eval_score(
+        swingy, benchmark_ctx=ctx, score_mode="excess_sharpe", std_coef=0.0, dd_coef=0.0
+    )
+    nav_steady = compute_robust_eval_score(
+        steady, benchmark_ctx=ctx, score_mode="excess_nav", std_coef=0.0, dd_coef=0.0
+    )
+    nav_swingy = compute_robust_eval_score(
+        swingy, benchmark_ctx=ctx, score_mode="excess_nav", std_coef=0.0, dd_coef=0.0
+    )
+    assert sharpe_steady["score"] > sharpe_swingy["score"]
+    assert nav_swingy["score"] > nav_steady["score"]  # legacy mode ranks by dollars
+    assert "pooled_excess_sharpe" in sharpe_steady
+    assert sharpe_steady["segment_excess_sharpe_mean"] > 0.0
+
+
+def test_excess_sharpe_mode_uses_frac_drawdown_penalty() -> None:
+    pd = pytest.importorskip("pandas")
+    ctx = EvalBenchmarkContext(
+        ohlcv=np.full((100, 10, 5), 100.0),
+        idx=pd.date_range("2020-01-01", periods=100),
+        tickers=[f"A{i}" for i in range(10)],
+        mode="equal_weight_daily",
+    )
+    nav = list(np.linspace(100_000.0, 101_000.0, 40))
+    base = {
+        "start_bar": 5,
+        "nav_path": nav,
+        "ending_nav": nav[-1],
+        "max_drawdown_nav": 0.0,
+        "max_drawdown_frac": 0.0,
+    }
+    deep = {**base, "max_drawdown_nav": 20_000.0, "max_drawdown_frac": 0.20}
+    s_shallow = compute_robust_eval_score(
+        [base], benchmark_ctx=ctx, score_mode="excess_sharpe", std_coef=0.0, dd_coef=2.0
+    )
+    s_deep = compute_robust_eval_score(
+        [deep], benchmark_ctx=ctx, score_mode="excess_sharpe", std_coef=0.0, dd_coef=2.0
+    )
+    # Same return path; only the frac drawdown differs → 2.0 × 0.20 = 0.4 score gap.
+    assert s_shallow["score"] - s_deep["score"] == pytest.approx(0.4)
+
+
+def test_score_mode_validation() -> None:
+    with pytest.raises(ValueError, match="score_mode"):
+        compute_robust_eval_score(
+            [{"ending_nav": 1.0, "max_drawdown_nav": 0.0}], score_mode="bogus"
+        )
 
 
 def test_compute_stitched_eval_metrics_compounds_blocks() -> None:

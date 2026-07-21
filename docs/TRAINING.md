@@ -29,7 +29,7 @@ For each asset key you must provide **one float** in each of (length **N**, same
 - `transaction_costs.tx_fee`
 - `transaction_costs.annual_holding_cost`
 
-Observation size: `obs_dim = 10 * N + 28` (includes per-asset live mask in the vector). Action size: `N + 1`.
+Observation size: `obs_dim = 10 * N + 28` base (includes per-asset live mask in the vector), plus 4 portfolio self-state features when `environment.self_state_features` is on (the config default → 132 for N=10). Action size: `N + 1`.
 
 See also [config/README.md](../config/README.md).
 
@@ -105,7 +105,7 @@ python scripts/backtest.py --run-id <RUN_ID> --checkpoint best --detailed --stoc
 
 Backtest reads `manifest.universe.tickers`, binds the run-local `Runs/<id>/config.yaml` and `data_cache.npz` by default, and **requires** `models/best/vec_normalize.pkl` paired with `best_model.zip` (pass `--allow-missing-vec-normalize` only for debugging). Results land in `Runs/<id>/backtest_summary.json`.
 
-**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when the **robust eval score** improves **after `fee_ramp_end`** (50/50 blend of segment-mean excess and **stitched** excess vs equal-weight daily passive book, minus dispersion and p75 drawdown). Stitched metrics remain in `eval_nav_history.npz` / TensorBoard; the **training plot** shows robust score on its own panel (not overlaid on NAV). Eval metrics are logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
+**Checkpoint + normalization:** `EvalNavBestModelCallback` saves `best_model.zip` and `best/vec_normalize.pkl` together when the **robust eval score** improves **after `fee_ramp_end`** (50/50 blend of segment-mean and stitched/pooled excess signal vs the equal-weight daily passive book, minus dispersion and p75 drawdown; with the default `training.best_model_score_mode: excess_sharpe` the signal is the annualized Sharpe of daily excess returns and the drawdown penalty uses the unitless max-drawdown fraction). Stitched metrics remain in `eval_nav_history.npz` / TensorBoard; the **training plot** shows robust score on its own panel (not overlaid on NAV). Eval metrics are logged from step 0; pre-ramp peaks do not update `models/best/`. Use `--checkpoint best` for OOS — do not pair `best_model.zip` with end-of-run `models/vec_normalize.pkl`.
 
 ### 6. Target-weight inference (optional)
 

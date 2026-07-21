@@ -211,8 +211,13 @@ def _make_env_factory(
 class EvalNavBestModelCallback(EvalCallback):
     """Run periodic eval; save ``best_model.zip`` on max **robust eval score**, not reward.
 
+    ``score_mode="excess_nav"`` (legacy):
     score = mean(excess vs passive bench) - std_coef * std(excess) - dd_coef * p75(max_dd_nav)
-    return term blends segment-mean excess with stitched excess (``best_model_score_stitched_blend``).
+    ``score_mode="excess_sharpe"``: the return signal is the annualized Sharpe of daily
+    excess returns (segment-mean blended with pooled) and the drawdown penalty uses
+    the unitless p75(max_dd_frac). See ``compute_robust_eval_score``.
+    The return term blends segment-mean and stitched/pooled signals
+    (``best_model_score_stitched_blend``).
 
     Passive benchmark for selection: ``training.best_model_benchmark`` (default equal-weight daily).
     Also logs stitched validation NAV (compounded eval blocks) and drawdown.
@@ -235,6 +240,7 @@ class EvalNavBestModelCallback(EvalCallback):
         score_std_coef: float = 0.75,
         score_dd_coef: float = 2.0,
         score_stitched_blend: float = 0.5,
+        score_mode: str = "excess_nav",
         eval_freq_steps: int = 500_000,
         eval_freq_pre_gate_steps: int = 3_000_000,
         n_envs: int = 16,
@@ -249,6 +255,7 @@ class EvalNavBestModelCallback(EvalCallback):
         self.score_std_coef = float(score_std_coef)
         self.score_dd_coef = float(score_dd_coef)
         self.score_stitched_blend = float(score_stitched_blend)
+        self.score_mode = str(score_mode)
         self.best_selection_score = -np.inf
         self.best_mean_nav = -np.inf
         self._nav_timesteps: list[int] = []
@@ -458,6 +465,7 @@ class EvalNavBestModelCallback(EvalCallback):
                     dd_coef=self.score_dd_coef,
                     stitched_blend=self.score_stitched_blend,
                     benchmark_ctx=self.benchmark_ctx,
+                    score_mode=self.score_mode,
                 )
                 score = float(metrics["score"])
                 mean_nav = float(metrics["mean_ending_nav"])
@@ -507,7 +515,7 @@ class EvalNavBestModelCallback(EvalCallback):
                         self._evals_since_best = 0
                         if self.verbose >= 1:
                             print(
-                                f"New best robust eval score: {score:,.0f} "
+                                f"New best robust eval score: {score:,.3f} "
                                 f"(mean excess {metrics['mean_excess_nav']:,.0f}, "
                                 f"std {metrics['std_excess_nav']:,.0f}, "
                                 f"p75 max DD {100.0 * metrics['p75_max_drawdown_frac']:.1f}%)"
@@ -1651,6 +1659,7 @@ def main() -> None:
         score_std_coef=tr_cfg.best_model_score_std_coef,
         score_dd_coef=tr_cfg.best_model_score_dd_coef,
         score_stitched_blend=tr_cfg.best_model_score_stitched_blend,
+        score_mode=tr_cfg.best_model_score_mode,
         eval_freq_steps=eval_freq_steps,
         eval_freq_pre_gate_steps=eval_freq_pre_gate,
         n_envs=n_envs,

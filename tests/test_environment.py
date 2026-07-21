@@ -195,6 +195,56 @@ def test_env_observation_dim_formula() -> None:
     assert env.observation_space.shape[0] == observation_dim_for_universe(n_assets)
 
 
+def test_self_state_features_extend_obs() -> None:
+    """environment.self_state_features appends 4 causal portfolio-state features."""
+    from dataclasses import replace
+
+    n_assets = 10  # match config per-asset cost/benchmark list width
+    t = 80
+    ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
+    base_cfg = get_config()
+
+    def _build(flag: bool):
+        set_config(
+            replace(base_cfg, environment=replace(base_cfg.environment, self_state_features=flag))
+        )
+        return MultiAssetPortfolioEnv(
+            ohlcv,
+            rsi,
+            macd,
+            macro=macro,
+            fracdiff=fracdiff,
+            fracdiff_macro=fracdiff_macro,
+            trend=trend,
+            random_start=False,
+            domain_randomize=False,
+        )
+
+    try:
+        env_off = _build(False)
+        env_on = _build(True)
+        base_dim = observation_dim_for_universe(n_assets, include_self_state=False)
+        assert env_off.observation_space.shape[0] == base_dim
+        assert env_on.observation_space.shape[0] == base_dim + 4
+
+        obs, _ = env_on.reset()
+        assert obs.shape == (base_dim + 4,)
+        # At episode start: no return history, all cash → vol/downside/excess 0, near-cap 0.
+        assert np.allclose(obs[-4:], 0.0)
+        for _ in range(30):
+            action = np.full(env_on.n_actions, 1.0)  # spread across assets
+            obs, _, terminated, truncated, _ = env_on.step(action)
+            if terminated or truncated:
+                break
+        self_state = obs[-4:]
+        assert np.all(np.isfinite(self_state))
+        assert self_state[0] >= 0.0  # realized vol
+        assert self_state[1] >= 0.0  # downside vol
+        assert 0.0 <= self_state[3] <= 1.0  # near-cap fraction
+    finally:
+        set_config(base_cfg)
+
+
 def _pad_float_list(xs: list[float], n: int) -> list[float]:
     out = list(xs)[:n]
     if len(out) >= n:

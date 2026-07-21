@@ -15,7 +15,44 @@ from rlbot.portfolio_metrics import summarize_weight_panel
 
 EXPOSURE_RISK_MODES = frozenset({"realized_vol", "vix_positive"})
 EVAL_BENCHMARK_MODES = frozenset({"balanced_6040", "equal_weight_daily"})
+BEST_MODEL_SCORE_MODES = frozenset({"excess_nav", "excess_sharpe"})
 VIX_RISK_BASELINE = 18.0
+TRADING_DAYS_PER_YEAR = 252
+# Segment Sharpe clip: near-zero-vol excess paths (agent ≈ benchmark) otherwise
+# produce unbounded ratios that would dominate the selection score.
+EXCESS_SHARPE_CLIP = 10.0
+
+
+def _episode_excess_log_returns(
+    episode: Mapping[str, Any],
+    ctx: EvalBenchmarkContext,
+) -> np.ndarray:
+    """Daily excess log returns (agent − benchmark) for one eval segment."""
+    nav = np.asarray(episode.get("nav_path", []), dtype=np.float64)
+    if nav.size < 3:
+        return np.empty(0, dtype=np.float64)
+    bench = benchmark_nav_path_for_episode(episode, ctx)
+    if bench.size != nav.size:
+        return np.empty(0, dtype=np.float64)
+    agent_r = np.diff(np.log(np.maximum(nav, 1e-12)))
+    bench_r = np.diff(np.log(np.maximum(bench, 1e-12)))
+    return agent_r - bench_r
+
+
+def annualized_sharpe(
+    daily_returns: np.ndarray,
+    *,
+    clip: float = EXCESS_SHARPE_CLIP,
+) -> float:
+    """Annualized Sharpe of a daily-return series, clipped to ±clip."""
+    r = np.asarray(daily_returns, dtype=np.float64)
+    if r.size < 2:
+        return 0.0
+    std = float(np.std(r))
+    if std < 1e-12:
+        return float(np.clip(np.sign(float(np.mean(r))) * clip, -clip, clip))
+    sharpe = float(np.mean(r)) / std * float(np.sqrt(TRADING_DAYS_PER_YEAR))
+    return float(np.clip(sharpe, -clip, clip))
 
 
 @dataclass(frozen=True)
@@ -118,19 +155,36 @@ def compute_robust_eval_score(
     dd_coef: float = 2.0,
     stitched_blend: float = 0.5,
     benchmark_ctx: EvalBenchmarkContext | None = None,
+    score_mode: str = "excess_nav",
 ) -> dict[str, float]:
     """Robust checkpoint score from one eval cycle's segment rollouts.
 
-    When ``benchmark_ctx`` is set (recommended):
+    ``score_mode="excess_nav"`` (legacy), with ``benchmark_ctx`` set:
 
     return_signal = (1 - stitched_blend) * mean(segment excess ending NAV)
                     + stitched_blend * stitched_excess_nav
     score = return_signal - std_coef * std(segment excess)
             - dd_coef * p75(max_dd_nav)
 
+    ``score_mode="excess_sharpe"`` (requires ``benchmark_ctx``): the return signal is
+    the annualized Sharpe of daily excess returns vs the benchmark — a blend of the
+    mean per-segment Sharpe and the Sharpe of all segments' daily excess pooled
+    chronologically — and the drawdown penalty uses the unitless
+    ``p75(max_dd_frac)``:
+
+    return_signal = (1 - stitched_blend) * mean(segment excess Sharpe)
+                    + stitched_blend * pooled excess Sharpe
+    score = return_signal - std_coef * std(segment excess Sharpe)
+            - dd_coef * p75(max_dd_frac)
+
     ``stitched_excess_nav`` compounds eval blocks chronologically (honest validation path).
     Also returns stitched validation NAV metrics when segment ``start_bar`` is present.
     """
+    mode = str(score_mode)
+    if mode not in BEST_MODEL_SCORE_MODES:
+        raise ValueError(
+            f"score_mode must be one of {sorted(BEST_MODEL_SCORE_MODES)}, got {mode!r}"
+        )
     empty = {
         "score": float("-inf"),
         "mean_ending_nav": float("nan"),
@@ -149,6 +203,7 @@ def compute_robust_eval_score(
     dd_navs = np.asarray([float(e["max_drawdown_nav"]) for e in episodes], dtype=np.float64)
     dd_fracs = np.asarray([float(e.get("max_drawdown_frac", 0.0)) for e in episodes], dtype=np.float64)
 
+    sharpe_metrics: dict[str, float] = {}
     if benchmark_ctx is not None:
         excess = np.asarray(
             [
@@ -166,6 +221,29 @@ def compute_robust_eval_score(
         stitched_excess = float(stitched.get("stitched_excess_nav", mean_excess))
         blend = float(np.clip(stitched_blend, 0.0, 1.0))
         mean_signal = (1.0 - blend) * mean_excess + blend * stitched_excess
+        if mode == "excess_sharpe":
+            ordered = sorted(
+                episodes,
+                key=lambda e: int(e["start_bar"]) if e.get("start_bar") is not None else 0,
+            )
+            per_segment = [
+                _episode_excess_log_returns(e, benchmark_ctx) for e in ordered
+            ]
+            usable = [r for r in per_segment if r.size >= 2]
+            if usable:
+                seg_sharpes = np.asarray(
+                    [annualized_sharpe(r) for r in usable], dtype=np.float64
+                )
+                pooled_sharpe = annualized_sharpe(np.concatenate(usable))
+                mean_signal = (1.0 - blend) * float(np.mean(seg_sharpes)) + blend * pooled_sharpe
+                std_signal = float(np.std(seg_sharpes)) if seg_sharpes.size > 1 else 0.0
+                sharpe_metrics = {
+                    "segment_excess_sharpe_mean": float(np.mean(seg_sharpes)),
+                    "segment_excess_sharpe_std": std_signal,
+                    "pooled_excess_sharpe": pooled_sharpe,
+                }
+            # else: no segment has enough bars — fall back to the excess-NAV signal
+            # computed above (still with the unitless drawdown penalty below).
     else:
         excess = navs.copy()
         mean_signal = float(np.mean(navs))
@@ -174,7 +252,8 @@ def compute_robust_eval_score(
 
     dd_p75 = float(np.percentile(dd_navs, 75)) if dd_navs.size else 0.0
     dd_frac_p75 = float(np.percentile(dd_fracs, 75)) if dd_fracs.size else 0.0
-    score = mean_signal - float(std_coef) * std_signal - float(dd_coef) * dd_p75
+    dd_term = dd_frac_p75 if mode == "excess_sharpe" else dd_p75
+    score = mean_signal - float(std_coef) * std_signal - float(dd_coef) * dd_term
 
     out: dict[str, float] = {
         "score": score,
@@ -189,6 +268,7 @@ def compute_robust_eval_score(
     }
     if benchmark_ctx is not None:
         out["return_signal"] = mean_signal
+    out.update(sharpe_metrics)
     for k, v in stitched.items():
         if isinstance(v, (int, float)) and np.isfinite(float(v)):
             out[k] = float(v)

@@ -31,6 +31,39 @@ def vol_penalty_from_returns(
     return float(rwd.vol_penalty_scale * rwd.reward_scale * excess), agent_dv, bench_dv
 
 
+def drawdown_amp_factor(dd_frac_pre: float, rwd: RewardConfig) -> float:
+    """Amplification on negative step returns: ``1 + gamma * dd_pre``, capped.
+
+    ``drawdown_amp_max > 0`` bounds the factor so worst-day reward outliers stay
+    within the VecNormalize clip band instead of all saturating identically;
+    ``0`` = uncapped (legacy behavior for old run snapshots).
+    """
+    amp = 1.0 + float(rwd.drawdown_downside_gamma) * max(float(dd_frac_pre), 0.0)
+    cap = float(rwd.drawdown_amp_max)
+    if cap > 0.0:
+        amp = min(amp, max(cap, 1.0))
+    return float(amp)
+
+
+def inactivity_vix_relief_multiplier(
+    vix: float,
+    relief_scale: float,
+    baseline: float = 18.0,
+) -> float:
+    """Multiplier in [0, 1] applied to the inactivity penalty.
+
+    Relief grows as VIX rises above the calm baseline:
+    ``1 - clip((vix / baseline - 1) * relief_scale, 0, 1)``. With scale 1.0 the
+    penalty is halved at VIX 27 and fully waived at VIX >= 36, so holding cash in
+    stress regimes is not punished like idling in a calm market. ``vix <= 1``
+    (missing/degenerate macro data) and ``relief_scale <= 0`` return 1.0.
+    """
+    if relief_scale <= 0.0 or float(vix) <= 1.0:
+        return 1.0
+    relief = float(np.clip((float(vix) / float(baseline) - 1.0) * float(relief_scale), 0.0, 1.0))
+    return 1.0 - relief
+
+
 def concentration_penalty_from_weights(
     weights: np.ndarray,
     rwd: RewardConfig,

@@ -33,6 +33,11 @@ environment:
   action_smoothing_alpha: 0.15  # same train + backtest (EMA on raw policy logits)
   domain_randomize_fee_beta_a: 5.0
   domain_randomize_fee_beta_b: 5.0
+  # Append 4 causal portfolio self-state features to the observation (realized vol,
+  # downside vol, rolling excess vs the reward benchmark, near-cap fraction) so the
+  # policy can see its own risk state. Changes obs_dim (10N+28 → 10N+32); old run
+  # snapshots without this key keep their original layout.
+  self_state_features: true
 
 reward:
   reward_scale: 2000.0
@@ -45,6 +50,11 @@ reward:
   # saturate the ±3 clipped differential — a quasi-binary +risk_bonus_scale*3 exploit.
   sortino_downside_floor: 0.001
   # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_combined_abs_cap).
+  # Reverted 4.0 → 2.5 after the 721/722 cohorts: the diff is clipped at ±3, so extra
+  # weight adds a constant "stay ahead of benchmark" bonus (risk-on on trending train
+  # data), not gradient. Under 4.0 the in-training eval excess-Sharpe DECLINED
+  # monotonically past ~20M steps on W3/W5 (720 under 2.5 stayed flat) and OOS mean
+  # Sharpe dropped 0.98 → 0.92. See docs/RESEARCH.md (721/722 postmortem).
   risk_bonus_scale: 2.5
   # Equal-weight passive benchmark (1/N per asset; feasible under max_single_asset_weight 0.20)
   benchmark_cap_weights: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
@@ -62,24 +72,45 @@ reward:
   # turnover_frac * turnover_penalty * reward_scale * VIX_scale * curriculum_churn_scale
   turnover_penalty: 0.007
   drawdown_downside_gamma: 12.0  # amplifies negative step returns when already in drawdown
+  # Cap on the (1 + gamma * dd) amplification factor. Uncapped, deep-drawdown days
+  # produce reward outliers far beyond VecNormalize's clip_reward band, so all bad
+  # days saturate identically (no gradient). 4.0 saturates at dd = 25%. 0 = uncapped.
+  drawdown_amp_max: 4.0
   # Direct drawdown shaping (applied every step; logged as rew_decomp/drawdown_penalty):
   drawdown_increase_penalty: 0.75  # × reward_scale on fresh dd expansion
-  drawdown_level_penalty: 3.0  # per step while dd_next > drawdown_level_floor
-  drawdown_level_floor: 0.08  # no level penalty until 8% off episode peak
+  # NOTE the asymmetry: the increase term is × reward_scale (2000) but the level term
+  # is NOT — it is raw `dd_excess × drawdown_level_penalty` per step. At the old 3–6
+  # range that was ~0.1–1.2/step vs a ±10–40/step return term, i.e. a no-op: doubling
+  # it for 721 left the decomp share unchanged (~4–5%) and W3 OOS DD went −26.3% →
+  # −29.4%. 60.0 makes sitting 15% off peak cost ~6/step (comparable to a bad return
+  # day) so there is a persistent gradient to de-risk during sustained drawdowns.
+  drawdown_level_penalty: 60.0  # × max(dd_next - drawdown_level_floor, 0) each step
+  drawdown_level_floor: 0.05  # no level penalty until 5% off episode peak
   # Portfolio diversification: penalty * max(target_eff_n - eff_n, 0)
   concentration_penalty: 0.75
   concentration_target_eff_assets: 6.0
-  # Daily cash accrual on idle cash before MTM (0 disables; e.g. 0.00025 ≈ 6.3% ann. at 252 days)
-  cash_daily_yield: 0.0
+  # Daily cash accrual on idle cash before MTM (0 disables; 0.00015 ≈ 3.8% ann. at 252
+  # days). Gives cash real economics so risk-off competes on merit, not just penalties.
+  cash_daily_yield: 0.00015
   inactivity_penalty_over_50: 0.35  # linear: cash_frac * this (no 50% step cliff)
   inactivity_penalty_over_90: 0.15  # extra linear ramp from 90% → 100% cash
+  # VIX-conditional relief on the inactivity penalty: multiplier
+  # 1 - clip((VIX/18 - 1) * relief, 0, 1). At 1.0: half penalty at VIX 27, none at
+  # VIX >= 36 — holding cash in stress is not punished like idling in calm markets.
+  inactivity_vix_relief: 1.0
   eval_inactivity_penalty_scale: 1.0
   participation_bonus: 0.02
   participation_reward_scale: 10.0
+  # Mirror of inactivity_vix_relief on the participation bonus: same multiplier, so at
+  # VIX >= 36 the agent earns nothing just for being invested and pays nothing for
+  # cash — the shaping terms go neutral in stress and returns decide. 0 disables.
+  participation_vix_relief: 1.0
   # Cut gross exposure when realized vol (or VIX+) is elevated: gross * vol_or_vix * scale
   exposure_risk_mode: realized_vol  # realized_vol | vix_positive
-  # realized_vol: ~90 is default. vix_positive needs ~1–3 (NOT 90: VIX 36 + full gross ≈ 36 units)
-  exposure_risk_penalty_scale: 80.0
+  # realized_vol: 100 is the published-grid optimum (cohorts 612–621: best mean chained
+  # return and mean Sharpe across seeds; see docs/RESEARCH.md). vix_positive needs ~1–3
+  # (NOT ~100: z = max((VIX-18)/18, 0), so VIX 36 at full gross ≈ scale reward units).
+  exposure_risk_penalty_scale: 100.0
   # Penalize excess downside vol vs the passive benchmark book (same window as Sortino):
   # -vol_penalty_scale * reward_scale * max(agent_downside_vol - benchmark_downside_vol, 0)
   # NOTE: scale is multiplied by reward_scale (2000), so keep this small to stay in band
@@ -134,9 +165,17 @@ training:
   # Benchmark-relative eval selection (equal-weight daily passive book by default):
   # score = (1-blend)*mean(excess) + blend*stitched_excess - std_coef*std(excess) - dd_coef*p75(max_dd)
   best_model_score_std_coef: 0.75
-  best_model_score_dd_coef: 2.0
+  # Raised 2.0 → 3.0 with excess_sharpe mode (penalty is on unitless p75(max_dd_frac),
+  # so 3.0 × a 0.20 drawdown ≈ −0.6 score vs Sharpe signals of ~0–2): selection now
+  # actively prefers shallow-drawdown checkpoints, not just high-Sharpe ones.
+  best_model_score_dd_coef: 3.0
   best_model_score_stitched_blend: 0.5  # 0 = segment mean only; 1 = stitched excess only
   best_model_benchmark: equal_weight_daily  # balanced_6040 | equal_weight_daily
+  # excess_sharpe: return signal = annualized Sharpe of daily excess returns (segment
+  # mean blended with pooled per stitched_blend), dd penalty on unitless p75(max_dd_frac).
+  # excess_nav (legacy): excess-NAV dollars + p75(max_dd_nav) — dominated by a few
+  # big-return segments (historical best_eval_score ↔ OOS Sharpe corr was negative).
+  best_model_score_mode: excess_sharpe
 
 vec_normalize:
   norm_obs: true

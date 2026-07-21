@@ -45,9 +45,28 @@ def _float_list(xs: list, name: str, expected_n: int | None = None) -> list[floa
     return [float(x) for x in xs]
 
 
-def observation_dim_for_universe(n_assets: int, n_macro: int = 4) -> int:
-    """Market + live mask + portfolio + meta observation size (macro count fixed at 4 by default)."""
-    return 10 * n_assets + 8 + 5 * n_macro
+# Optional portfolio self-state block appended to the observation when
+# ``environment.self_state_features`` is on: realized vol, downside vol,
+# rolling excess vs the reward benchmark, and near-cap fraction.
+N_SELF_STATE_FEATURES = 4
+
+
+def observation_dim_for_universe(
+    n_assets: int,
+    n_macro: int = 4,
+    *,
+    include_self_state: bool | None = None,
+) -> int:
+    """Market + live mask + portfolio + meta observation size (macro count fixed at 4 by default).
+
+    ``include_self_state=None`` reads ``environment.self_state_features`` from the
+    active config (old run snapshots without the key parse as ``False``, keeping
+    their original 10N + 28 layout).
+    """
+    if include_self_state is None:
+        include_self_state = bool(get_config().environment.self_state_features)
+    base = 10 * n_assets + 8 + 5 * n_macro
+    return base + (N_SELF_STATE_FEATURES if include_self_state else 0)
 
 
 @dataclass(frozen=True)
@@ -66,6 +85,9 @@ class EnvironmentConfig:
     domain_randomize_fee_beta_a: float
     domain_randomize_fee_beta_b: float
     action_smoothing_alpha: float
+    # Append 4 portfolio self-state features to the observation (see
+    # N_SELF_STATE_FEATURES). Default False preserves old run snapshots' obs layout.
+    self_state_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,18 @@ class RewardConfig:
     exposure_risk_mode: str
     exposure_risk_penalty_scale: float
     vol_penalty_scale: float
+    # VIX-conditional relief on the inactivity penalty: multiplier
+    # 1 - clip((VIX/18 - 1) * relief, 0, 1). 0 disables (old behavior): holding
+    # cash in elevated-vol regimes is not penalized as hard as in calm ones.
+    inactivity_vix_relief: float = 0.0
+    # Same VIX-conditional multiplier applied to the participation bonus: in stress
+    # the agent is not paid just for being invested, so at high VIX cash vs invested
+    # becomes reward-neutral on the shaping terms and returns decide. 0 disables.
+    participation_vix_relief: float = 0.0
+    # Cap on the drawdown amplification factor (1 + gamma * dd_pre) applied to
+    # negative step returns. 0 = uncapped (old behavior); >= 1 bounds the worst-day
+    # reward outlier so VecNormalize clipping does not flatten all bad days equally.
+    drawdown_amp_max: float = 0.0
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -176,6 +210,10 @@ class TrainingConfig:
     best_model_score_dd_coef: float = 2.0
     best_model_score_stitched_blend: float = 0.5
     best_model_benchmark: str = "equal_weight_daily"
+    # "excess_nav" (legacy): score in excess-NAV dollars with p75(max_dd_nav) penalty.
+    # "excess_sharpe": score on annualized Sharpe of daily excess returns vs the
+    # eval benchmark, with p75(max_dd_frac) penalty (unitless, era-comparable).
+    best_model_score_mode: str = "excess_nav"
 
 
 @dataclass(frozen=True)
@@ -407,6 +445,20 @@ def _validate_reward_config(rew: RewardConfig) -> None:
         raise ValueError(
             f"reward.turnover_penalty must be >= 0, got {rew.turnover_penalty}"
         )
+    if rew.inactivity_vix_relief < 0.0:
+        raise ValueError(
+            f"reward.inactivity_vix_relief must be >= 0, got {rew.inactivity_vix_relief}"
+        )
+    if rew.participation_vix_relief < 0.0:
+        raise ValueError(
+            f"reward.participation_vix_relief must be >= 0, got {rew.participation_vix_relief}"
+        )
+    amp_max = float(rew.drawdown_amp_max)
+    if amp_max != 0.0 and amp_max < 1.0:
+        raise ValueError(
+            "reward.drawdown_amp_max must be 0 (uncapped) or >= 1, "
+            f"got {rew.drawdown_amp_max}"
+        )
 
 
 def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
@@ -472,6 +524,8 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             domain_randomize_fee_beta_a=float(_req(env, "domain_randomize_fee_beta_a", "environment")),
             domain_randomize_fee_beta_b=float(_req(env, "domain_randomize_fee_beta_b", "environment")),
             action_smoothing_alpha=float(env.get("action_smoothing_alpha", 0.0)),
+            # Default False preserves the 10N + 28 obs layout of old run snapshots.
+            self_state_features=bool(env.get("self_state_features", False)),
         ),
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),
@@ -516,6 +570,10 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             exposure_risk_mode=str(rew.get("exposure_risk_mode", "realized_vol")),
             exposure_risk_penalty_scale=float(rew.get("exposure_risk_penalty_scale", 0.0)),
             vol_penalty_scale=float(rew.get("vol_penalty_scale", 0.0)),
+            # Defaults 0.0 preserve old run snapshots (no relief, uncapped amp).
+            inactivity_vix_relief=float(rew.get("inactivity_vix_relief", 0.0)),
+            participation_vix_relief=float(rew.get("participation_vix_relief", 0.0)),
+            drawdown_amp_max=float(rew.get("drawdown_amp_max", 0.0)),
         ),
         transaction_costs=TransactionCostsConfig(
             slippage=_float_list(
@@ -575,6 +633,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             best_model_score_dd_coef=float(tr.get("best_model_score_dd_coef", 2.0)),
             best_model_score_stitched_blend=float(tr.get("best_model_score_stitched_blend", 0.5)),
             best_model_benchmark=str(tr.get("best_model_benchmark", "equal_weight_daily")),
+            best_model_score_mode=str(tr.get("best_model_score_mode", "excess_nav")),
         ),
         vec_normalize=VecNormalizeConfig(
             norm_obs=bool(_req(vn, "norm_obs", "vec_normalize")),
@@ -630,6 +689,14 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
     if not 0.0 <= blend <= 1.0:
         raise ValueError(
             f"training.best_model_score_stitched_blend must be in [0, 1], got {blend}"
+        )
+    from rlbot.eval_selection import BEST_MODEL_SCORE_MODES
+
+    sm = cfg.training.best_model_score_mode
+    if sm not in BEST_MODEL_SCORE_MODES:
+        raise ValueError(
+            f"training.best_model_score_mode must be one of {sorted(BEST_MODEL_SCORE_MODES)}, "
+            f"got {sm!r}"
         )
     return cfg
 

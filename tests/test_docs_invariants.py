@@ -21,8 +21,12 @@ def _doc_text(name: str) -> str:
     return (PROJECT_ROOT / name).read_text(encoding="utf-8")
 
 
-def test_obs_dim_is_128_for_default_universe() -> None:
-    assert observation_dim_for_universe(10) == 128
+def test_obs_dim_for_default_universe() -> None:
+    """Base layout is 10N + 28; the self-state block (default config: on) adds 4."""
+    assert observation_dim_for_universe(10, include_self_state=False) == 128
+    assert observation_dim_for_universe(10, include_self_state=True) == 132
+    expected = 132 if get_config().environment.self_state_features else 128
+    assert observation_dim_for_universe(10) == expected
 
 
 def test_default_cap_is_020() -> None:

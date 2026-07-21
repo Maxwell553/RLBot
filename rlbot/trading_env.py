@@ -4,7 +4,8 @@ Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / co
 Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
   - inactivity - cost-linked churn - drawdown penalty - concentration penalty
   - volatility penalty - exposure risk penalty
-  - return: clipped_log_return * REWARD_SCALE; negative returns amplified by (1 + gamma * dd_pre)
+  - return: clipped_log_return * reward_scale; negative returns amplified by
+    (1 + gamma * dd_pre), capped at drawdown_amp_max when > 0
   - drawdown penalty: dd_increase * reward_scale * drawdown_increase_penalty
     + max(dd_next - drawdown_level_floor, 0) * drawdown_level_penalty
   - concentration: concentration_penalty * max(target_eff_n - eff_n, 0) on risky weights
@@ -12,7 +13,10 @@ Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
   - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
   - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
   - Sortino + benchmark capped at a constant |sortino+benchmark| <= benchmark_combined_abs_cap
-  - inactivity: linear in cash fraction (plus extra ramp above 90%)
+  - inactivity: linear in cash fraction (plus extra ramp above 90%); scaled down by
+    the VIX relief multiplier when inactivity_vix_relief > 0 (cash is cheaper in stress)
+  - participation: gross exposure * bonus * scale; scaled down by the same VIX relief
+    multiplier when participation_vix_relief > 0 (no pay for being invested in stress)
   - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
 
@@ -38,8 +42,10 @@ from gymnasium import spaces
 from rlbot.reward_terms import (
     concentration_penalty_from_weights,
     downside_vol_from_returns,
+    drawdown_amp_factor,
     drawdown_penalty_from_nav,
     exposure_risk_penalty_from_state,
+    inactivity_vix_relief_multiplier,
     vol_penalty_from_returns,
 )
 from rlbot.data_utils import MACRO_VIX_INDEX, N_MACRO
@@ -342,7 +348,9 @@ class EpisodeEndNavRecorder(gym.Wrapper):
 
 class MultiAssetPortfolioEnv(gym.Env):
     """
-    Observation size: ``10 * n_assets + 8 + 5 * N_MACRO`` (e.g. 128 when ``n_assets=10``).
+    Observation size: ``10 * n_assets + 8 + 5 * N_MACRO``, plus 4 portfolio
+    self-state features when ``environment.self_state_features`` is on
+    (e.g. 128 / 132 when ``n_assets=10``).
 
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
@@ -521,9 +529,13 @@ class MultiAssetPortfolioEnv(gym.Env):
         n_live = self.n_assets
         n_port = self.n_actions
         n_meta = 2
+        # Optional portfolio self-state block (realized vol, downside vol, rolling
+        # excess vs benchmark, near-cap fraction) — appended after meta, never noised.
+        self._self_state_features = bool(env_cfg.self_state_features)
+        n_self_state = 4 if self._self_state_features else 0
         self._n_noisy_features = self.noisy_market_feature_count(self.n_assets, N_MACRO)
         self._n_market_features = self._n_noisy_features + n_live
-        obs_dim = self._n_market_features + n_port + n_meta
+        obs_dim = self._n_market_features + n_port + n_meta + n_self_state
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -797,12 +809,38 @@ class MultiAssetPortfolioEnv(gym.Env):
         parts.append(self.asset_live[t_mkt].astype(np.float32))
 
         close = self.ohlcv[t, :, 3]
-        parts.append(self._portfolio_weights(close))
+        port_w = self._portfolio_weights(close)
+        parts.append(port_w)
 
         nav = self._nav(close)
         dd = (nav - self._episode_peak_nav) / max(self._episode_peak_nav, 1e-12)
         progress = self._steps / max(self._current_ep_max_steps, 1)
         parts.append(np.array([dd, progress], dtype=np.float32))
+
+        if self._self_state_features:
+            # Causal portfolio self-state: everything derives from completed steps
+            # (return buffers through the last mark-to-market) and current weights.
+            rwd = self._reward_cfg
+            wlen = min(len(self._return_buffer), rwd.risk_window)
+            if wlen >= 2:
+                rets = np.asarray(self._return_buffer[-wlen:], dtype=np.float64)
+                brets = np.asarray(self._market_return_buffer[-wlen:], dtype=np.float64)
+                realized_vol = float(np.std(rets)) * 100.0
+                downside_vol = float(np.sqrt(np.mean(np.minimum(rets, 0.0) ** 2))) * 100.0
+                rolling_excess = float(np.sum(rets) - np.sum(brets)) * 10.0
+            else:
+                realized_vol = 0.0
+                downside_vol = 0.0
+                rolling_excess = 0.0
+            cap = float(self._env_cfg.max_single_asset_weight)
+            risky_w = np.asarray(port_w[1:], dtype=np.float64)
+            near_cap_frac = float(np.mean(risky_w >= 0.9 * cap)) if cap > 0.0 else 0.0
+            parts.append(
+                np.array(
+                    [realized_vol, downside_vol, rolling_excess, near_cap_frac],
+                    dtype=np.float32,
+                )
+            )
 
         obs = np.concatenate(parts)
 
@@ -1050,7 +1088,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         # ── reward: return (drawdown-amplified downside) + Sortino - inactivity ─
         base_return = clipped_ret * rwd.reward_scale
         if clipped_ret < 0.0:
-            amp = 1.0 + rwd.drawdown_downside_gamma * dd_frac_pre
+            amp = drawdown_amp_factor(dd_frac_pre, rwd)
             return_component = base_return * amp
             drawdown_component = base_return * (amp - 1.0)
         else:
@@ -1086,9 +1124,19 @@ class MultiAssetPortfolioEnv(gym.Env):
             inactivity_component += float(
                 ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90 * inact
             )
+        # VIX-conditional relief: don't punish cash in stress regimes like calm idling.
+        inactivity_component *= inactivity_vix_relief_multiplier(
+            current_vix, rwd.inactivity_vix_relief, baseline=VIX_CHURN_BASELINE
+        )
         gross_exposure = float(np.sum(w[1:]))
         participation_component = (
             gross_exposure * rwd.participation_bonus * rwd.participation_reward_scale
+        )
+        # Mirror of the inactivity relief: in stress regimes the agent is not paid
+        # merely for being invested, so cash vs invested is shaping-neutral at high
+        # VIX and the return/Sortino/benchmark terms decide.
+        participation_component *= inactivity_vix_relief_multiplier(
+            current_vix, rwd.participation_vix_relief, baseline=VIX_CHURN_BASELINE
         )
 
         churn_component = (

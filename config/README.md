@@ -59,21 +59,30 @@ Edit `universe.assets` and all per-asset lists (length **N**, same order), refre
 
 | Key | Purpose |
 |-----|---------|
-| `risk_bonus_scale` | Sortino differential multiplier (default **2.5**) |
+| `risk_bonus_scale` | Sortino differential multiplier (default **2.5**; the 721/722 cohorts tested 4.0 and the eval excess-Sharpe trajectory degraded — the ±3 clip makes extra weight a constant risk-on bonus, not gradient) |
 | `benchmark_cap_weights` | Passive book used by reward benchmark excess and Sortino diff (default equal 1/N; feasible under the 20% asset cap) |
 | `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware passive book above |
 | `benchmark_combined_abs_cap` | Constant cap on combined \|sortino+benchmark\| per step in reward units (default **24.0**; `0` disables both; never relative to the other terms) |
 | `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default 0.35 + 0.15 tail above 90% cash; max ~0.50 at 100% cash) |
+| `inactivity_vix_relief` | VIX-conditional relief on the inactivity penalty: multiplier `1 - clip((VIX/18 - 1) × relief, 0, 1)` (default **1.0** — half penalty at VIX 27, none at VIX ≥ 36; parser default 0 preserves old snapshots) |
+| `participation_vix_relief` | Same VIX-conditional multiplier applied to the participation bonus (default **1.0**; parser default 0 preserves old snapshots). With both reliefs at 1.0, the cash-vs-invested shaping terms go neutral at VIX ≥ 36 and returns decide |
 | `participation_bonus` / `participation_reward_scale` | Gross-exposure bonus (default 0.02 × 10) |
 | `turnover_penalty` | Direct `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` (default **0.007**; ramps with churn, off during fee-free) |
-| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **80.0** for realized vol — use **~1–3** if switching to `vix_positive`) |
+| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **100.0** for realized vol — the published-grid optimum, see [docs/RESEARCH.md](../docs/RESEARCH.md) — use **~1–3** if switching to `vix_positive`) |
 | `vol_penalty_scale` | Penalize excess downside vol vs the passive benchmark: `scale × reward_scale × max(agent_downside_vol − benchmark_downside_vol, 0)` over the Sortino window (default **0.15**; multiplied by `reward_scale`, so keep it small; `0` disables) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
-| `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults 0.75, 3.0, 0.08) |
+| `drawdown_amp_max` | Cap on the `(1 + gamma × dd)` amplification factor (default **4.0**, saturates at dd = 25%; `0` = uncapped legacy behavior). Bounds worst-day reward outliers so VecNormalize clipping keeps gradient on bad days |
+| `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults 0.75, **60.0**, **0.05**). Note: the increase term is × `reward_scale`, the level term is **not** — level coefficients ≤ ~10 are invisible next to the return term (the 721 no-op) |
 | `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (defaults 0.75, 6.0 effective assets) |
-| `cash_daily_yield` | Optional risk-free accrual on cash before MTM (default **0.0** = disabled; e.g. `0.00025`/day ≈ 6.3% ann.) |
+| `cash_daily_yield` | Risk-free accrual on cash before MTM (default **0.00015**/day ≈ 3.8% ann.; `0` disables; parser default 0 preserves old snapshots) |
 | `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 4.0) |
 | `eval_inactivity_penalty_scale` | Eval env inactivity scale (default 1.0) |
+
+## `environment` (selected)
+
+| Key | Purpose |
+|-----|---------|
+| `self_state_features` | Append 4 causal portfolio self-state obs features: realized vol, downside vol, rolling excess vs the reward benchmark, near-cap fraction (default **true** → `obs_dim = 10N + 32`; parser default false keeps old snapshots at `10N + 28`) |
 
 ## `training`
 
@@ -81,10 +90,11 @@ Edit `universe.assets` and all per-asset lists (length **N**, same order), refre
 |-----|---------|
 | `timesteps` | Default PPO budget (default **50M**) |
 | `early_stop_patience` | Stop after K evals with no new best robust score once curriculum completes (default **8**; `0` disables) |
-| `best_model_score_std_coef` / `best_model_score_dd_coef` | Eval selection penalties on std(excess) and p75(max_dd) (defaults **0.75**, **2.0**) |
+| `best_model_score_std_coef` / `best_model_score_dd_coef` | Eval selection penalties on std(excess) and p75(max_dd) (defaults **0.75**, **3.0**; dd penalty is on unitless max_dd_frac in `excess_sharpe` mode) |
 | `best_model_score_stitched_blend` | Weight on **stitched** excess in the eval return signal (default **0.5** → 50/50 stitched/segment blend; `0` = segment mean only, `1` = stitched only) |
 | `best_model_benchmark` | Passive book for eval excess: **`equal_weight_daily`** (default) or `balanced_6040` |
-| `viz_freq` / eval cadence | Training plot + eval every **500k** global steps (~100 evals per 50M run) |
+| `best_model_score_mode` | **`excess_sharpe`** (default): return signal is the annualized Sharpe of daily excess returns (segment mean blended with pooled), dd penalty on unitless `p75(max_dd_frac)`. `excess_nav` (legacy, parser default): excess-NAV dollars + `p75(max_dd_nav)` |
+| `viz_freq` / eval cadence | Two-speed eval: every **3M** steps before the fee-ramp gate (`eval_freq_pre_gate_steps`), every **500k** after (`eval_freq_steps`) — ~50 evals per 50M run; plots every 500k (`viz_freq`) |
 
 ## `curriculum`
 
