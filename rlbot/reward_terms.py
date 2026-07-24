@@ -64,6 +64,50 @@ def inactivity_vix_relief_multiplier(
     return 1.0 - relief
 
 
+def inactivity_drawdown_relief_multiplier(
+    dd_frac: float,
+    floor: float,
+    relief_scale: float,
+    relief_span: float,
+) -> float:
+    """Multiplier in [0, 1] on cash/participation shaping from the agent's own DD.
+
+    Relief grows as drawdown rises above ``floor``:
+    ``1 - clip((dd - floor) / span, 0, 1) * relief_scale``. With scale 1.0 and
+    span 0.10, inactivity/participation are fully waived once dd >= floor + 0.10
+    (15% off peak at the default 5% floor) — cash becomes the escape hatch from
+    sustained underwater risk, not a calm-market idling tax. ``relief_scale <= 0``
+    or ``relief_span <= 0`` return 1.0 (legacy: no DD-conditional relief).
+    """
+    if relief_scale <= 0.0 or relief_span <= 0.0:
+        return 1.0
+    excess = max(float(dd_frac) - float(floor), 0.0)
+    relief = float(np.clip(excess / float(relief_span), 0.0, 1.0)) * float(relief_scale)
+    return 1.0 - min(relief, 1.0)
+
+
+def shaping_stress_relief_multiplier(
+    *,
+    vix: float,
+    dd_frac: float,
+    vix_relief: float,
+    drawdown_relief: float,
+    drawdown_floor: float,
+    drawdown_relief_span: float,
+    vix_baseline: float = 18.0,
+) -> float:
+    """Most-relief-wins combine of VIX and own-drawdown shaping multipliers.
+
+    Either stress channel can waive cash/participation shaping; taking the min
+    avoids requiring both VIX and NAV drawdown before cash is allowed.
+    """
+    vix_mult = inactivity_vix_relief_multiplier(vix, vix_relief, baseline=vix_baseline)
+    dd_mult = inactivity_drawdown_relief_multiplier(
+        dd_frac, drawdown_floor, drawdown_relief, drawdown_relief_span
+    )
+    return float(min(vix_mult, dd_mult))
+
+
 def concentration_penalty_from_weights(
     weights: np.ndarray,
     rwd: RewardConfig,
@@ -97,6 +141,22 @@ def exposure_risk_penalty_from_state(
     )
 
 
+def drawdown_level_exposure_factor(gross_exposure: float, coupling: float) -> float:
+    """Scale factor in [0, 1] applied to the persistent drawdown *level* term.
+
+    ``coupling = 0`` → always 1 (legacy: level penalty accrues in cash too).
+    ``coupling = 1`` → factor equals clipped gross exposure, so fully de-risking
+    to cash zeros the level term — the structural escape hatch that was missing
+    when level penalty punished underwater NAV regardless of book risk.
+    Intermediate couplings blend: ``(1 - c) + c * gross``.
+    """
+    c = float(np.clip(coupling, 0.0, 1.0))
+    if c <= 0.0:
+        return 1.0
+    g = float(np.clip(gross_exposure, 0.0, 1.0))
+    return float((1.0 - c) + c * g)
+
+
 def drawdown_penalty_from_nav(
     *,
     peak_before: float,
@@ -104,14 +164,23 @@ def drawdown_penalty_from_nav(
     v_next: float,
     dd_frac_pre: float,
     rwd: RewardConfig,
-) -> tuple[float, float, float]:
-    """Return (penalty, dd_next, dd_increase) using post-step drawdown state."""
+    gross_exposure: float = 1.0,
+) -> tuple[float, float, float, float, float]:
+    """Return ``(penalty, dd_next, dd_increase, increase_term, level_term)``.
+
+    ``increase_term`` is the fresh-expansion component (× ``reward_scale``);
+    ``level_term`` is the persistent underwater component (not × scale), optionally
+    scaled by gross exposure when ``drawdown_level_exposure_coupling > 0`` so that
+    de-risking to cash stops the ongoing level tax.
+    """
     peak = max(float(peak_before), 1e-12)
     dd_next = max(0.0, (peak - float(v_next)) / peak)
     dd_increase = max(dd_next - float(dd_frac_pre), 0.0)
     dd_excess = max(dd_next - float(rwd.drawdown_level_floor), 0.0)
-    penalty = (
-        dd_increase * rwd.reward_scale * rwd.drawdown_increase_penalty
-        + dd_excess * rwd.drawdown_level_penalty
+    increase_term = float(dd_increase * rwd.reward_scale * rwd.drawdown_increase_penalty)
+    level_raw = float(dd_excess * rwd.drawdown_level_penalty)
+    level_term = level_raw * drawdown_level_exposure_factor(
+        gross_exposure, float(rwd.drawdown_level_exposure_coupling)
     )
-    return float(penalty), dd_next, dd_increase
+    penalty = increase_term + level_term
+    return float(penalty), dd_next, dd_increase, increase_term, level_term

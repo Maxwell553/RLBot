@@ -21,6 +21,7 @@ outputs/
 # Local runtime / secrets (do not commit)
 .env
 .env.*
+!.env.example
 *.log
 
 # Regenerable caches and large training artifacts (repo stays source-focused)
@@ -32,3 +33,8 @@ paper/
 # Broker credentials and local execution state (reserved for the tier-5 shadow
 # ledger and any future broker integration; never tracked)
 execution/**
+
+# Frontend: source is tracked; only installs and build output are ignored
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/

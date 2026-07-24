@@ -28,10 +28,20 @@ dependencies = [
 [project.scripts]
 market-trainer-train = "scripts.train:main"
 market-trainer-backtest = "scripts.backtest:main"
+market-trainer-audit = "scripts.audit_runs:main"
+market-trainer-preflight = "scripts.preflight:main"
+market-trainer-dashboard = "scripts.dashboard:main"
+market-trainer-workflow-api = "scripts.workflow_api:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
 modal = ["modal>=0.66.0", "fastapi>=0.100.0"]
+api = ["fastapi>=0.100.0", "uvicorn>=0.23.0", "curl-cffi>=0.15.0"]
+
+[tool.pytest.ini_options]
+# Only collect from tests/ — Runs/<id>/provenance/untracked/ archives untracked
+# sources (including test files) for reproducibility and must not be collected.
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]

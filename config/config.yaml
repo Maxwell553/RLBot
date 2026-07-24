@@ -38,6 +38,18 @@ environment:
   # policy can see its own risk state. Changes obs_dim (10N+28 → 10N+32); old run
   # snapshots without this key keep their original layout.
   self_state_features: true
+  # Two-head action (exposure logit + risky allocation). Cohort 727 science flip: ON
+  # so the policy has an explicit gross-exposure head instead of burying cash in a
+  # joint softmax (726 stayed ~fully invested OOS on W2–W5).
+  two_head_actions: true
+  # Cohort 728: soft DD exposure taper — mechanical left-tail brake. Once episode
+  # NAV is 6% off peak, start scaling risky weights toward cash; by 12% DD, gross
+  # is capped at 30%. Applies in train + OOS (same env). Goal: cut W2–W5 crash DDs
+  # (727 still saw −12% to −24% while ~95% invested).
+  dd_exposure_taper: true
+  dd_exposure_taper_start: 0.06
+  dd_exposure_taper_end: 0.12
+  dd_exposure_taper_min_gross: 0.30
 
 reward:
   reward_scale: 2000.0
@@ -59,7 +71,8 @@ reward:
   # Equal-weight passive benchmark (1/N per asset; feasible under max_single_asset_weight 0.20)
   benchmark_cap_weights: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
   # clip(agent_log_ret - bench_log_ret) * scale; uses same friction model as Sortino benchmark
-  benchmark_excess_scale: 600.0
+  # Cohort 728: 600 → 400 — less reward for riding crash→rebound excess (W3 pattern).
+  benchmark_excess_scale: 400.0
   benchmark_excess_clip: 0.04
   # CONSTANT cap on |sortino + benchmark| per step (reward units; 0 disables both).
   # Deliberately not relative to the other terms: a share-of-other-mass cap let the
@@ -77,45 +90,61 @@ reward:
   # days saturate identically (no gradient). 4.0 saturates at dd = 25%. 0 = uncapped.
   drawdown_amp_max: 4.0
   # Direct drawdown shaping (applied every step; logged as rew_decomp/drawdown_penalty):
-  drawdown_increase_penalty: 0.75  # × reward_scale on fresh dd expansion
+  # Cohort 728: intensify fresh-DD and level taxes so the exposure head de-risks
+  # *before* the mechanical taper fires (increase 1→2, level 100→160, floor 5%→3%).
+  drawdown_increase_penalty: 2.0  # × reward_scale on fresh dd expansion
   # NOTE the asymmetry: the increase term is × reward_scale (2000) but the level term
-  # is NOT — it is raw `dd_excess × drawdown_level_penalty` per step. At the old 3–6
-  # range that was ~0.1–1.2/step vs a ±10–40/step return term, i.e. a no-op: doubling
-  # it for 721 left the decomp share unchanged (~4–5%) and W3 OOS DD went −26.3% →
-  # −29.4%. 60.0 makes sitting 15% off peak cost ~6/step (comparable to a bad return
-  # day) so there is a persistent gradient to de-risk during sustained drawdowns.
-  drawdown_level_penalty: 60.0  # × max(dd_next - drawdown_level_floor, 0) each step
-  drawdown_level_floor: 0.05  # no level penalty until 5% off episode peak
+  # is NOT — it is raw `dd_excess × drawdown_level_penalty × exposure_factor` per step.
+  # At the old 3–6 range that was a no-op (~4–5% reward mass). 100.0 at 15% off peak
+  # and full gross costs ~10/step — larger than max inactivity (~0.20) so drawdown
+  # dominates the cash-vs-invested tradeoff. See drawdown_level_exposure_coupling.
+  drawdown_level_penalty: 160.0  # × max(dd_next - floor, 0) × exposure_factor each step
+  drawdown_level_floor: 0.03  # no level penalty until 3% off episode peak
+  # Structural H1 fix: couple the persistent level term to gross exposure.
+  # level *= (1 - c) + c * gross. At c=1, fully de-risking to cash zeros the level
+  # tax (the escape hatch that was missing when level punished underwater NAV even
+  # in cash — agents then stayed invested to "earn their way out"). 0 = legacy.
+  drawdown_level_exposure_coupling: 1.0
   # Portfolio diversification: penalty * max(target_eff_n - eff_n, 0)
   concentration_penalty: 0.75
   concentration_target_eff_assets: 6.0
-  # Daily cash accrual on idle cash before MTM (0 disables; 0.00015 ≈ 3.8% ann. at 252
-  # days). Gives cash real economics so risk-off competes on merit, not just penalties.
-  cash_daily_yield: 0.00015
-  inactivity_penalty_over_50: 0.35  # linear: cash_frac * this (no 50% step cliff)
-  inactivity_penalty_over_90: 0.15  # extra linear ramp from 90% → 100% cash
+  # Cohort 727: raise cash carry (~5.0% ann.) so de-risking via the exposure head
+  # competes with equity beta on merit.
+  cash_daily_yield: 0.0002
+  # Softened vs 720–723 (0.35/0.15 → max 0.50): calm-market cash tax must stay well
+  # below underwater-and-invested DD level (~10/step) so "always invested" is not the
+  # equilibrium. Max inactivity now ~0.20 at 100% cash in a calm, non-DD regime.
+  inactivity_penalty_over_50: 0.15  # linear: cash_frac * this (no 50% step cliff)
+  inactivity_penalty_over_90: 0.05  # extra linear ramp from 90% → 100% cash
   # VIX-conditional relief on the inactivity penalty: multiplier
   # 1 - clip((VIX/18 - 1) * relief, 0, 1). At 1.0: half penalty at VIX 27, none at
   # VIX >= 36 — holding cash in stress is not punished like idling in calm markets.
   inactivity_vix_relief: 1.0
+  # Own-drawdown relief (H1): same form over (dd - floor) / span. Combined with VIX
+  # relief by most-relief-wins. At 1.0 / span 0.10, inactivity is fully waived by
+  # dd >= 15% — cash is the escape hatch once underwater, not a calm-market idling tax.
+  inactivity_drawdown_relief: 1.0
+  inactivity_drawdown_relief_span: 0.10
   eval_inactivity_penalty_scale: 1.0
-  participation_bonus: 0.02
+  # Cohort 727: zero the invest nudge — two-head exposure must earn its keep via
+  # return / excess / Sortino, not a calm-market participation bonus.
+  participation_bonus: 0.0
   participation_reward_scale: 10.0
-  # Mirror of inactivity_vix_relief on the participation bonus: same multiplier, so at
-  # VIX >= 36 the agent earns nothing just for being invested and pays nothing for
-  # cash — the shaping terms go neutral in stress and returns decide. 0 disables.
+  # Mirror of inactivity relief on the participation bonus (VIX + own-DD, most-relief-
+  # wins). At high VIX or once underwater, the agent earns nothing just for being
+  # invested — shaping goes neutral and returns / DD-coupled level decide. 0 disables.
   participation_vix_relief: 1.0
+  participation_drawdown_relief: 1.0
   # Cut gross exposure when realized vol (or VIX+) is elevated: gross * vol_or_vix * scale
-  exposure_risk_mode: realized_vol  # realized_vol | vix_positive
-  # realized_vol: 100 is the published-grid optimum (cohorts 612–621: best mean chained
-  # return and mean Sharpe across seeds; see docs/RESEARCH.md). vix_positive needs ~1–3
-  # (NOT ~100: z = max((VIX-18)/18, 0), so VIX 36 at full gross ≈ scale reward units).
-  exposure_risk_penalty_scale: 100.0
+  # Cohort 728: switch to VIX+ so de-risking starts on stress *signals* before NAV DD
+  # fully materializes (realized_vol lags the crash). Scale ~2.5: at VIX 36, z≈1 →
+  # ~2.5 reward units at full gross (same band as other shaping terms).
+  exposure_risk_mode: vix_positive  # realized_vol | vix_positive
+  exposure_risk_penalty_scale: 2.5
   # Penalize excess downside vol vs the passive benchmark book (same window as Sortino):
   # -vol_penalty_scale * reward_scale * max(agent_downside_vol - benchmark_downside_vol, 0)
-  # NOTE: scale is multiplied by reward_scale (2000), so keep this small to stay in band
-  # with the other reward terms (0.15 * 2000 ≈ a ~0.6/step penalty on typical excess vol).
-  vol_penalty_scale: 0.15
+  # Cohort 728: 0.30 → 0.45 — stronger left-tail vol tax (~0.9/step typical excess).
+  vol_penalty_scale: 0.45
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
@@ -127,6 +156,12 @@ transaction_costs:
 hyperparameters:
   learning_rate: 3.0e-4
   learning_rate_floor: 1.0e-6
+  # phase_aware: hold 3e-4 until DR widening completes (~35M on the rephased 50M
+  # schedule), then cosine → floor over the settled remainder. The legacy global
+  # cosine had LR at ~1e-4 by the best-model gate and ~2e-5 at full DR — adaptation
+  # was frozen exactly while fee/lag conditions were still changing (723/724 evidence:
+  # post-gate eval scores declined monotonically and never recovered).
+  lr_schedule: phase_aware
   batch_size: 16384  # <= n_steps * n_envs; 65536/16384 = 4 mini-batches/epoch × n_epochs 3 = 12 backprop loops/pause
   n_steps: 4096
   n_epochs: 3
@@ -161,21 +196,42 @@ training:
   curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
   checkpoint_save_freq_steps: 1000000
   reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
-  early_stop_patience: 8     # >0 → stop after K evals with no new best (after curriculum)
+  early_stop_patience: 12    # >0 → stop after K evals with no new best (after curriculum)
   # Benchmark-relative eval selection (equal-weight daily passive book by default):
   # score = (1-blend)*mean(excess) + blend*stitched_excess - std_coef*std(excess) - dd_coef*p75(max_dd)
   best_model_score_std_coef: 0.75
-  # Raised 2.0 → 3.0 with excess_sharpe mode (penalty is on unitless p75(max_dd_frac),
-  # so 3.0 × a 0.20 drawdown ≈ −0.6 score vs Sharpe signals of ~0–2): selection now
-  # actively prefers shallow-drawdown checkpoints, not just high-Sharpe ones.
-  best_model_score_dd_coef: 3.0
+  # Raised 2.0 → 3.0 with excess_sharpe (727); 3.0 → 8.0 with defensive_sharpe (728):
+  # penalty is on unitless max(max_dd_frac), so 8.0 × 0.15 DD ≈ −1.2 score — deep
+  # left-tail checkpoints lose even with strong excess Sharpe.
+  best_model_score_dd_coef: 8.0
   best_model_score_stitched_blend: 0.5  # 0 = segment mean only; 1 = stitched excess only
   best_model_benchmark: equal_weight_daily  # balanced_6040 | equal_weight_daily
-  # excess_sharpe: return signal = annualized Sharpe of daily excess returns (segment
-  # mean blended with pooled per stitched_blend), dd penalty on unitless p75(max_dd_frac).
-  # excess_nav (legacy): excess-NAV dollars + p75(max_dd_nav) — dominated by a few
-  # big-return segments (historical best_eval_score ↔ OOS Sharpe corr was negative).
-  best_model_score_mode: excess_sharpe
+  # Cohort 728: defensive_sharpe = excess Sharpe signal − dd_coef × max(max_dd_frac)
+  # (not p75). Pairs with best_model_max_dd_reject so selection prefers shallow-DD
+  # policies that should transfer to crashy OOS windows (W2–W5).
+  best_model_score_mode: defensive_sharpe
+  # Hard gate: never save best if any multi-regime slice max DD exceeds 15%.
+  best_model_max_dd_reject: 0.15
+  # Checkpoint hardening (0 / false = legacy single-eval immediate replace).
+  # Enabled after 723/724: single-eval immediate replacement selected checkpoints at the
+  # first post-gate eval (still mid-DR-widening) on 4 of 6 runs — a noisy score under a
+  # moving training distribution. Trailing-3 median + like-for-like stress blend selects
+  # for sustained quality under fixed adverse (1.5× fee / lag-2) conditions instead.
+  best_model_trailing_evals: 3       # median of last 3 post-gate scores
+  best_model_trailing_agg: median
+  best_model_confirm_evals: 0        # trailing median already suppresses one-eval spikes
+  best_model_stress_suite: true      # blend fixed high-fee/high-lag stress eval (both sides priced)
+  best_model_stress_weight: 0.3
+  # Cohort 727 multi-regime selection retained: K continuous overlays + P25 aggregate.
+  # 728 layers defensive_sharpe + max-DD reject on top (eval↔OOS verification target:
+  # selected checkpoint's eval max_dd should track OOS max_dd, not just Sharpe).
+  oos_aligned_eval: true
+  oos_aligned_eval_bars: 252         # per-regime slice (~1y continuous)
+  oos_aligned_eval_weight: 1.0       # selection fully on multi-regime aggregate
+  multi_regime_eval: true
+  multi_regime_eval_slices: 5        # evenly spaced continuous overlays
+  multi_regime_eval_agg: p25         # p25 | median | min | mean
+  eval_score_burn_in_bars: 21        # ~1 month deploy transient discarded per episode
 
 vec_normalize:
   norm_obs: true
@@ -189,19 +245,25 @@ entropy_schedule:
   early_floor: 0.01
   early_floor_high: 0.02
   warmup_improvements: 5  # logged only (eval NAV); does not gate decay
-  decay_start_fraction: 0.585  # cosine decay starts after fee_ramp_fraction (0.585)
+  decay_start_fraction: 0.45  # cosine decay starts after fee_ramp_fraction (0.45)
   dr_lock_fraction: 0.10
-  early_floor_fraction: 0.585  # exploration floors through fee ramp (same milestone as decay start)
+  early_floor_fraction: 0.45  # exploration floors through fee ramp (same milestone as decay start)
 
 # Smoothed curriculum track: spread fee / churn / DR shifts across the 50M run (avoids mid-run cliffs).
 curriculum:
   budget_short: 50000000
   budget_long: 120000000
-  # ≤ budget_short: fraction-of-run schedule (0.13/0.585 keep fee_free/fee_ramp at ~6.5M/29.25M)
-  fee_free_fraction: 0.13   # ~6.5M
-  fee_ramp_fraction: 0.585  # ~29.25M
+  # ≤ budget_short: fraction-of-run schedule. Rephased (0.13/0.585 → 0.10/0.45) after the
+  # 723/724 cohorts: post-gate eval scores declined monotonically on every window — the
+  # curriculum finished so late that the policy trained under final (full-fee, widening-DR)
+  # conditions only in the last few M steps, with LR already collapsed. Now: fee-free ~5M,
+  # full fees + best-gate at ~22.5M, DR widen 22.5M→35M, then 15M settled full-DR training.
+  fee_free_fraction: 0.10   # ~5M
+  fee_ramp_fraction: 0.45   # ~22.5M
   churn_ramp_floor: 0.10  # churn scale at fee-ramp start; ramps to 1.0 by fee_ramp_end
-  dr_widen_span_fraction: 0.65
+  # 0.25 → DR widen ends ~35M (fee_ramp 22.5M + 12.5M), leaving ~15M stationary full-DR.
+  # Was 0.65 (curriculum ate the whole 50M; early stop unreachable).
+  dr_widen_span_fraction: 0.25
   # Long-run anchors (≥ budget_long)
   fee_free_long: 13300000
   fee_ramp_end_long: 40000000

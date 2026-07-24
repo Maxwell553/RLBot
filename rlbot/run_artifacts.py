@@ -282,6 +282,184 @@ def git_provenance(root: Path = PROJECT_ROOT) -> dict[str, Any]:
     }
 
 
+# Python packages whose source hashes are stamped into the training manifest when dirty.
+_PROVENANCE_PACKAGE_ROOTS = ("rlbot", "scripts")
+
+
+def hash_python_sources(
+    root: Path = PROJECT_ROOT,
+    *,
+    packages: tuple[str, ...] = _PROVENANCE_PACKAGE_ROOTS,
+) -> dict[str, str]:
+    """SHA-256 of each ``.py`` file under the listed packages (relative paths as keys)."""
+    import hashlib
+
+    out: dict[str, str] = {}
+    for pkg in packages:
+        base = root / pkg
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.py")):
+            if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+                continue
+            rel = str(path.relative_to(root)).replace("\\", "/")
+            digest = sha256_file(path)
+            if digest is not None:
+                out[rel] = digest
+    # Also stamp a single tree digest for compact comparison.
+    if out:
+        tree = hashlib.sha256()
+        for rel in sorted(out):
+            tree.update(rel.encode("utf-8"))
+            tree.update(b"\0")
+            tree.update(out[rel].encode("utf-8"))
+            tree.update(b"\n")
+        out["__tree__"] = tree.hexdigest()
+    return out
+
+
+def persist_dirty_source_snapshot(
+    dest_dir: Path,
+    *,
+    root: Path = PROJECT_ROOT,
+    git_dirty: bool | None = None,
+) -> dict[str, Any]:
+    """When the tree is dirty, write ``git.diff`` and archive untracked sources.
+
+    Untracked ``*.py`` files are copied under ``dest_dir/untracked/<relpath>`` so a
+    dirty run remains reconstructible (listing paths alone is not enough when new
+    modules are untracked). Tracked-but-modified content stays in ``git.diff``.
+
+    Returns a provenance fragment for the manifest. Clean trees skip the patch write
+    but still write ``source_hashes.json``.
+    """
+    import subprocess
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    prov = git_provenance(root) if git_dirty is None else {
+        **git_provenance(root),
+        "git_dirty": git_dirty,
+    }
+    dirty = prov.get("git_dirty")
+    fragment: dict[str, Any] = {
+        "git_commit": prov.get("git_commit"),
+        "git_dirty": dirty,
+        "source_patch": None,
+        "source_hashes": None,
+        "untracked_archived": [],
+        "untracked_archive_dir": None,
+    }
+    # Always hash the Python sources actually present — answers "what code ran?"
+    # even on a clean tree (commit pin alone is not enough if files were edited
+    # after the commit without ``git_dirty`` detection failing).
+    hashes = hash_python_sources(root)
+    fragment["source_hashes"] = {
+        "__tree__": hashes.get("__tree__"),
+        "n_files": max(0, len(hashes) - (1 if "__tree__" in hashes else 0)),
+    }
+    # Persist the full per-file map beside the manifest (can be large).
+    hash_path = dest_dir / "source_hashes.json"
+    write_manifest(hash_path, hashes)
+    fragment["source_hashes_path"] = "provenance/source_hashes.json"
+
+    if not dirty:
+        return fragment
+
+    patch_path = dest_dir / "git.diff"
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        fragment["source_patch_error"] = str(exc)
+        return fragment
+
+    untracked_rels: list[str] = []
+    if untracked.returncode == 0 and untracked.stdout.strip():
+        untracked_rels = [
+            line.strip().replace("\\", "/")
+            for line in untracked.stdout.splitlines()
+            if line.strip()
+        ]
+
+    archived: list[str] = []
+    archive_root = dest_dir / "untracked"
+    for rel in untracked_rels:
+        # Archive reconstructible source only (new modules / scripts). Binary
+        # caches and data stay listed but not copied.
+        if not rel.endswith(".py"):
+            continue
+        src = (root / rel).resolve()
+        try:
+            src.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if not src.is_file():
+            continue
+        dest = archive_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        archived.append(rel)
+
+    body = proc.stdout or ""
+    if untracked_rels:
+        body += "\n# --- untracked files ---\n"
+        for rel in untracked_rels:
+            tag = "archived" if rel in archived else "listed-only"
+            body += f"# [{tag}] {rel}\n"
+        if archived:
+            body += (
+                "# Python sources copied to provenance/untracked/<path> "
+                "(contents not inlined in this diff).\n"
+            )
+    patch_path.write_text(body, encoding="utf-8")
+    fragment["source_patch"] = str(patch_path.name)
+    fragment["untracked_archived"] = archived
+    if archived:
+        fragment["untracked_archive_dir"] = "provenance/untracked"
+    return fragment
+
+
+def hardware_profile() -> dict[str, Any]:
+    """Best-effort CPU/GPU/platform stamp for training manifests."""
+    import os
+    import platform
+
+    profile: dict[str, Any] = {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "processor": platform.processor() or platform.machine(),
+        "cpu_count": os.cpu_count(),
+    }
+    try:
+        import torch
+
+        profile["torch"] = torch.__version__
+        profile["cuda_available"] = bool(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            profile["cuda_device"] = torch.cuda.get_device_name(0)
+            profile["cuda_device_count"] = int(torch.cuda.device_count())
+    except Exception:
+        profile["torch"] = None
+    return profile
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def check_holdout_window_against_manifest(
     got_start,
     got_end,

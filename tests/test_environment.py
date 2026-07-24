@@ -469,7 +469,7 @@ def test_inactivity_penalty_bounded_at_full_cash() -> None:
     """100% cash inactivity penalty matches config (over_50 + over_90 tail)."""
     rwd = get_config().reward
     expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    assert expected == pytest.approx(0.50, rel=1e-6)
+    assert expected == pytest.approx(0.20, rel=1e-6)
 
 
 def test_turnover_penalty_ramps_with_churn_curriculum() -> None:
@@ -567,6 +567,7 @@ def test_downside_return_amplified_when_in_drawdown() -> None:
 
 def test_drawdown_penalty_logged_on_level_and_increase() -> None:
     """Direct drawdown penalty applies on expansion and while sitting in deep drawdown."""
+    from rlbot.reward_terms import drawdown_level_exposure_factor
     from rlbot.rl_config import get_config
 
     rwd = get_config().reward
@@ -594,12 +595,43 @@ def test_drawdown_penalty_logged_on_level_and_increase() -> None:
     env._episode_peak_nav = 100_000.0
     env._cash = 0.0
     env._units[0] = 1_000.0
-    _, _, _, _, info = env.step(np.zeros(env.n_actions))
+    # Force a fully-invested target so coupling does not zero the level term.
+    # Softmax-over-cash: suppress cash logit. Two-head: high exposure logit + equal assets.
+    action = np.full(env.n_actions, 10.0)
+    if bool(getattr(get_config().environment, "two_head_actions", False)):
+        action[0] = 10.0  # exposure ≈ 1
+        action[1:] = 0.0  # equal risky allocation
+    else:
+        action[0] = -10.0
+        action[1:] = 10.0
+    _, _, _, _, info = env.step(action)
     pen = info.get("rew_decomp/drawdown_penalty", 0.0)
     assert pen < -1e-6
-    dd_frac = 30_000.0 / 100_000.0
-    expected_level = max(dd_frac - rwd.drawdown_level_floor, 0.0) * rwd.drawdown_level_penalty
-    assert pen == pytest.approx(-expected_level, rel=1e-4)
+    w = info["target_weights"]
+    gross = float(np.sum(w[1:]))
+    # Pre-rebalance DD drives the level term / taper (peak fixed at 100k; units@70 → ~30% DD).
+    dd_frac_pre = max(0.0, (100_000.0 - 70_000.0) / 100_000.0)
+    expected_level = (
+        max(dd_frac_pre - rwd.drawdown_level_floor, 0.0)
+        * rwd.drawdown_level_penalty
+        * drawdown_level_exposure_factor(gross, rwd.drawdown_level_exposure_coupling)
+    )
+    assert info.get("rew_decomp/drawdown_level", 0.0) == pytest.approx(
+        -expected_level, rel=1e-3, abs=1e-6
+    )
+    assert pen < -1e-6
+    env_cfg = get_config().environment
+    if bool(getattr(env_cfg, "dd_exposure_taper", False)) and dd_frac_pre >= float(
+        env_cfg.dd_exposure_taper_end
+    ):
+        assert gross == pytest.approx(
+            float(env_cfg.dd_exposure_taper_min_gross), abs=0.05
+        )
+    else:
+        assert gross > 0.5
+    # Own-DD relief should waive participation/inactivity shaping once deep underwater.
+    assert info.get("rew_decomp/inactivity_stress_mult", 1.0) == pytest.approx(0.0, abs=1e-9)
+    assert info.get("rew_decomp/participation_stress_mult", 1.0) == pytest.approx(0.0, abs=1e-9)
 
 
 def test_concentration_penalty_on_single_asset_book() -> None:

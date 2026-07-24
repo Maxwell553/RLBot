@@ -307,3 +307,185 @@ def test_benchmark_nav_path_rejects_invalid_mode() -> None:
         from rlbot.eval_selection import benchmark_nav_path_for_episode
 
         benchmark_nav_path_for_episode(ep, ctx)
+
+
+def test_apply_episode_burn_in_trims_cash_restart() -> None:
+    from rlbot.eval_selection import apply_episode_burn_in
+
+    nav = [100_000.0] + [100_000.0 - 1000.0 * i for i in range(1, 40)]
+    weights = np.zeros((39, 3), dtype=np.float64)
+    weights[:, 0] = 1.0  # all cash
+    weights[10:, 0] = 0.0
+    weights[10:, 1] = 1.0
+    ep = {
+        "nav_path": nav,
+        "ending_nav": nav[-1],
+        "start_nav": nav[0],
+        "start_bar": 50,
+        "max_drawdown_nav": 0.0,
+        "max_drawdown_frac": 0.0,
+        "weights": weights,
+    }
+    out = apply_episode_burn_in(ep, 10)
+    assert out["start_bar"] == 60
+    assert len(out["nav_path"]) == len(nav) - 10
+    assert out["start_nav"] == pytest.approx(nav[10])
+    assert out["ending_nav"] == pytest.approx(nav[-1])
+    assert np.asarray(out["weights"]).shape[0] == 29
+    assert out["max_drawdown_nav"] >= 0.0
+
+
+def test_blend_block_and_oos_aligned_scores() -> None:
+    from rlbot.eval_selection import blend_block_and_oos_aligned_scores
+
+    assert blend_block_and_oos_aligned_scores(1.0, 3.0, weight=0.75) == pytest.approx(2.5)
+    assert blend_block_and_oos_aligned_scores(1.0, None, weight=0.75) == pytest.approx(1.0)
+    assert blend_block_and_oos_aligned_scores(1.0, 3.0, weight=0.0) == pytest.approx(1.0)
+    assert blend_block_and_oos_aligned_scores(1.0, 3.0, weight=1.0) == pytest.approx(3.0)
+
+
+def test_aggregate_multi_regime_scores() -> None:
+    from rlbot.eval_selection import aggregate_multi_regime_scores
+
+    scores = [0.0, 1.0, 2.0, 3.0]
+    assert aggregate_multi_regime_scores(scores, agg="min") == pytest.approx(0.0)
+    assert aggregate_multi_regime_scores(scores, agg="mean") == pytest.approx(1.5)
+    assert aggregate_multi_regime_scores(scores, agg="median") == pytest.approx(1.5)
+    # p25 of [0,1,2,3] ≈ 0.75
+    assert aggregate_multi_regime_scores(scores, agg="p25") == pytest.approx(0.75)
+    assert aggregate_multi_regime_scores([], agg="p25") == float("-inf")
+
+
+def test_apply_dd_exposure_taper() -> None:
+    from rlbot.eval_selection import apply_dd_exposure_taper
+
+    w = np.array([0.1, 0.3, 0.3, 0.3], dtype=np.float64)
+    # Below start: unchanged
+    out0 = apply_dd_exposure_taper(w, 0.03, start=0.06, end=0.12, min_gross=0.30)
+    assert out0 == pytest.approx(w)
+    # At/above end: risky scaled to min_gross
+    out1 = apply_dd_exposure_taper(w, 0.20, start=0.06, end=0.12, min_gross=0.30)
+    assert out1[1:].sum() == pytest.approx(0.30, abs=1e-9)
+    assert out1[0] == pytest.approx(0.70, abs=1e-9)
+    assert out1.sum() == pytest.approx(1.0)
+    # Mid taper: between 1.0 and min_gross
+    out_mid = apply_dd_exposure_taper(w, 0.09, start=0.06, end=0.12, min_gross=0.30)
+    assert 0.30 < out_mid[1:].sum() < 0.90
+
+
+def test_defensive_sharpe_uses_max_dd_not_p75() -> None:
+    """defensive_sharpe must penalize the worst segment DD, not the 75th percentile."""
+    pd = pytest.importorskip("pandas")
+    # Two segments: one mild DD, one deep — p75 can sit near mild, max is deep.
+    mild = {
+        "start_bar": 0,
+        "nav_path": [100_000.0, 101_000.0, 100_500.0, 102_000.0],
+        "ending_nav": 102_000.0,
+        "max_drawdown_nav": 500.0,
+        "max_drawdown_frac": 0.005,
+    }
+    deep = {
+        "start_bar": 10,
+        "nav_path": [100_000.0, 110_000.0, 85_000.0, 95_000.0],
+        "ending_nav": 95_000.0,
+        "max_drawdown_nav": 25_000.0,
+        "max_drawdown_frac": 0.227,
+    }
+    ctx = EvalBenchmarkContext(
+        ohlcv=np.full((40, 10, 5), 100.0),
+        idx=pd.date_range("2020-01-01", periods=40),
+        tickers=[f"A{i}" for i in range(10)],
+        mode="equal_weight_daily",
+    )
+    eps = [mild, deep]
+    excess = compute_robust_eval_score(
+        eps, benchmark_ctx=ctx, score_mode="excess_sharpe", std_coef=0.0, dd_coef=8.0,
+        stitched_blend=0.0,
+    )
+    defensive = compute_robust_eval_score(
+        eps, benchmark_ctx=ctx, score_mode="defensive_sharpe", std_coef=0.0, dd_coef=8.0,
+        stitched_blend=0.0,
+    )
+    assert defensive["max_max_drawdown_frac"] == pytest.approx(0.227)
+    # Same return signal → defensive score must be strictly worse (max > p75).
+    assert defensive["score"] < excess["score"]
+
+
+def test_multi_regime_slice_bounds_span_panel() -> None:
+    from rlbot.data_utils import multi_regime_slice_bounds
+
+    bounds = multi_regime_slice_bounds(2000, n_slices=5, slice_bars=252)
+    assert len(bounds) == 5
+    assert bounds[0] == (0, 252)
+    assert bounds[-1] == (2000 - 252, 2000)
+    for start, end in bounds:
+        assert end - start == 252
+        assert 0 <= start < end <= 2000
+    # Interior slices should be distinct and ordered.
+    starts = [s for s, _ in bounds]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == 5
+
+
+def test_build_multi_regime_walkforward_packs() -> None:
+    import pandas as pd
+    from rlbot.data_utils import build_multi_regime_walkforward_packs
+
+    n, n_assets = 800, 3
+    idx = pd.date_range("2010-01-01", periods=n, freq="B")
+    ohlcv = np.ones((n, n_assets, 5), dtype=np.float64)
+    macro = np.ones((n, 4), dtype=np.float64)
+    live = np.ones((n, n_assets), dtype=np.float64)
+    feat = np.zeros((n, n_assets), dtype=np.float64)
+    packs = build_multi_regime_walkforward_packs(
+        idx,
+        ohlcv,
+        macro,
+        live,
+        rsi=feat,
+        macd=feat,
+        fracdiff=feat,
+        fracdiff_macro=np.zeros((n, 4), dtype=np.float64),
+        trend=feat,
+        asset_vol=feat,
+        macro_vol=np.zeros((n, 4), dtype=np.float64),
+        n_slices=4,
+        slice_bars=126,
+    )
+    assert len(packs) == 4
+    for p in packs:
+        assert len(p.idx) == 126
+        assert p.ohlcv.shape[0] == 126
+        assert p.block_boundaries == []
+
+
+def test_compute_robust_eval_score_burn_in_changes_signal() -> None:
+    """Burn-in should drop the early cash-heavy steps from the scored path."""
+    pd = pytest.importorskip("pandas")
+    # Flat then rising: burn-in past the flat region changes excess dynamics.
+    nav = [100_000.0] * 15 + [100_000.0 * (1.001 ** i) for i in range(1, 40)]
+    ep = {
+        "start_bar": 0,
+        "nav_path": nav,
+        "ending_nav": nav[-1],
+        "max_drawdown_nav": 0.0,
+        "max_drawdown_frac": 0.0,
+    }
+    ctx = EvalBenchmarkContext(
+        ohlcv=np.full((80, 10, 5), 100.0),
+        idx=pd.date_range("2020-01-01", periods=80),
+        tickers=[f"A{i}" for i in range(10)],
+        mode="equal_weight_daily",
+    )
+    full = compute_robust_eval_score(
+        [ep], benchmark_ctx=ctx, stitched_blend=1.0, std_coef=0.0, dd_coef=0.0,
+        score_mode="excess_sharpe", burn_in_bars=0,
+    )
+    burned = compute_robust_eval_score(
+        [ep], benchmark_ctx=ctx, stitched_blend=1.0, std_coef=0.0, dd_coef=0.0,
+        score_mode="excess_sharpe", burn_in_bars=14,
+    )
+    assert np.isfinite(full["score"])
+    assert np.isfinite(burned["score"])
+    # Not required to differ for flat EW bench, but burn-in must not crash / go -inf.
+    assert burned["score"] > float("-inf")

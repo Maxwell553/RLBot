@@ -61,9 +61,12 @@ OOS burn: `oos_trials_for_window` in recent summaries is ~**46–49** distinct m
 
 | Cohort | `vol_penalty_scale` | Verdict |
 | --- | ---: | --- |
-| `622`–`625` | 300.0 | **Invalid** — do not use for env design decisions |
+| `623`–`625` | 300.0 | **Invalid** — exclude from method comparisons |
+| `622` | 300.0 | **Separate flag** (`vol_penalty_bug_present`) — do not bundle with 623–625 |
 | `626`–`627` | 0.15 (fixed) | Usable, but also changed **cap to 0.60** (confounded) |
 | `612`–`621` | absent / pre-term | Usable as pre-vol-penalty grid (see caveats) |
+
+Also label **`W3_619`–`W5_619`** as `resumed_long_budget` (~82–84M cumulative); not comparable to single-pass 50M cells. Use `python scripts/audit_runs.py` for automatic labels.
 
 Raw contaminated chained returns still look “fine” (`622` +83%, `623` +149%, `624` +120%, `625` +176%) — **that is not evidence the penalty worked**; the reward signal was broken.
 
@@ -284,8 +287,8 @@ Ranked for an agent that can change `trading_env.py` / reward terms / obs featur
 
 ### H1 — Fix risk-off optionality without cash cliffs
 **Problem:** inactivity penalties + zero cash yield push full investment; stress windows then show brutal DD.  
-**Ideas:** state-dependent inactivity (weaker when realized vol / VIX / drawdown elevated); small `cash_daily_yield`; or replace cash penalties with a *target exposure band* reward.  
-**Success:** improve median W2/W4 Sharpe and mean max DD without collapsing W1/W5 returns; keep seed-median chained ≥ current Set A median (~+135%).
+**Shipped (config default):** `drawdown_level_exposure_coupling: 1.0` (level tax × gross — cash zeros persistent DD penalty); own-drawdown relief on inactivity/participation (`inactivity_drawdown_relief` / `participation_drawdown_relief`, most-relief-wins with VIX); softened calm-market cash tax (max ~0.20) and participation (+0.10); harder level (`drawdown_level_penalty: 100`) so underwater-and-invested (~10/step at 15% DD) dominates inactivity. Still need OOS validation.  
+**Success:** improve median W2/W4 Sharpe and mean max DD without collapsing W1/W5 returns; keep seed-median chained ≥ current Set A median (~+135%); mean OOS cash should rise above the ~2–8% "always invested" equilibrium without a blunt always-defensive collapse (721 failure mode).
 
 ### H2 — Make concentration penalty bite
 **Problem:** eff-N drifts to ~3–4; HHI anti-correlates with Sharpe; cap 0.60 made this worse.  

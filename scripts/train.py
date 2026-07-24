@@ -33,6 +33,9 @@ _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 import argparse
 import shutil
 import sys
+import json
+import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,6 +75,9 @@ from rlbot.data_utils import (
     fetch_aligned_daily,
     load_cache,
     reserve_chronological_holdout,
+    reserve_chronological_validation_tail,
+    build_continuous_walkforward_pack,
+    build_multi_regime_walkforward_packs,
     save_cache,
     select_tradeable_columns,
     WalkforwardEnvPack,
@@ -105,25 +111,41 @@ from rlbot.run_artifacts import (
     RunPaths,
     config_sha256,
     git_provenance,
+    hardware_profile,
     new_run_id,
+    persist_dirty_source_snapshot,
     read_run_manifest,
     resolve_data_cache,
     sha256_file,
     merge_manifest,
+    utc_now_iso,
     write_manifest,
 )
 from rlbot.eval_selection import (
     EvalBenchmarkContext,
     aggregate_eval_portfolio_diagnostics,
+    aggregate_multi_regime_scores,
     append_eval_diagnostics_jsonl,
+    blend_block_and_oos_aligned_scores,
     compute_robust_eval_score,
 )
 from rlbot.eval_schedule import eval_freq_vector_steps, should_run_scheduled_eval
+from rlbot.checkpoint_selection import (
+    STRESS_FEE_SCALE,
+    STRESS_OBS_LAG,
+    ConfirmationState,
+    SelectionDiagnostics,
+    blend_canonical_stress,
+    post_gate_scores,
+    trailing_aggregate,
+    update_confirmation,
+)
 from rlbot.research.spec import CANONICAL_WINDOWS
 from rlbot.trading_env import EpisodeEndNavRecorder, MultiAssetPortfolioEnv
 from rlbot.reward_logging import RewardDecompAccumulator
 from rlbot.modal_cloud import commit_modal_volumes
 from rlbot.visualize import TrainingVizCallback, open_plot_file
+from rlbot.curriculum_preflight import build_curriculum_preflight, format_preflight_text
 
 _startup_log("[train] Dependencies loaded.")
 
@@ -244,6 +266,19 @@ class EvalNavBestModelCallback(EvalCallback):
         eval_freq_steps: int = 500_000,
         eval_freq_pre_gate_steps: int = 3_000_000,
         n_envs: int = 16,
+        trailing_evals: int = 0,
+        trailing_agg: str = "median",
+        confirm_evals: int = 0,
+        stress_suite: bool = False,
+        stress_weight: float = 0.3,
+        oos_aligned_env: VecNormalize | None = None,
+        oos_aligned_benchmark_ctx: EvalBenchmarkContext | None = None,
+        oos_aligned_benchmark_ctxs: list[EvalBenchmarkContext] | None = None,
+        oos_aligned_weight: float = 0.0,
+        multi_regime_eval_agg: str = "p25",
+        eval_score_burn_in_bars: int = 0,
+        best_model_max_dd_reject: float = 0.0,
+        reward_decomp_callback: "RewardDecompCallback | None" = None,
         **kwargs,
     ):
         self._best_model_dir = Path(best_model_save_path)
@@ -252,10 +287,26 @@ class EvalNavBestModelCallback(EvalCallback):
         self.benchmark_ctx = benchmark_ctx
         self.panel_tickers = list(panel_tickers)
         self.max_single_asset_weight = float(max_single_asset_weight)
+        self._oos_aligned_env = oos_aligned_env
+        self._oos_aligned_benchmark_ctx = oos_aligned_benchmark_ctx
+        self._oos_aligned_benchmark_ctxs = list(oos_aligned_benchmark_ctxs or [])
+        self.oos_aligned_weight = float(oos_aligned_weight)
+        self.multi_regime_eval_agg = str(multi_regime_eval_agg).lower()
+        self.eval_score_burn_in_bars = int(eval_score_burn_in_bars)
+        self.best_model_max_dd_reject = float(best_model_max_dd_reject)
+        self._last_oos_aligned_max_dd = float("nan")
         self.score_std_coef = float(score_std_coef)
         self.score_dd_coef = float(score_dd_coef)
         self.score_stitched_blend = float(score_stitched_blend)
         self.score_mode = str(score_mode)
+        self.trailing_evals = max(0, int(trailing_evals))
+        self.trailing_agg = str(trailing_agg).lower()
+        self.confirm_evals = max(0, int(confirm_evals))
+        self.stress_suite = bool(stress_suite)
+        self.stress_weight = float(stress_weight)
+        self._confirm_state: ConfirmationState | None = None
+        self._reward_decomp_callback = reward_decomp_callback
+        self.last_selection_diagnostics: SelectionDiagnostics | None = None
         self.best_selection_score = -np.inf
         self.best_mean_nav = -np.inf
         self._nav_timesteps: list[int] = []
@@ -318,7 +369,31 @@ class EvalNavBestModelCallback(EvalCallback):
         ]
         return float(max(post)) if post else -np.inf
 
-    def _restore_best_selection_from_history(self) -> None:
+    def _post_gate_score_series(self) -> list[float]:
+        """Instantaneous (or stress-blended) scores eligible for trailing selection."""
+        return post_gate_scores(
+            self._nav_timesteps,
+            self._robust_scores,
+            gate_step=int(self.best_model_min_step),
+        )
+
+    def _trailing_selection_score(self, scores: list[float] | None = None) -> float:
+        series = self._post_gate_score_series() if scores is None else scores
+        window = max(1, self.trailing_evals) if self.trailing_evals > 0 else 1
+        agg = self.trailing_agg if self.trailing_agg in ("median", "mean") else "median"
+        return trailing_aggregate(series, window=window, agg=agg)
+
+    def _restore_best_selection_from_history(
+        self,
+        *,
+        saved_best_selection_score: float | None = None,
+        saved_best_mean_nav: float | None = None,
+    ) -> None:
+        """Resume the selection threshold from the checkpoint that was actually saved.
+
+        Prefer the persisted ``best_eval_step`` / ``best_selection_score`` (trailing +
+        confirmation) over argmax of instantaneous post-gate scores.
+        """
         if not self._robust_scores:
             return
         n = min(len(self._robust_scores), len(self._nav_timesteps))
@@ -334,13 +409,43 @@ class EvalNavBestModelCallback(EvalCallback):
             self.best_selection_score = -np.inf
             self.best_mean_nav = -np.inf
             return
-        masked_scores = scores[mask]
-        j_masked = int(np.argmax(masked_scores))
-        idx = int(np.nonzero(mask)[0][j_masked])
-        self.best_selection_score = float(scores[idx])
-        if idx < len(self._mean_ending_nav):
+
+        idx: int | None = None
+        if self._best_eval_step is not None:
+            matches = [
+                i for i in range(n) if int(steps[i]) == int(self._best_eval_step) and mask[i]
+            ]
+            if matches:
+                idx = int(matches[-1])
+
+        if idx is None:
+            # Legacy histories without a selected-step stamp: fall back to argmax.
+            masked_scores = scores[mask]
+            j_masked = int(np.argmax(masked_scores))
+            idx = int(np.nonzero(mask)[0][j_masked])
+            self._best_eval_step = int(steps[idx])
+
+        if (
+            saved_best_selection_score is not None
+            and np.isfinite(saved_best_selection_score)
+        ):
+            self.best_selection_score = float(saved_best_selection_score)
+        else:
+            # Reconstruct trailing selection through the selected index (post-gate only).
+            through = post_gate_scores(
+                steps[: idx + 1],
+                scores[: idx + 1],
+                gate_step=int(self.best_model_min_step),
+            )
+            if self.trailing_evals > 1:
+                self.best_selection_score = self._trailing_selection_score(through)
+            else:
+                self.best_selection_score = float(scores[idx])
+
+        if saved_best_mean_nav is not None and np.isfinite(saved_best_mean_nav):
+            self.best_mean_nav = float(saved_best_mean_nav)
+        elif idx < len(self._mean_ending_nav):
             self.best_mean_nav = float(self._mean_ending_nav[idx])
-        self._best_eval_step = int(steps[idx])
 
     def _load_nav_history(self) -> None:
         if not self.nav_history_path.is_file():
@@ -370,6 +475,12 @@ class EvalNavBestModelCallback(EvalCallback):
             bes = z.get("best_eval_step")
             if bes is not None:
                 self._best_eval_step = int(np.asarray(bes).reshape(-1)[0])
+            saved_sel: float | None = None
+            if "best_selection_score" in z:
+                saved_sel = float(np.asarray(z["best_selection_score"]).reshape(-1)[0])
+            saved_nav: float | None = None
+            if "best_mean_nav" in z:
+                saved_nav = float(np.asarray(z["best_mean_nav"]).reshape(-1)[0])
             if self._nav_timesteps:
                 if self.best_model_min_step > 0:
                     self._post_gate_eval_forced = any(
@@ -381,7 +492,10 @@ class EvalNavBestModelCallback(EvalCallback):
                     self._post_gate_tracking_started = any(
                         t >= self.best_model_min_step for t in self._nav_timesteps
                     )
-                self._restore_best_selection_from_history()
+                self._restore_best_selection_from_history(
+                    saved_best_selection_score=saved_sel,
+                    saved_best_mean_nav=saved_nav,
+                )
         except (OSError, ValueError, KeyError):
             pass
 
@@ -405,6 +519,12 @@ class EvalNavBestModelCallback(EvalCallback):
             )
         if self._best_eval_step is not None:
             payload["best_eval_step"] = np.asarray([self._best_eval_step], dtype=np.int64)
+        if np.isfinite(self.best_selection_score):
+            payload["best_selection_score"] = np.asarray(
+                [self.best_selection_score], dtype=np.float64
+            )
+        if np.isfinite(self.best_mean_nav):
+            payload["best_mean_nav"] = np.asarray([self.best_mean_nav], dtype=np.float64)
         np.savez_compressed(self.nav_history_path, **payload)
 
     def _collect_eval_episodes(self) -> list[dict]:
@@ -419,6 +539,7 @@ class EvalNavBestModelCallback(EvalCallback):
             tickers=self.panel_tickers,
             max_single_asset_weight=self.max_single_asset_weight,
             benchmark_ctx=self.benchmark_ctx,
+            burn_in_bars=self.eval_score_burn_in_bars,
         )
         panel = diag.get("portfolio") or {}
         if panel:
@@ -466,6 +587,7 @@ class EvalNavBestModelCallback(EvalCallback):
                     stitched_blend=self.score_stitched_blend,
                     benchmark_ctx=self.benchmark_ctx,
                     score_mode=self.score_mode,
+                    burn_in_bars=self.eval_score_burn_in_bars,
                 )
                 score = float(metrics["score"])
                 mean_nav = float(metrics["mean_ending_nav"])
@@ -503,20 +625,79 @@ class EvalNavBestModelCallback(EvalCallback):
                 self._log_portfolio_diagnostics(episodes, metrics)
                 gate_open = self._best_model_gate_open()
                 self.logger.record("eval/best_model_gate_open", float(gate_open))
+                raw_score = score
+                oos_aligned_score = None
+                if self.oos_aligned_weight > 0.0 and self._oos_aligned_env is not None:
+                    oos_aligned_score = self._run_oos_aligned_eval()
+                    if oos_aligned_score is not None:
+                        score = blend_block_and_oos_aligned_scores(
+                            raw_score,
+                            oos_aligned_score,
+                            weight=self.oos_aligned_weight,
+                        )
+                        self.logger.record("eval/oos_aligned_score", float(oos_aligned_score))
+                        self.logger.record("eval/selection_score_oos_blended", float(score))
+                stress_score = None
+                if gate_open and self.stress_suite:
+                    stress_score = self._run_stress_eval()
+                    if stress_score is not None:
+                        score = blend_canonical_stress(
+                            score, stress_score, stress_weight=self.stress_weight
+                        )
+                        self.logger.record("eval/stress_score", float(stress_score))
+                        self.logger.record("eval/selection_score_blended", float(score))
+                        # Replace the just-appended raw block score with the final selection score.
+                        self._robust_scores[-1] = float(score)
+                elif oos_aligned_score is not None:
+                    self._robust_scores[-1] = float(score)
+                post_scores = self._post_gate_score_series()
+                trailing = self._trailing_selection_score(post_scores)
+                selection_score = trailing if self.trailing_evals > 1 else score
+                self.logger.record("eval/trailing_selection_score", float(selection_score))
                 if gate_open:
                     if self.best_model_min_step > 0 and not self._post_gate_tracking_started:
                         self._post_gate_tracking_started = True
                         self.best_selection_score = -np.inf
                         self.best_mean_nav = -np.inf
-                    if score > self.best_selection_score:
-                        self.best_selection_score = score
+                        self._confirm_state = None
+                    new_state, replace = update_confirmation(
+                        self._confirm_state,
+                        score=selection_score,
+                        best_score=self.best_selection_score,
+                        confirms_needed=self.confirm_evals,
+                    )
+                    self._confirm_state = new_state
+                    confirms_seen = 0 if new_state is None else int(new_state.confirms_seen)
+                    self.last_selection_diagnostics = SelectionDiagnostics(
+                        raw_score=float(raw_score),
+                        trailing_score=float(trailing),
+                        selection_score=float(selection_score),
+                        stress_score=None if stress_score is None else float(stress_score),
+                        trailing_window=int(self.trailing_evals),
+                        trailing_agg=str(self.trailing_agg),
+                        confirms_needed=int(self.confirm_evals),
+                        confirms_seen=confirms_seen,
+                        gate_open=True,
+                        replaced_best=bool(replace),
+                    )
+                    append_eval_diagnostics_jsonl(
+                        self.eval_diagnostics_path.with_name("selection_diagnostics.jsonl"),
+                        {
+                            "timestep": int(self.num_timesteps),
+                            **self.last_selection_diagnostics.to_dict(),
+                        },
+                    )
+                    if replace:
+                        self.best_selection_score = selection_score
                         self.best_mean_nav = mean_nav
                         self._best_eval_step = int(self.num_timesteps)
                         self._evals_since_best = 0
+                        self._confirm_state = None
                         if self.verbose >= 1:
                             print(
-                                f"New best robust eval score: {score:,.3f} "
-                                f"(mean excess {metrics['mean_excess_nav']:,.0f}, "
+                                f"New best robust eval score: {selection_score:,.3f} "
+                                f"(raw {raw_score:,.3f}, "
+                                f"mean excess {metrics['mean_excess_nav']:,.0f}, "
                                 f"std {metrics['std_excess_nav']:,.0f}, "
                                 f"p75 max DD {100.0 * metrics['p75_max_drawdown_frac']:.1f}%)"
                             )
@@ -527,6 +708,10 @@ class EvalNavBestModelCallback(EvalCallback):
                                 str(self._best_model_dir / "vec_normalize.pkl")
                             )
                         self._save_nav_history()
+                        if self._reward_decomp_callback is not None:
+                            self._reward_decomp_callback.snapshot_best(
+                                int(self.num_timesteps)
+                            )
                     elif self.patience > 0 and self.num_timesteps >= self.curriculum_end_step:
                         self._evals_since_best += 1
                         self.logger.record("eval/evals_since_best", self._evals_since_best)
@@ -539,6 +724,283 @@ class EvalNavBestModelCallback(EvalCallback):
                             return False
 
         return continue_training
+
+    def _run_oos_aligned_eval(self) -> float | None:
+        """Continuous validation matching OOS backtest structure.
+
+        Single-pack mode (726): one chronological episode.
+        Multi-regime mode (727+): one continuous episode per regime slice, then
+        aggregate with ``multi_regime_eval_agg`` (default p25).
+        """
+        if self._oos_aligned_env is None:
+            return None
+        multi = len(self._oos_aligned_benchmark_ctxs) > 1
+        if not multi and self._oos_aligned_benchmark_ctx is None:
+            return None
+        try:
+            if self._train_vec_env is not None:
+                sync_vecnormalize_stats(self._train_vec_env, self._oos_aligned_env)
+            self._oos_aligned_env.env_method("pop_eval_episodes")
+            from stable_baselines3.common.evaluation import evaluate_policy
+
+            n_eps = max(1, len(self._oos_aligned_benchmark_ctxs)) if multi else 1
+            evaluate_policy(
+                self.model,
+                self._oos_aligned_env,
+                n_eval_episodes=n_eps,
+                deterministic=self.deterministic,
+                render=False,
+                callback=None,
+                warn=False,
+            )
+            batches = self._oos_aligned_env.env_method("pop_eval_episodes")
+            episodes: list[dict] = []
+            for batch in batches:
+                episodes.extend(batch)
+            if not episodes:
+                return None
+
+            if multi:
+                ctxs = self._oos_aligned_benchmark_ctxs
+                # One episode per env/slice (order matches SubprocVecEnv worker order).
+                n = min(len(episodes), len(ctxs))
+                per_scores: list[float] = []
+                cash_fracs: list[float] = []
+                per_max_dds: list[float] = []
+                for i in range(n):
+                    metrics_i = compute_robust_eval_score(
+                        [episodes[i]],
+                        std_coef=self.score_std_coef,
+                        dd_coef=self.score_dd_coef,
+                        stitched_blend=1.0,
+                        benchmark_ctx=ctxs[i],
+                        score_mode=self.score_mode,
+                        burn_in_bars=self.eval_score_burn_in_bars,
+                    )
+                    per_scores.append(float(metrics_i["score"]))
+                    per_max_dds.append(float(metrics_i.get("max_max_drawdown_frac", 0.0)))
+                    diag_i = aggregate_eval_portfolio_diagnostics(
+                        [episodes[i]],
+                        tickers=self.panel_tickers,
+                        max_single_asset_weight=self.max_single_asset_weight,
+                        benchmark_ctx=ctxs[i],
+                        burn_in_bars=self.eval_score_burn_in_bars,
+                    )
+                    panel_i = diag_i.get("portfolio") or {}
+                    if panel_i:
+                        cash_fracs.append(float(panel_i.get("mean_cash_frac", 0.0)))
+                    append_eval_diagnostics_jsonl(
+                        self.eval_diagnostics_path,
+                        {
+                            "timestep": int(self.num_timesteps),
+                            "kind": "oos_aligned",
+                            "regime_index": i,
+                            "score": metrics_i,
+                            "portfolio": panel_i,
+                            "segments": diag_i.get("segments", []),
+                        },
+                    )
+                agg_score = aggregate_multi_regime_scores(
+                    per_scores, agg=self.multi_regime_eval_agg
+                )
+                max_dd = float(max(per_max_dds)) if per_max_dds else 0.0
+                self._last_oos_aligned_max_dd = max_dd
+                rejected = (
+                    self.best_model_max_dd_reject > 0.0
+                    and max_dd > self.best_model_max_dd_reject
+                )
+                if rejected:
+                    agg_score = float("-inf")
+                self.logger.record("eval/oos_aligned_score", float(agg_score) if np.isfinite(agg_score) else -1e9)
+                self.logger.record("eval/oos_aligned_max_dd_frac", max_dd)
+                self.logger.record("eval/oos_aligned_dd_rejected", float(rejected))
+                self.logger.record(
+                    "eval/oos_aligned_score_min", float(min(per_scores)) if per_scores else 0.0
+                )
+                self.logger.record(
+                    "eval/oos_aligned_score_median",
+                    float(np.median(per_scores)) if per_scores else 0.0,
+                )
+                if cash_fracs:
+                    self.logger.record(
+                        "eval/oos_aligned_mean_cash_frac", float(np.mean(cash_fracs))
+                    )
+                append_eval_diagnostics_jsonl(
+                    self.eval_diagnostics_path,
+                    {
+                        "timestep": int(self.num_timesteps),
+                        "kind": "oos_aligned_aggregate",
+                        "agg": self.multi_regime_eval_agg,
+                        "per_regime_scores": per_scores,
+                        "per_regime_max_dd": per_max_dds,
+                        "max_dd_frac": max_dd,
+                        "dd_rejected": bool(rejected),
+                        "dd_reject_threshold": float(self.best_model_max_dd_reject),
+                        "score": float(agg_score) if np.isfinite(agg_score) else None,
+                    },
+                )
+                return float(agg_score)
+
+            metrics = compute_robust_eval_score(
+                episodes,
+                std_coef=self.score_std_coef,
+                dd_coef=self.score_dd_coef,
+                stitched_blend=1.0,  # single continuous path
+                benchmark_ctx=self._oos_aligned_benchmark_ctx,
+                score_mode=self.score_mode,
+                burn_in_bars=self.eval_score_burn_in_bars,
+            )
+            max_dd = float(metrics.get("max_max_drawdown_frac", 0.0))
+            self._last_oos_aligned_max_dd = max_dd
+            rejected = (
+                self.best_model_max_dd_reject > 0.0
+                and max_dd > self.best_model_max_dd_reject
+            )
+            score_out = float("-inf") if rejected else float(metrics["score"])
+            # Log continuous-path portfolio diagnostics alongside block diagnostics.
+            diag = aggregate_eval_portfolio_diagnostics(
+                episodes,
+                tickers=self.panel_tickers,
+                max_single_asset_weight=self.max_single_asset_weight,
+                benchmark_ctx=self._oos_aligned_benchmark_ctx,
+                burn_in_bars=self.eval_score_burn_in_bars,
+            )
+            panel = diag.get("portfolio") or {}
+            if panel:
+                self.logger.record(
+                    "eval/oos_aligned_mean_cash_frac", panel.get("mean_cash_frac", 0.0)
+                )
+                self.logger.record(
+                    "eval/oos_aligned_mean_gross_exposure",
+                    panel.get("mean_gross_exposure", 0.0),
+                )
+            self.logger.record("eval/oos_aligned_max_dd_frac", max_dd)
+            self.logger.record("eval/oos_aligned_dd_rejected", float(rejected))
+            append_eval_diagnostics_jsonl(
+                self.eval_diagnostics_path,
+                {
+                    "timestep": int(self.num_timesteps),
+                    "kind": "oos_aligned",
+                    "score": metrics,
+                    "portfolio": panel,
+                    "segments": diag.get("segments", []),
+                    "dd_rejected": bool(rejected),
+                    "dd_reject_threshold": float(self.best_model_max_dd_reject),
+                },
+            )
+            return float(score_out)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[train] oos-aligned eval failed: {exc}")
+            return None
+
+    def _run_stress_eval(self) -> float | None:
+        """Fixed high-fee / high-lag eval; returns robust score or None on failure.
+
+        Agent *and* passive benchmark are priced at ``STRESS_FEE_SCALE`` so the
+        excess / Sharpe signal stays like-for-like (not agent-only fee stress).
+
+        When OOS-aligned continuous selection is active (weight ≥ 0.5), stress the
+        continuous env so the adverse-fee signal matches the primary selection path.
+        Multi-regime: stress every slice and aggregate with the same agg as selection.
+        """
+        use_oos = (
+            self.oos_aligned_weight >= 0.5
+            and self._oos_aligned_env is not None
+            and (
+                self._oos_aligned_benchmark_ctx is not None
+                or len(self._oos_aligned_benchmark_ctxs) > 0
+            )
+        )
+        env = self._oos_aligned_env if use_oos else self.eval_env
+        multi = use_oos and len(self._oos_aligned_benchmark_ctxs) > 1
+        bench_ctx = self._oos_aligned_benchmark_ctx if use_oos else self.benchmark_ctx
+        n_eps = (
+            max(1, len(self._oos_aligned_benchmark_ctxs))
+            if multi
+            else (1 if use_oos else self.n_eval_episodes)
+        )
+        try:
+            if self._train_vec_env is not None:
+                sync_vecnormalize_stats(self._train_vec_env, env)
+            env.env_method(
+                "set_eval_controls",
+                fee_scale=float(STRESS_FEE_SCALE),
+                obs_lag=int(STRESS_OBS_LAG),
+            )
+            env.env_method("pop_eval_episodes")
+            from stable_baselines3.common.evaluation import evaluate_policy
+
+            evaluate_policy(
+                self.model,
+                env,
+                n_eval_episodes=n_eps,
+                deterministic=self.deterministic,
+                render=False,
+                callback=self._log_success_callback if not use_oos else None,
+                warn=False,
+            )
+            batches = env.env_method("pop_eval_episodes")
+            episodes: list[dict] = []
+            for batch in batches:
+                episodes.extend(batch)
+            env.env_method("set_eval_controls", fee_scale=None, obs_lag=None)
+            if not episodes:
+                return None
+            if multi:
+                ctxs = [
+                    EvalBenchmarkContext(
+                        ohlcv=c.ohlcv,
+                        idx=c.idx,
+                        tickers=list(c.tickers),
+                        asset_live=c.asset_live,
+                        mode=str(c.mode),
+                        fee_scale=float(STRESS_FEE_SCALE),
+                    )
+                    for c in self._oos_aligned_benchmark_ctxs
+                ]
+                n = min(len(episodes), len(ctxs))
+                per_scores = []
+                for i in range(n):
+                    m = compute_robust_eval_score(
+                        [episodes[i]],
+                        std_coef=self.score_std_coef,
+                        dd_coef=self.score_dd_coef,
+                        stitched_blend=1.0,
+                        benchmark_ctx=ctxs[i],
+                        score_mode=self.score_mode,
+                        burn_in_bars=self.eval_score_burn_in_bars,
+                    )
+                    per_scores.append(float(m["score"]))
+                return aggregate_multi_regime_scores(
+                    per_scores, agg=self.multi_regime_eval_agg
+                )
+            stress_ctx = bench_ctx
+            if use_oos and bench_ctx is not None:
+                stress_ctx = EvalBenchmarkContext(
+                    ohlcv=bench_ctx.ohlcv,
+                    idx=bench_ctx.idx,
+                    tickers=list(bench_ctx.tickers),
+                    asset_live=bench_ctx.asset_live,
+                    mode=str(bench_ctx.mode),
+                    fee_scale=float(STRESS_FEE_SCALE),
+                )
+            metrics = compute_robust_eval_score(
+                episodes,
+                std_coef=self.score_std_coef,
+                dd_coef=self.score_dd_coef,
+                stitched_blend=1.0 if use_oos else self.score_stitched_blend,
+                benchmark_ctx=stress_ctx,
+                score_mode=self.score_mode,
+                burn_in_bars=self.eval_score_burn_in_bars,
+            )
+            return float(metrics["score"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"[train] stress eval failed: {exc}")
+            try:
+                env.env_method("set_eval_controls", fee_scale=None, obs_lag=None)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
 
 
 class AdaptiveEntropyCallback(BaseCallback):
@@ -742,10 +1204,12 @@ class TradingCurriculumCallback(BaseCallback):
         learn_budget: int,
         update_freq: int = 50_000,
         eval_vec_env: VecNormalize | None = None,
+        oos_aligned_vec_env: VecNormalize | None = None,
     ):
         super().__init__()
         self.vec_env = vec_env
         self.eval_vec_env = eval_vec_env
+        self.oos_aligned_vec_env = oos_aligned_vec_env
         self.learn_budget = int(learn_budget)
         self.fee_free_until, self.fee_ramp_end = trade_curriculum_milestones(
             self.learn_budget
@@ -809,6 +1273,8 @@ class TradingCurriculumCallback(BaseCallback):
             )
             if self.eval_vec_env is not None:
                 self.eval_vec_env.env_method("set_curriculum_state", fee, churn)
+            if self.oos_aligned_vec_env is not None:
+                self.oos_aligned_vec_env.env_method("set_curriculum_state", fee, churn)
             self._last_key = key
             self.logger.record("config/curriculum_fee_override", -1.0 if fee is None else float(fee))
             self.logger.record("config/curriculum_churn_scale", churn)
@@ -828,32 +1294,77 @@ class TradingCurriculumCallback(BaseCallback):
 
 
 class RewardDecompCallback(BaseCallback):
-    """Aggregate ``info['rew_decomp/*']`` → TensorBoard scalars + a windowed JSON snapshot.
+    """Aggregate ``info['rew_decomp/*']`` → TensorBoard + JSONL history + windowed JSON.
 
     Makes the reward balance observable (the review's asymmetry finding: inactivity
     can dwarf participation/churn). Logs per-term means and share-of-absolute-reward over
-    the window since the last log, then resets, so ``reward_decomp.json`` reflects recent
-    (steady-state) behavior rather than a run-wide average. TB scalars give the time series.
+    the window since the last log, then resets, so the rolling JSON reflects recent
+    (steady-state) behavior. JSONL keeps the full time series; a best-checkpoint
+    snapshot is written when ``models/best/`` updates.
     """
 
-    def __init__(self, json_path, log_freq: int = 50_000):
+    def __init__(
+        self,
+        json_path,
+        log_freq: int = 50_000,
+        *,
+        clip_reward: float = 10.0,
+    ):
         super().__init__()
-        self.json_path = json_path
+        self.json_path = Path(json_path)
+        self.jsonl_path = self.json_path.with_suffix(".jsonl")
+        self.best_json_path = self.json_path.with_name("reward_decomp_best.json")
         self.log_freq = max(int(log_freq), 1)
+        self.clip_reward = float(clip_reward)
         self._acc = RewardDecompAccumulator()
+        self._n_reward = 0
+        self._n_clipped = 0
+
+    def _append_jsonl(self, payload: dict) -> None:
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+
+    def snapshot_best(self, timesteps: int) -> None:
+        """Persist the current window summary as the best-checkpoint decomposition."""
+        if self._acc.count <= 0:
+            return
+        s = self._acc.summary()
+        write_manifest(
+            self.best_json_path,
+            {"timesteps": int(timesteps), "at_best_checkpoint": True, **s},
+        )
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos")
         if infos:
             self._acc.update(infos)
+        rewards = self.locals.get("rewards")
+        if rewards is not None:
+            arr = np.asarray(rewards, dtype=np.float64).reshape(-1)
+            self._n_reward += int(arr.size)
+            self._n_clipped += int(np.sum(np.abs(arr) >= self.clip_reward - 1e-9))
         if self.n_calls % self.log_freq == 0 and self._acc.count > 0:
             s = self._acc.summary()
+            clip_rate = (
+                float(self._n_clipped) / float(self._n_reward) if self._n_reward else 0.0
+            )
+            s["vecnormalize_reward_clip_rate"] = clip_rate
             for term, val in s["mean"].items():
                 self.logger.record(f"rew_decomp/mean/{term}", val)
             for term, val in s["abs_share"].items():
                 self.logger.record(f"rew_decomp/abs_share/{term}", val)
-            write_manifest(self.json_path, {"timesteps": int(self.num_timesteps), **s})
-            self._acc.reset()  # windowed: next snapshot reflects the next interval only
+            for k, val in (s.get("extras") or {}).items():
+                self.logger.record(f"rew_decomp/extra/{k}", val)
+            for k, val in (s.get("reward_quantiles") or {}).items():
+                self.logger.record(f"rew_decomp/quantile/{k}", val)
+            self.logger.record("rew_decomp/vecnormalize_clip_rate", clip_rate)
+            payload = {"timesteps": int(self.num_timesteps), **s}
+            write_manifest(self.json_path, payload)
+            self._append_jsonl(payload)
+            self._acc.reset()
+            self._n_reward = 0
+            self._n_clipped = 0
         return True
 
 
@@ -1199,6 +1710,119 @@ def main() -> None:
         holdout_start=args.holdout_start,
         holdout_end=args.holdout_end,
     )
+    # Full pre-OOS panel (before carving the continuous validation tail).
+    idx_trainable = idx_fit
+    n_trainable_bars = int(len(idx_fit))
+
+    # Continuous validation for selection:
+    # - multi_regime (727+): K overlays spanning the full trainable panel (no carve-out)
+    # - chronological tail (726): hold out the last N bars from alternating train/eval
+    oos_aligned_pack: WalkforwardEnvPack | None = None
+    oos_aligned_packs: list[WalkforwardEnvPack] = []
+    chronological_validation: dict | None = None
+    if bool(tr_cfg.oos_aligned_eval) and float(tr_cfg.oos_aligned_eval_weight) > 0.0:
+        n_val = int(tr_cfg.oos_aligned_eval_bars)
+        if bool(getattr(tr_cfg, "multi_regime_eval", False)):
+            rsi_fit_full, macd_fit_full, fd_fit_full, fdm_fit_full, trend_fit_full, avol_fit_full, mvol_fit_full = (
+                align_panel_to_timeline(
+                    idx,
+                    idx_fit,
+                    rsi,
+                    macd,
+                    fracdiff,
+                    fracdiff_macro,
+                    trend,
+                    asset_vol,
+                    macro_vol,
+                )
+            )
+            oos_aligned_packs = build_multi_regime_walkforward_packs(
+                idx_fit,
+                ohlcv_fit,
+                macro_fit,
+                asset_live_fit,
+                rsi=rsi_fit_full,
+                macd=macd_fit_full,
+                fracdiff=fd_fit_full,
+                fracdiff_macro=fdm_fit_full,
+                trend=trend_fit_full,
+                asset_vol=avol_fit_full,
+                macro_vol=mvol_fit_full,
+                n_slices=int(tr_cfg.multi_regime_eval_slices),
+                slice_bars=n_val,
+            )
+            chronological_validation = {
+                "mode": "multi_regime",
+                "n_slices": len(oos_aligned_packs),
+                "slice_bars": n_val,
+                "agg": str(tr_cfg.multi_regime_eval_agg),
+                "oos_aligned_eval_weight": float(tr_cfg.oos_aligned_eval_weight),
+                "eval_score_burn_in_bars": int(tr_cfg.eval_score_burn_in_bars),
+                "feature_memory": "continuous",
+                "slices": [
+                    {"start": str(p.idx[0]), "end": str(p.idx[-1]), "n_bars": int(len(p.idx))}
+                    for p in oos_aligned_packs
+                ],
+            }
+            print(
+                f"  Multi-regime validation: {len(oos_aligned_packs)} × {n_val} bars "
+                f"(agg={tr_cfg.multi_regime_eval_agg}, weight={tr_cfg.oos_aligned_eval_weight:g}, "
+                f"burn_in={tr_cfg.eval_score_burn_in_bars})"
+            )
+            for i, p in enumerate(oos_aligned_packs):
+                print(f"    slice[{i}]: {p.idx[0].date()} .. {p.idx[-1].date()}")
+        else:
+            (idx_fit, ohlcv_fit, macro_fit, asset_live_fit), (
+                idx_val,
+                ohlcv_val,
+                macro_val,
+                asset_live_val,
+            ) = reserve_chronological_validation_tail(
+                idx_fit,
+                ohlcv_fit,
+                macro_fit,
+                asset_live_fit,
+                n_bars=n_val,
+                min_remaining=max(500, 4 * int(tr_cfg.block_size)),
+            )
+            rsi_v, macd_v, fd_v, fdm_v, trend_v, avol_v, mvol_v = align_panel_to_timeline(
+                idx,
+                idx_val,
+                rsi,
+                macd,
+                fracdiff,
+                fracdiff_macro,
+                trend,
+                asset_vol,
+                macro_vol,
+            )
+            oos_aligned_pack = build_continuous_walkforward_pack(
+                idx_val,
+                ohlcv_val,
+                macro_val,
+                asset_live_val,
+                rsi=rsi_v,
+                macd=macd_v,
+                fracdiff=fd_v,
+                fracdiff_macro=fdm_v,
+                trend=trend_v,
+                asset_vol=avol_v,
+                macro_vol=mvol_v,
+            )
+            chronological_validation = {
+                "mode": "chronological_tail",
+                "n_bars": int(len(idx_val)),
+                "start": str(idx_val[0]),
+                "end": str(idx_val[-1]),
+                "oos_aligned_eval_weight": float(tr_cfg.oos_aligned_eval_weight),
+                "eval_score_burn_in_bars": int(tr_cfg.eval_score_burn_in_bars),
+                "feature_memory": "continuous",
+            }
+            print(
+                f"  OOS-aligned validation: {len(idx_val)} bars "
+                f"{idx_val[0].date()} .. {idx_val[-1].date()} "
+                f"(weight={tr_cfg.oos_aligned_eval_weight:g}, burn_in={tr_cfg.eval_score_burn_in_bars})"
+            )
 
     purge = cfg.data.feature_purge_warmup
     split_mode = cfg.data.feature_split_mode
@@ -1273,11 +1897,28 @@ def main() -> None:
     }
 
     # Provenance shared by the pre- and post-training manifest writes.
+    started_at = utc_now_iso()
+    dirty_frag = persist_dirty_source_snapshot(
+        paths.run_meta_dir / "provenance",
+        root=ROOT,
+    )
+    resume_path = str(getattr(args, "resume", "") or "").strip()
+    resume_parent_step = None
+    if resume_path:
+        m_ckpt = re.search(r"ppo_(\d+)_steps", resume_path)
+        if m_ckpt:
+            resume_parent_step = int(m_ckpt.group(1))
     provenance = {
         "feature_split_mode": cfg.data.feature_split_mode,
         "config_hash": config_sha256(cfg.to_dict()),
         "data_cache_hash": sha256_file(paths.data_snapshot),
-        **git_provenance(),
+        "started_at_utc": started_at,
+        "hardware": hardware_profile(),
+        "provenance": dirty_frag,
+        "resume_parent": resume_path or None,
+        "resume_parent_step": resume_parent_step,
+        "nominal_timesteps": int(args.timesteps),
+        **{k: dirty_frag.get(k) for k in ("git_commit", "git_dirty")},
     }
 
     write_manifest(
@@ -1288,17 +1929,18 @@ def main() -> None:
             "args": vars(args),
             "universe": universe_meta,
             "n_index": int(len(idx)),
-            "n_trainable_bars": int(len(idx_fit)),
+            "n_trainable_bars": n_trainable_bars,
             "chronological_holdout": {
                 "holdout_days": int(args.holdout_days),
                 "train_end": args.train_end,
                 "holdout_start": args.holdout_start,
                 "holdout_end": args.holdout_end or (str(idx_hold[-1]) if len(idx_hold) else None),
-                "trainable_end": str(idx_fit[-1]) if len(idx_fit) else None,
+                "trainable_end": str(idx_trainable[-1]) if len(idx_trainable) else None,
                 "holdout_bars": int(len(idx_hold)),
                 "date_start": str(idx_hold[0]) if len(idx_hold) else None,
                 "date_end": str(idx_hold[-1]) if len(idx_hold) else None,
             },
+            "chronological_validation": chronological_validation,
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
             "data_cache_snapshot": str(paths.data_snapshot),
@@ -1329,6 +1971,10 @@ def main() -> None:
         )
     else:
         print(f"  early_stop: off (full {args.timesteps:,} timesteps; best_model by robust eval score)")
+    try:
+        print(format_preflight_text(build_curriculum_preflight(cfg, budget=int(args.timesteps))))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [preflight] skipped: {exc}")
     print(
         f"  trade bundle: best/ saves model + vec_normalize together on each new best robust score; "
         f"exit writes final model + end-of-run vec_normalize.pkl"
@@ -1407,7 +2053,14 @@ def main() -> None:
         f"then 0.01 for {_ef:,}) → cosine decay to {ent_cfg.final_ent} from "
         f"{_decay_frac:.0%} of run (step ~{_decay_step:,}), not eval-gated"
     )
-    print(f"  LR={args.learning_rate} (cosine → 1e-6 floor)")
+    if str(getattr(hp, "lr_schedule", "cosine")).lower() == "phase_aware":
+        _lr_hold = dr_widen_end_milestone(int(args.timesteps))
+        print(
+            f"  LR={args.learning_rate} (phase-aware: hold until DR widen end "
+            f"~{_lr_hold:,}, then cosine → {hp.learning_rate_floor} floor)"
+        )
+    else:
+        print(f"  LR={args.learning_rate} (cosine → {hp.learning_rate_floor} floor)")
     if args.train_end and args.holdout_start:
         print(
             f"  OOS holdout: {args.holdout_start} .. {idx_hold[-1].date()} → {len(idx_hold)} bars "
@@ -1512,6 +2165,55 @@ def main() -> None:
         gamma=hp.gamma,
         training=False,
     )
+
+    oos_aligned_env: VecNormalize | None = None
+    oos_aligned_benchmark_ctx: EvalBenchmarkContext | None = None
+    oos_aligned_benchmark_ctxs: list[EvalBenchmarkContext] = []
+    packs_for_oos = (
+        oos_aligned_packs
+        if oos_aligned_packs
+        else ([oos_aligned_pack] if oos_aligned_pack is not None else [])
+    )
+    if packs_for_oos:
+        factories = []
+        for i, pack in enumerate(packs_for_oos):
+            oos_ep_steps = max(1, int(pack.ohlcv.shape[0]) - 2)
+            factories.append(
+                _make_env_factory(
+                    pack,
+                    random_start=False,
+                    noise_scale=train_noise_scale,
+                    log_dir=paths.logs_dir,
+                    monitor_stem=f"oos_aligned_monitor_{i}",
+                    max_episode_steps=oos_ep_steps,
+                    reseed_on_reset=False,
+                    obs_lag_default=args.obs_lag,
+                    domain_randomize=False,
+                    inactivity_penalty_scale=cfg.reward.eval_inactivity_penalty_scale,
+                    record_episode_nav=True,
+                    config_installer=worker_config,
+                )
+            )
+            oos_aligned_benchmark_ctxs.append(
+                EvalBenchmarkContext(
+                    ohlcv=pack.ohlcv,
+                    idx=pack.idx,
+                    tickers=list(panel_tickers),
+                    asset_live=pack.asset_live,
+                    mode=str(tr_cfg.best_model_benchmark),
+                )
+            )
+        oos_aligned_env = SubprocVecEnv(factories)
+        oos_aligned_env = VecNormalize(
+            oos_aligned_env,
+            norm_obs=vn_cfg.norm_obs,
+            norm_reward=False,
+            clip_obs=vn_cfg.clip_obs,
+            gamma=hp.gamma,
+            training=False,
+        )
+        oos_aligned_benchmark_ctx = oos_aligned_benchmark_ctxs[0]
+
     _startup_log("[train] Environments ready; building RecurrentPPO policy...")
 
     # ── model ────────────────────────────────────────────────────────────
@@ -1525,10 +2227,19 @@ def main() -> None:
         optimizer_kwargs=dict(weight_decay=hp.weight_decay),
     )
 
+    # Phase-aware LR: hold the initial LR through DR widening (fee/lag conditions are
+    # still shifting; a decayed LR freezes adaptation), then cosine-decay to the floor
+    # over the settled full-DR remainder. "cosine" (legacy) keeps the global curve.
+    lr_hold_until = (
+        dr_widen_end_milestone(int(args.timesteps))
+        if str(getattr(hp, "lr_schedule", "cosine")).lower() == "phase_aware"
+        else 0
+    )
     lr_schedule = lr_schedule_with_floor_for_budget(
         args.learning_rate,
         hp.learning_rate_floor,
         int(args.timesteps),
+        hold_until_step=lr_hold_until,
     )
 
     finetune_mode = bool(args.finetune.strip())
@@ -1568,10 +2279,14 @@ def main() -> None:
             train_env.obs_rms = loaded_vn.obs_rms
             train_env.ret_rms = loaded_vn.ret_rms
             eval_env.obs_rms = loaded_vn.obs_rms
+            if oos_aligned_env is not None:
+                oos_aligned_env.obs_rms = loaded_vn.obs_rms
             print(f"  Restored VecNormalize stats from: {vn_path}")
         else:
             print("  WARNING: No VecNormalize stats found for checkpoint")
             eval_env.obs_rms = train_env.obs_rms
+            if oos_aligned_env is not None:
+                oos_aligned_env.obs_rms = train_env.obs_rms
 
         if finetune_mode:
             print(f"  Fine-tune LR={args.learning_rate}, ent_coef={hp.ent_coef_finetune}, clip={hp.clip_range_finetune}")
@@ -1600,6 +2315,8 @@ def main() -> None:
             device="auto",
         )
         eval_env.obs_rms = train_env.obs_rms
+        if oos_aligned_env is not None:
+            oos_aligned_env.obs_rms = train_env.obs_rms
 
     total_params = sum(p.numel() for p in model.policy.parameters())
     trainable_params = sum(p.numel() for p in model.policy.parameters() if p.requires_grad)
@@ -1627,6 +2344,23 @@ def main() -> None:
         f"  eval coverage: {n_validation_blocks} segments / {eval_coverage_bars} scored bars "
         f"(effective sample size of the deterministic eval-selection signal)"
     )
+    if oos_aligned_env is not None:
+        if oos_aligned_packs:
+            print(
+                f"  Multi-regime selection: {len(oos_aligned_packs)} × "
+                f"{tr_cfg.oos_aligned_eval_bars} bars, agg={tr_cfg.multi_regime_eval_agg}, "
+                f"weight={tr_cfg.oos_aligned_eval_weight:g}, "
+                f"burn_in={tr_cfg.eval_score_burn_in_bars}"
+            )
+        else:
+            print(
+                f"  OOS-aligned selection: continuous {tr_cfg.oos_aligned_eval_bars} bars, "
+                f"weight={tr_cfg.oos_aligned_eval_weight:g}, "
+                f"burn_in={tr_cfg.eval_score_burn_in_bars} "
+                f"(primary checkpoint signal matches backtest structure)"
+            )
+    if bool(getattr(cfg.environment, "two_head_actions", False)):
+        print("  Policy action map: two-head (exposure logit + risky allocation)")
     # Patience early-stop is gated on curriculum completion (dr_widen_end); patience=0 keeps
     # the full --timesteps budget. best_model saves open after fee_ramp_end (full eval fees).
     curriculum_end_step = dr_widen_end_milestone(args.timesteps)
@@ -1663,6 +2397,20 @@ def main() -> None:
         eval_freq_steps=eval_freq_steps,
         eval_freq_pre_gate_steps=eval_freq_pre_gate,
         n_envs=n_envs,
+        trailing_evals=int(getattr(tr_cfg, "best_model_trailing_evals", 0)),
+        trailing_agg=str(getattr(tr_cfg, "best_model_trailing_agg", "median")),
+        confirm_evals=int(getattr(tr_cfg, "best_model_confirm_evals", 0)),
+        stress_suite=bool(getattr(tr_cfg, "best_model_stress_suite", False)),
+        stress_weight=float(getattr(tr_cfg, "best_model_stress_weight", 0.3)),
+        oos_aligned_env=oos_aligned_env,
+        oos_aligned_benchmark_ctx=oos_aligned_benchmark_ctx,
+        oos_aligned_benchmark_ctxs=oos_aligned_benchmark_ctxs,
+        oos_aligned_weight=(
+            float(tr_cfg.oos_aligned_eval_weight) if oos_aligned_env is not None else 0.0
+        ),
+        multi_regime_eval_agg=str(getattr(tr_cfg, "multi_regime_eval_agg", "p25")),
+        eval_score_burn_in_bars=int(tr_cfg.eval_score_burn_in_bars),
+        best_model_max_dd_reject=float(getattr(tr_cfg, "best_model_max_dd_reject", 0.0)),
         log_path=str(paths.eval_log_dir),
         n_eval_episodes=n_validation_blocks,
         deterministic=True,
@@ -1683,7 +2431,9 @@ def main() -> None:
     reward_decomp_callback = RewardDecompCallback(
         json_path=paths.eval_log_dir / "reward_decomp.json",
         log_freq=callback_update_freq,
+        clip_reward=float(cfg.vec_normalize.clip_reward),
     )
+    eval_callback._reward_decomp_callback = reward_decomp_callback
     callbacks = [eval_callback, checkpoint_callback, reward_decomp_callback]
     resume_mode = bool(args.resume.strip())
     learn_timesteps, reset_num_timesteps = resolve_learn_timesteps(
@@ -1701,6 +2451,7 @@ def main() -> None:
                 learn_budget=args.timesteps,
                 update_freq=callback_update_freq,
                 eval_vec_env=eval_env,
+                oos_aligned_vec_env=oos_aligned_env,
             ),
         )
         callbacks.append(AdaptiveEntropyCallback(
@@ -1780,8 +2531,12 @@ def main() -> None:
         if np.isfinite(eval_callback.best_selection_score)
         else None
     )
-    best_eval_step = None
-    if eval_callback._robust_scores and eval_callback._nav_timesteps:
+    # Prefer the step that actually wrote best_model.zip (trailing/confirmation),
+    # not argmax of instantaneous post-gate scores.
+    best_eval_step = getattr(eval_callback, "_best_eval_step", None)
+    if best_eval_step is not None:
+        best_eval_step = int(best_eval_step)
+    elif eval_callback._robust_scores and eval_callback._nav_timesteps:
         navs_arr = np.asarray(eval_callback._robust_scores, dtype=np.float64)
         steps_arr = np.asarray(eval_callback._nav_timesteps, dtype=np.int64)
         n = min(len(navs_arr), len(steps_arr))
@@ -1792,6 +2547,13 @@ def main() -> None:
             j = int(np.argmax(navs_arr[post_gate]))
             best_eval_step = int(steps_arr[post_gate][j])
     early_stop_reason = getattr(eval_callback, "early_stop_reason", None)
+    elapsed_timesteps = int(getattr(model, "num_timesteps", 0) or 0)
+    cumulative_timesteps = elapsed_timesteps
+    if resume_parent_step is not None and elapsed_timesteps < resume_parent_step:
+        # Session counter was reset somehow; prefer parent+session if available.
+        cumulative_timesteps = resume_parent_step + max(0, elapsed_timesteps)
+    elif resume_parent_step is not None:
+        cumulative_timesteps = elapsed_timesteps  # SB3 keeps absolute counter on resume
 
     # Merge (never rebuild) the pre-training manifest: it carries the
     # chronological_holdout block that defines what OOS is for this run; losing it
@@ -1804,10 +2566,13 @@ def main() -> None:
             "args": vars(args),
             "universe": universe_meta,
             "n_index": int(len(idx)),
+            "n_trainable_bars": n_trainable_bars,
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
+            "chronological_validation": chronological_validation,
             "data_cache_snapshot": str(paths.data_snapshot),
-            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "started_at_utc": provenance.get("started_at_utc"),
+            "finished_at_utc": utc_now_iso(),
             "training_status": "interrupted" if interrupted else "completed",
             "total_params": total_params,
             "trainable_params": trainable_params,
@@ -1815,6 +2580,9 @@ def main() -> None:
             "best_eval_score": best_eval_score,
             "best_eval_step": best_eval_step,
             "early_stop_reason": early_stop_reason,
+            "elapsed_timesteps": elapsed_timesteps,
+            "cumulative_timesteps": cumulative_timesteps,
+            "nominal_timesteps": int(args.timesteps),
             **provenance,
             "artifacts": {
                 "final_model": str(paths.final_model),
@@ -1828,6 +2596,9 @@ def main() -> None:
                 "eval_npz": str(paths.eval_npz),
                 "eval_nav_history": str(paths.eval_nav_history),
                 "eval_portfolio_diagnostics": str(paths.eval_portfolio_diagnostics_jsonl),
+                "reward_decomp_jsonl": str(paths.eval_log_dir / "reward_decomp.jsonl"),
+                "reward_decomp_best": str(paths.eval_log_dir / "reward_decomp_best.json"),
+                "source_provenance_dir": str(paths.run_meta_dir / "provenance"),
             },
         },
     )
@@ -1838,6 +2609,8 @@ def main() -> None:
         {
             "run_id": run_id,
             "timesteps": int(args.timesteps),
+            "elapsed_timesteps": elapsed_timesteps,
+            "cumulative_timesteps": cumulative_timesteps,
             "total_params": total_params,
             "trainable_params": trainable_params,
             "best_eval_nav": best_eval_nav,
@@ -1846,8 +2619,9 @@ def main() -> None:
             "early_stop_reason": early_stop_reason,
             "n_train_bars": int(len(train_idx)),
             "n_eval_bars": int(len(eval_idx)),
-            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
-            **provenance,
+            "started_at_utc": provenance.get("started_at_utc"),
+            "finished_at_utc": utc_now_iso(),
+            **{k: provenance[k] for k in ("git_commit", "git_dirty", "config_hash", "data_cache_hash", "feature_split_mode") if k in provenance},
         },
     )
 

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from rlbot.data_utils import reserve_chronological_holdout
+from rlbot.data_utils import reserve_chronological_holdout, reserve_chronological_validation_tail
 
 
 def _panel(n_bars: int = 120, n_a: int = 3, seed: int = 0):
@@ -164,3 +164,22 @@ def test_no_trainable_rows_raises() -> None:
             train_end=idx[0] - pd.Timedelta(days=10),
             holdout_start=idx[0],
         )
+
+
+def test_validation_tail_is_chronological_suffix() -> None:
+    idx, ohlcv, tag = _panel()
+    (rem_idx, rem_ohlcv, rem_tag), (val_idx, val_ohlcv, val_tag) = (
+        reserve_chronological_validation_tail(idx, ohlcv, tag, n_bars=20, min_remaining=50)
+    )
+    assert len(val_idx) == 20
+    assert len(rem_idx) + len(val_idx) == len(idx)
+    assert rem_idx[-1] < val_idx[0]
+    assert val_idx[-1] == idx[-1]
+    assert rem_tag[-1] == tag[len(rem_idx) - 1]
+    assert val_tag[0] == tag[len(rem_idx)]
+
+
+def test_validation_tail_rejects_too_short_panel() -> None:
+    idx, ohlcv, tag = _panel()
+    with pytest.raises(ValueError, match="Need at least"):
+        reserve_chronological_validation_tail(idx, ohlcv, tag, n_bars=80, min_remaining=50)

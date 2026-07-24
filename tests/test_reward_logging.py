@@ -32,7 +32,10 @@ def test_accumulates_means_and_shares() -> None:
     assert s["mean"]["participation"] == 1.0
     # return (with downside amp) should dominate shaping terms at realistic magnitudes
     assert s["abs_share"]["return"] > s["abs_share"]["inactivity"]
-    assert abs(sum(s["abs_share"].values()) - 1.0) < 1e-9
+    primary = [
+        k for k in s["abs_share"] if k not in ("drawdown_increase", "drawdown_level")
+    ]
+    assert abs(sum(s["abs_share"][k] for k in primary) - 1.0) < 1e-9
 
 
 def test_ignores_non_finite_and_missing() -> None:

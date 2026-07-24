@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rlbot.run_artifacts import RunPaths, _run_exists, new_run_id, write_manifest
+from rlbot.run_artifacts import (
+    RunPaths,
+    _run_exists,
+    new_run_id,
+    persist_dirty_source_snapshot,
+    write_manifest,
+)
 
 
 def test_mkdirs_creates_runs_tree(tmp_path: Path) -> None:
@@ -46,3 +52,46 @@ def test_new_run_id_format_and_duplicates(tmp_path: Path) -> None:
     assert new_run_id(1, root=tmp_path, when=when) == "W1_604_a"
     (tmp_path / "Runs" / "W1_604_a").mkdir(parents=True)
     assert new_run_id(1, root=tmp_path, when=when) == "W1_604_b"
+
+
+def test_persist_dirty_archives_untracked_python(tmp_path: Path, monkeypatch) -> None:
+    """Untracked *.py must be copied into provenance/untracked/, not merely listed."""
+    import subprocess
+
+    root = tmp_path / "repo"
+    (root / "rlbot").mkdir(parents=True)
+    (root / "rlbot" / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+    untracked = root / "rlbot" / "new_module.py"
+    untracked.write_text("y = 2\n", encoding="utf-8")
+    (root / "notes.txt").write_text("skip me\n", encoding="utf-8")
+
+    def fake_run(cmd, cwd=None, capture_output=False, text=False, timeout=None):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        if cmd[:3] == ["git", "diff", "HEAD"]:
+            r = R()
+            r.stdout = "diff --git a/rlbot/tracked.py b/rlbot/tracked.py\n"
+            return r
+        if cmd[:3] == ["git", "ls-files", "--others"]:
+            r = R()
+            r.stdout = "rlbot/new_module.py\nnotes.txt\n"
+            return r
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    dest = tmp_path / "provenance"
+    frag = persist_dirty_source_snapshot(dest, root=root, git_dirty=True)
+    assert frag["source_patch"] == "git.diff"
+    assert "rlbot/new_module.py" in frag["untracked_archived"]
+    assert frag["untracked_archive_dir"] == "provenance/untracked"
+    archived = dest / "untracked" / "rlbot" / "new_module.py"
+    assert archived.is_file()
+    assert archived.read_text(encoding="utf-8") == "y = 2\n"
+    # Non-Python untracked files are listed in the patch, not archived.
+    assert not (dest / "untracked" / "notes.txt").exists()
+    patch = (dest / "git.diff").read_text(encoding="utf-8")
+    assert "[archived] rlbot/new_module.py" in patch
+    assert "[listed-only] notes.txt" in patch

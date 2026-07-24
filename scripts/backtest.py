@@ -839,8 +839,48 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         )
         _bt_log(f"[backtest] Detailed stats done ({time.perf_counter() - t_det:.1f}s).")
 
-    _write_backtest_summary(result, args, detailed_stats, cache_path, manifest)
+    _write_backtest_summary(
+        result,
+        args,
+        detailed_stats,
+        cache_path,
+        manifest,
+        excess_metrics=_excess_vs_equal_weight_metrics(
+            navs, test_ohlcv, start_bar, test_live
+        ),
+    )
     return result
+
+
+def _excess_vs_equal_weight_metrics(
+    navs: np.ndarray,
+    ohlcv: np.ndarray,
+    start_bar: int,
+    asset_live,
+) -> dict:
+    """Daily excess-return Sharpe vs equal-weight (for excess DSR)."""
+    from rlbot.eval_selection import annualized_sharpe
+
+    nav_ew = equal_weight_daily_cost_aware_nav(
+        navs, ohlcv, start_bar, asset_live=asset_live
+    )
+    ew_return = float(nav_ew[-1] / max(float(nav_ew[0]), 1e-12) - 1.0)
+    agent_r = np.diff(np.log(np.maximum(np.asarray(navs, dtype=np.float64), 1e-12)))
+    ew_r = np.diff(np.log(np.maximum(np.asarray(nav_ew, dtype=np.float64), 1e-12)))
+    n = min(agent_r.size, ew_r.size)
+    out: dict = {
+        "equal_weight_daily_return": ew_return,
+        "excess_return": float(navs[-1] / max(float(navs[0]), 1e-12) - 1.0) - ew_return,
+    }
+    if n < 4:
+        return out
+    excess = agent_r[:n] - ew_r[:n]
+    out["excess_sharpe"] = float(annualized_sharpe(excess))
+    z = (excess - excess.mean()) / (excess.std() + 1e-12)
+    out["excess_ret_skew"] = float(np.mean(z**3)) if n >= 3 else 0.0
+    out["excess_ret_kurt"] = float(np.mean(z**4)) if n >= 4 else 3.0
+    out["excess_n_rets"] = int(n)
+    return out
 
 
 def _write_backtest_summary(
@@ -849,6 +889,8 @@ def _write_backtest_summary(
     detailed: dict | None,
     cache_path: Path,
     manifest: dict | None = None,
+    *,
+    excess_metrics: dict | None = None,
 ) -> None:
     """Write a machine-readable per-run backtest summary."""
     from dataclasses import asdict
@@ -880,10 +922,57 @@ def _write_backtest_summary(
             window = oos_ledger.window_key(ch["holdout_start"], ch["holdout_end"])
     n_trials = _oos_trials_for_args(args, manifest)
     dsr = _deflated_sharpe_for_result(result, n_trials)
+    n_trials_conservative = max(1, int(n_trials) * 2)
+    excess_metrics = excess_metrics or {}
+    dsr_excess = None
+    if (
+        isinstance(excess_metrics.get("excess_sharpe"), (int, float))
+        and isinstance(excess_metrics.get("excess_n_rets"), int)
+        and int(excess_metrics["excess_n_rets"]) >= 4
+    ):
+        dsr_excess = float(
+            deflated_sharpe_ratio(
+                float(excess_metrics["excess_sharpe"]),
+                n_obs=int(excess_metrics["excess_n_rets"]),
+                n_trials=n_trials,
+                skew=float(excess_metrics.get("excess_ret_skew") or 0.0),
+                kurt=float(excess_metrics.get("excess_ret_kurt") or 3.0),
+            )
+        )
+        if not np.isfinite(dsr_excess):
+            dsr_excess = None
+    dsr_excess_conservative = None
+    if (
+        isinstance(excess_metrics.get("excess_sharpe"), (int, float))
+        and isinstance(excess_metrics.get("excess_n_rets"), int)
+        and int(excess_metrics["excess_n_rets"]) >= 4
+    ):
+        dsr_excess_conservative = float(
+            deflated_sharpe_ratio(
+                float(excess_metrics["excess_sharpe"]),
+                n_obs=int(excess_metrics["excess_n_rets"]),
+                n_trials=n_trials_conservative,
+                skew=float(excess_metrics.get("excess_ret_skew") or 0.0),
+                kurt=float(excess_metrics.get("excess_ret_kurt") or 3.0),
+            )
+        )
+        if not np.isfinite(dsr_excess_conservative):
+            dsr_excess_conservative = None
     if dsr is not None:
         print(
             f"[backtest] Deflated Sharpe (vs best of {n_trials} model(s) on this "
             f"window): {dsr:.3f} (>0.95 = significant after selection)"
+        )
+    if dsr_excess is not None:
+        cons = (
+            f"{dsr_excess_conservative:.3f}"
+            if dsr_excess_conservative is not None
+            else "n/a"
+        )
+        print(
+            f"[backtest] Deflated Sharpe on daily excess vs equal-weight "
+            f"(trials={n_trials}, conservative={n_trials_conservative}): "
+            f"{dsr_excess:.3f} / {cons}"
         )
     payload = {
         **asdict(result),
@@ -894,7 +983,13 @@ def _write_backtest_summary(
         "hash_drift": hash_drift or None,
         "oos_window": window,
         "oos_trials_for_window": n_trials,
+        "oos_trials_conservative": n_trials_conservative,
         "deflated_sharpe": dsr,
+        "equal_weight_daily_return": excess_metrics.get("equal_weight_daily_return"),
+        "excess_return_vs_equal_weight": excess_metrics.get("excess_return"),
+        "excess_sharpe": excess_metrics.get("excess_sharpe"),
+        "deflated_sharpe_excess": dsr_excess,
+        "deflated_sharpe_excess_conservative": dsr_excess_conservative,
         "feature_split_mode": cfg.data.feature_split_mode,
         **git_provenance(),
         "detailed": detailed,

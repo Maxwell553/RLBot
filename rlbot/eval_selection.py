@@ -15,12 +15,156 @@ from rlbot.portfolio_metrics import summarize_weight_panel
 
 EXPOSURE_RISK_MODES = frozenset({"realized_vol", "vix_positive"})
 EVAL_BENCHMARK_MODES = frozenset({"balanced_6040", "equal_weight_daily"})
-BEST_MODEL_SCORE_MODES = frozenset({"excess_nav", "excess_sharpe"})
+BEST_MODEL_SCORE_MODES = frozenset({"excess_nav", "excess_sharpe", "defensive_sharpe"})
 VIX_RISK_BASELINE = 18.0
 TRADING_DAYS_PER_YEAR = 252
 # Segment Sharpe clip: near-zero-vol excess paths (agent ≈ benchmark) otherwise
 # produce unbounded ratios that would dominate the selection score.
 EXCESS_SHARPE_CLIP = 10.0
+
+
+def apply_dd_exposure_taper(
+    weights: np.ndarray,
+    dd_frac: float,
+    *,
+    start: float,
+    end: float,
+    min_gross: float,
+) -> np.ndarray:
+    """Cap risky gross exposure as episode drawdown deepens.
+
+    Allowed gross goes from 1.0 at ``dd_frac <= start`` down to ``min_gross`` at
+    ``dd_frac >= end`` (linear). If current gross already sits under the cap,
+    weights are unchanged; otherwise risky weights are scaled to the allowed
+    gross and the residual is parked in cash. No-op when ``end <= start``.
+    """
+    w = np.asarray(weights, dtype=np.float64).reshape(-1).copy()
+    if w.size < 2:
+        return w
+    s = float(start)
+    e = float(end)
+    floor = float(np.clip(min_gross, 0.0, 1.0))
+    if e <= s:
+        return w
+    dd = float(max(dd_frac, 0.0))
+    if dd <= s:
+        allowed = 1.0
+    elif dd >= e:
+        allowed = floor
+    else:
+        t = (dd - s) / (e - s)
+        allowed = 1.0 + t * (floor - 1.0)
+    risky = w[1:]
+    gross = float(np.sum(risky))
+    if gross <= allowed + 1e-12 or gross <= 1e-12:
+        return w
+    scaled = risky * (allowed / gross)
+    out = np.empty_like(w)
+    out[0] = max(0.0, 1.0 - float(np.sum(scaled)))
+    out[1:] = scaled
+    ssum = float(np.sum(out))
+    if ssum > 1e-12:
+        out /= ssum
+    else:
+        out[:] = 0.0
+        out[0] = 1.0
+    return out
+
+
+def apply_episode_burn_in(
+    episode: Mapping[str, Any],
+    burn_in_bars: int,
+) -> dict[str, Any]:
+    """Drop the first ``burn_in_bars`` steps so cash-restart transients do not dominate.
+
+    ``nav_path`` is ``[start_nav, nav_after_step1, ...]``. Skipping ``B`` steps keeps
+    ``nav_path[B:]`` (post-burn-in start) and ``weights[B:]`` when present. Drawdowns
+    and ``ending_nav`` are recomputed on the trimmed path. Episodes that are too short
+    after burn-in are returned unchanged.
+    """
+    b = int(burn_in_bars)
+    if b <= 0:
+        return dict(episode)
+    nav = [float(x) for x in episode.get("nav_path", [])]
+    if len(nav) <= b + 2:
+        return dict(episode)
+    new_nav = np.asarray(nav[b:], dtype=np.float64)
+    peak = np.maximum.accumulate(new_nav)
+    dd_nav = peak - new_nav
+    out = dict(episode)
+    out["nav_path"] = new_nav.tolist()
+    out["start_nav"] = float(new_nav[0])
+    out["ending_nav"] = float(new_nav[-1])
+    out["max_drawdown_nav"] = float(np.max(dd_nav))
+    out["max_drawdown_frac"] = float(np.max(dd_nav / np.maximum(peak, 1e-12)))
+    if episode.get("start_bar") is not None:
+        out["start_bar"] = int(episode["start_bar"]) + b
+    weights = episode.get("weights")
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.ndim == 2 and w.shape[0] > b:
+            out["weights"] = w[b:]
+        else:
+            out["weights"] = w
+    return out
+
+
+def apply_episodes_burn_in(
+    episodes: list[Mapping[str, Any]],
+    burn_in_bars: int,
+) -> list[dict[str, Any]]:
+    """Apply :func:`apply_episode_burn_in` to each episode."""
+    return [apply_episode_burn_in(ep, burn_in_bars) for ep in episodes]
+
+
+def blend_block_and_oos_aligned_scores(
+    block_score: float,
+    oos_aligned_score: float | None,
+    *,
+    weight: float,
+) -> float:
+    """Blend alternating-block and continuous OOS-aligned selection scores.
+
+    ``weight`` is the continuous-path weight in ``[0, 1]``. When the continuous
+    score is missing, returns ``block_score`` unchanged.
+    """
+    w = float(np.clip(weight, 0.0, 1.0))
+    if oos_aligned_score is None or w <= 0.0:
+        return float(block_score)
+    if w >= 1.0:
+        return float(oos_aligned_score)
+    return float((1.0 - w) * float(block_score) + w * float(oos_aligned_score))
+
+
+MULTI_REGIME_SCORE_AGGS = frozenset({"p25", "median", "min", "mean"})
+
+
+def aggregate_multi_regime_scores(
+    scores: list[float] | np.ndarray,
+    *,
+    agg: str = "p25",
+) -> float:
+    """Collapse per-regime continuous scores into one selection signal.
+
+    ``p25`` (default for cohort 727) is intentionally pessimistic: a checkpoint
+    must hold up on the harder regimes, not just average into a bull slice.
+    """
+    arr = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if arr.size == 0 or not np.any(np.isfinite(arr)):
+        return float("-inf")
+    arr = arr[np.isfinite(arr)]
+    mode = str(agg).lower()
+    if mode not in MULTI_REGIME_SCORE_AGGS:
+        raise ValueError(
+            f"multi-regime agg must be one of {sorted(MULTI_REGIME_SCORE_AGGS)}, got {agg!r}"
+        )
+    if mode == "p25":
+        return float(np.percentile(arr, 25))
+    if mode == "median":
+        return float(np.median(arr))
+    if mode == "min":
+        return float(np.min(arr))
+    return float(np.mean(arr))
 
 
 def _episode_excess_log_returns(
@@ -156,6 +300,7 @@ def compute_robust_eval_score(
     stitched_blend: float = 0.5,
     benchmark_ctx: EvalBenchmarkContext | None = None,
     score_mode: str = "excess_nav",
+    burn_in_bars: int = 0,
 ) -> dict[str, float]:
     """Robust checkpoint score from one eval cycle's segment rollouts.
 
@@ -177,9 +322,19 @@ def compute_robust_eval_score(
     score = return_signal - std_coef * std(segment excess Sharpe)
             - dd_coef * p75(max_dd_frac)
 
+    ``score_mode="defensive_sharpe"`` (cohort 728+): same excess-Sharpe return signal,
+    but the drawdown penalty uses ``max(max_dd_frac)`` instead of p75 so a single
+    deep left-tail episode cannot hide behind a milder quartile. Intended to prefer
+    shallow-DD checkpoints for walk-forward windows with crash risk (W2–W5).
+
     ``stitched_excess_nav`` compounds eval blocks chronologically (honest validation path).
     Also returns stitched validation NAV metrics when segment ``start_bar`` is present.
+
+    ``burn_in_bars`` drops the first N steps of each episode before scoring so
+    cash-restart deploy transients do not dominate (esp. short alternating blocks).
     """
+    if int(burn_in_bars) > 0:
+        episodes = apply_episodes_burn_in(episodes, int(burn_in_bars))
     mode = str(score_mode)
     if mode not in BEST_MODEL_SCORE_MODES:
         raise ValueError(
@@ -195,6 +350,7 @@ def compute_robust_eval_score(
         "p75_max_drawdown_nav": float("nan"),
         "mean_max_drawdown_frac": float("nan"),
         "p75_max_drawdown_frac": float("nan"),
+        "max_max_drawdown_frac": float("nan"),
     }
     if not episodes:
         return empty
@@ -202,6 +358,7 @@ def compute_robust_eval_score(
     navs = np.asarray([float(e["ending_nav"]) for e in episodes], dtype=np.float64)
     dd_navs = np.asarray([float(e["max_drawdown_nav"]) for e in episodes], dtype=np.float64)
     dd_fracs = np.asarray([float(e.get("max_drawdown_frac", 0.0)) for e in episodes], dtype=np.float64)
+    sharpe_modes = ("excess_sharpe", "defensive_sharpe")
 
     sharpe_metrics: dict[str, float] = {}
     if benchmark_ctx is not None:
@@ -221,7 +378,7 @@ def compute_robust_eval_score(
         stitched_excess = float(stitched.get("stitched_excess_nav", mean_excess))
         blend = float(np.clip(stitched_blend, 0.0, 1.0))
         mean_signal = (1.0 - blend) * mean_excess + blend * stitched_excess
-        if mode == "excess_sharpe":
+        if mode in sharpe_modes:
             ordered = sorted(
                 episodes,
                 key=lambda e: int(e["start_bar"]) if e.get("start_bar") is not None else 0,
@@ -252,7 +409,13 @@ def compute_robust_eval_score(
 
     dd_p75 = float(np.percentile(dd_navs, 75)) if dd_navs.size else 0.0
     dd_frac_p75 = float(np.percentile(dd_fracs, 75)) if dd_fracs.size else 0.0
-    dd_term = dd_frac_p75 if mode == "excess_sharpe" else dd_p75
+    dd_frac_max = float(np.max(dd_fracs)) if dd_fracs.size else 0.0
+    if mode == "defensive_sharpe":
+        dd_term = dd_frac_max
+    elif mode == "excess_sharpe":
+        dd_term = dd_frac_p75
+    else:
+        dd_term = dd_p75
     score = mean_signal - float(std_coef) * std_signal - float(dd_coef) * dd_term
 
     out: dict[str, float] = {
@@ -265,6 +428,7 @@ def compute_robust_eval_score(
         "p75_max_drawdown_nav": dd_p75,
         "mean_max_drawdown_frac": float(np.mean(dd_fracs)),
         "p75_max_drawdown_frac": dd_frac_p75,
+        "max_max_drawdown_frac": dd_frac_max,
     }
     if benchmark_ctx is not None:
         out["return_signal"] = mean_signal
@@ -281,8 +445,11 @@ def aggregate_eval_portfolio_diagnostics(
     tickers: list[str],
     max_single_asset_weight: float,
     benchmark_ctx: EvalBenchmarkContext | None = None,
+    burn_in_bars: int = 0,
 ) -> dict[str, Any]:
     """Portfolio panel summary + per-segment NAV stats for one eval cycle."""
+    if int(burn_in_bars) > 0:
+        episodes = apply_episodes_burn_in(episodes, int(burn_in_bars))
     weights_blocks = [
         np.asarray(e["weights"], dtype=np.float64) for e in episodes if e.get("weights") is not None
     ]

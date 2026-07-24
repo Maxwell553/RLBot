@@ -88,6 +88,18 @@ class EnvironmentConfig:
     # Append 4 portfolio self-state features to the observation (see
     # N_SELF_STATE_FEATURES). Default False preserves old run snapshots' obs layout.
     self_state_features: bool = False
+    # When True, action[0] is an exposure logit and action[1:] allocate the risky
+    # sleeve (two-head policy class). Default False preserves the softmax-over-cash
+    # policy. Do not mix with reward/curriculum A/Bs until validated in isolation.
+    two_head_actions: bool = False
+    # Soft drawdown exposure taper (cohort 728+): as episode NAV drawdown deepens
+    # from ``dd_exposure_taper_start`` → ``dd_exposure_taper_end``, scale risky
+    # weights toward cash down to ``dd_exposure_taper_min_gross``. Parser defaults
+    # off preserve pre-728 snapshots. Mechanical left-tail brake (train + OOS).
+    dd_exposure_taper: bool = False
+    dd_exposure_taper_start: float = 0.06
+    dd_exposure_taper_end: float = 0.12
+    dd_exposure_taper_min_gross: float = 0.30
 
 
 @dataclass(frozen=True)
@@ -132,6 +144,17 @@ class RewardConfig:
     # negative step returns. 0 = uncapped (old behavior); >= 1 bounds the worst-day
     # reward outlier so VecNormalize clipping does not flatten all bad days equally.
     drawdown_amp_max: float = 0.0
+    # Couple the persistent drawdown *level* term to gross exposure:
+    # level *= (1 - c) + c * gross. 0 = legacy (level accrues in cash too — no
+    # escape hatch); 1 = fully de-risking to cash zeros the level tax.
+    drawdown_level_exposure_coupling: float = 0.0
+    # Own-drawdown relief on inactivity / participation (mirrors VIX relief but
+    # uses the agent's NAV drawdown). 0 = legacy (no DD-conditional cash relief).
+    inactivity_drawdown_relief: float = 0.0
+    participation_drawdown_relief: float = 0.0
+    # DD excess over drawdown_level_floor that reaches full relief (default 0.10 →
+    # full waiver by floor+10%, i.e. 15% off peak at floor 0.05).
+    inactivity_drawdown_relief_span: float = 0.10
 
     def benchmark_cap_weights_array(self) -> np.ndarray:
         w = np.asarray(self.benchmark_cap_weights, dtype=np.float64)
@@ -176,6 +199,11 @@ class HyperparametersConfig:
     vf_coef: float
     max_grad_norm: float
     weight_decay: float
+    # "cosine" (legacy; parser default — preserves old run snapshots): global cosine
+    # decay over the whole budget. "phase_aware": hold learning_rate until DR widening
+    # completes (dr_widen_end), then cosine-decay to the floor over the remaining
+    # budget — keeps a meaningful LR while fee/lag conditions are still changing.
+    lr_schedule: str = "cosine"
 
 
 @dataclass(frozen=True)
@@ -213,7 +241,34 @@ class TrainingConfig:
     # "excess_nav" (legacy): score in excess-NAV dollars with p75(max_dd_nav) penalty.
     # "excess_sharpe": score on annualized Sharpe of daily excess returns vs the
     # eval benchmark, with p75(max_dd_frac) penalty (unitless, era-comparable).
+    # "defensive_sharpe": same excess-Sharpe signal, but DD penalty uses max(max_dd_frac).
     best_model_score_mode: str = "excess_nav"
+    # Reject a candidate best checkpoint when continuous/multi-regime eval max DD
+    # exceeds this fraction (0 disables). Cohort 728+: prefer shallow-DD policies.
+    best_model_max_dd_reject: float = 0.0
+    # Trailing window over post-gate eval scores before replacing best (0/1 = legacy).
+    best_model_trailing_evals: int = 0
+    best_model_trailing_agg: str = "median"  # median | mean
+    # Require this many consecutive improving evals before saving best (0 = immediate).
+    best_model_confirm_evals: int = 0
+    # Blend a fixed high-fee / high-lag stress eval into the selection score.
+    best_model_stress_suite: bool = False
+    best_model_stress_weight: float = 0.3
+    # OOS-aligned continuous validation (parser defaults preserve pre-726 snapshots).
+    # When enabled without multi_regime_eval: the last ``oos_aligned_eval_bars`` of the
+    # trainable panel are held out and scored as one continuous episode.
+    # When ``multi_regime_eval`` is on (cohort 727+): keep the full train panel and
+    # instead score ``multi_regime_eval_slices`` continuous overlays of length
+    # ``oos_aligned_eval_bars``, aggregating with ``multi_regime_eval_agg``.
+    oos_aligned_eval: bool = False
+    oos_aligned_eval_bars: int = 504
+    oos_aligned_eval_weight: float = 0.0
+    multi_regime_eval: bool = False
+    multi_regime_eval_slices: int = 5
+    multi_regime_eval_agg: str = "p25"  # p25 | median | min | mean
+    # Drop the first N bars of each eval episode before scoring / portfolio diagnostics
+    # so cash-restart deploy transients do not dominate mean cash or excess Sharpe.
+    eval_score_burn_in_bars: int = 0
 
 
 @dataclass(frozen=True)
@@ -459,6 +514,28 @@ def _validate_reward_config(rew: RewardConfig) -> None:
             "reward.drawdown_amp_max must be 0 (uncapped) or >= 1, "
             f"got {rew.drawdown_amp_max}"
         )
+    coupling = float(rew.drawdown_level_exposure_coupling)
+    if not (0.0 <= coupling <= 1.0):
+        raise ValueError(
+            "reward.drawdown_level_exposure_coupling must be in [0, 1], "
+            f"got {rew.drawdown_level_exposure_coupling}"
+        )
+    if rew.inactivity_drawdown_relief < 0.0:
+        raise ValueError(
+            "reward.inactivity_drawdown_relief must be >= 0, "
+            f"got {rew.inactivity_drawdown_relief}"
+        )
+    if rew.participation_drawdown_relief < 0.0:
+        raise ValueError(
+            "reward.participation_drawdown_relief must be >= 0, "
+            f"got {rew.participation_drawdown_relief}"
+        )
+    span = float(rew.inactivity_drawdown_relief_span)
+    if span < 0.0:
+        raise ValueError(
+            "reward.inactivity_drawdown_relief_span must be >= 0, "
+            f"got {rew.inactivity_drawdown_relief_span}"
+        )
 
 
 def validate_config_for_universe(cfg: RLConfig, n_assets: int) -> None:
@@ -526,6 +603,11 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             action_smoothing_alpha=float(env.get("action_smoothing_alpha", 0.0)),
             # Default False preserves the 10N + 28 obs layout of old run snapshots.
             self_state_features=bool(env.get("self_state_features", False)),
+            two_head_actions=bool(env.get("two_head_actions", False)),
+            dd_exposure_taper=bool(env.get("dd_exposure_taper", False)),
+            dd_exposure_taper_start=float(env.get("dd_exposure_taper_start", 0.06)),
+            dd_exposure_taper_end=float(env.get("dd_exposure_taper_end", 0.12)),
+            dd_exposure_taper_min_gross=float(env.get("dd_exposure_taper_min_gross", 0.30)),
         ),
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),
@@ -570,10 +652,21 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             exposure_risk_mode=str(rew.get("exposure_risk_mode", "realized_vol")),
             exposure_risk_penalty_scale=float(rew.get("exposure_risk_penalty_scale", 0.0)),
             vol_penalty_scale=float(rew.get("vol_penalty_scale", 0.0)),
-            # Defaults 0.0 preserve old run snapshots (no relief, uncapped amp).
+            # Defaults 0.0 preserve old run snapshots (no relief, uncapped amp,
+            # level penalty not coupled to gross, no own-DD cash relief).
             inactivity_vix_relief=float(rew.get("inactivity_vix_relief", 0.0)),
             participation_vix_relief=float(rew.get("participation_vix_relief", 0.0)),
             drawdown_amp_max=float(rew.get("drawdown_amp_max", 0.0)),
+            drawdown_level_exposure_coupling=float(
+                rew.get("drawdown_level_exposure_coupling", 0.0)
+            ),
+            inactivity_drawdown_relief=float(rew.get("inactivity_drawdown_relief", 0.0)),
+            participation_drawdown_relief=float(
+                rew.get("participation_drawdown_relief", 0.0)
+            ),
+            inactivity_drawdown_relief_span=float(
+                rew.get("inactivity_drawdown_relief_span", 0.10)
+            ),
         ),
         transaction_costs=TransactionCostsConfig(
             slippage=_float_list(
@@ -604,6 +697,7 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             vf_coef=float(_req(hp, "vf_coef", "hyperparameters")),
             max_grad_norm=float(_req(hp, "max_grad_norm", "hyperparameters")),
             weight_decay=float(_req(hp, "weight_decay", "hyperparameters")),
+            lr_schedule=str(hp.get("lr_schedule", "cosine")).lower(),
         ),
         policy=PolicyConfig(
             lstm_hidden_size=int(_req(pol, "lstm_hidden_size", "policy")),
@@ -634,6 +728,19 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             best_model_score_stitched_blend=float(tr.get("best_model_score_stitched_blend", 0.5)),
             best_model_benchmark=str(tr.get("best_model_benchmark", "equal_weight_daily")),
             best_model_score_mode=str(tr.get("best_model_score_mode", "excess_nav")),
+            best_model_max_dd_reject=float(tr.get("best_model_max_dd_reject", 0.0)),
+            best_model_trailing_evals=int(tr.get("best_model_trailing_evals", 0)),
+            best_model_trailing_agg=str(tr.get("best_model_trailing_agg", "median")),
+            best_model_confirm_evals=int(tr.get("best_model_confirm_evals", 0)),
+            best_model_stress_suite=bool(tr.get("best_model_stress_suite", False)),
+            best_model_stress_weight=float(tr.get("best_model_stress_weight", 0.3)),
+            oos_aligned_eval=bool(tr.get("oos_aligned_eval", False)),
+            oos_aligned_eval_bars=int(tr.get("oos_aligned_eval_bars", 504)),
+            oos_aligned_eval_weight=float(tr.get("oos_aligned_eval_weight", 0.0)),
+            multi_regime_eval=bool(tr.get("multi_regime_eval", False)),
+            multi_regime_eval_slices=int(tr.get("multi_regime_eval_slices", 5)),
+            multi_regime_eval_agg=str(tr.get("multi_regime_eval_agg", "p25")),
+            eval_score_burn_in_bars=int(tr.get("eval_score_burn_in_bars", 0)),
         ),
         vec_normalize=VecNormalizeConfig(
             norm_obs=bool(_req(vn, "norm_obs", "vec_normalize")),
@@ -697,6 +804,73 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
         raise ValueError(
             f"training.best_model_score_mode must be one of {sorted(BEST_MODEL_SCORE_MODES)}, "
             f"got {sm!r}"
+        )
+    agg = str(cfg.training.best_model_trailing_agg).lower()
+    if agg not in ("median", "mean"):
+        raise ValueError(
+            f"training.best_model_trailing_agg must be 'median' or 'mean', got {agg!r}"
+        )
+    sw = float(cfg.training.best_model_stress_weight)
+    if not 0.0 <= sw <= 1.0:
+        raise ValueError(
+            f"training.best_model_stress_weight must be in [0, 1], got {sw}"
+        )
+    oos_w = float(cfg.training.oos_aligned_eval_weight)
+    if not 0.0 <= oos_w <= 1.0:
+        raise ValueError(
+            f"training.oos_aligned_eval_weight must be in [0, 1], got {oos_w}"
+        )
+    if cfg.training.oos_aligned_eval and int(cfg.training.oos_aligned_eval_bars) < 64:
+        raise ValueError(
+            f"training.oos_aligned_eval_bars must be >= 64 when oos_aligned_eval is on, "
+            f"got {cfg.training.oos_aligned_eval_bars}"
+        )
+    if cfg.training.multi_regime_eval:
+        if not cfg.training.oos_aligned_eval:
+            raise ValueError(
+                "training.multi_regime_eval requires training.oos_aligned_eval: true"
+            )
+        n_slices = int(cfg.training.multi_regime_eval_slices)
+        if n_slices < 2:
+            raise ValueError(
+                f"training.multi_regime_eval_slices must be >= 2, got {n_slices}"
+            )
+        from rlbot.eval_selection import MULTI_REGIME_SCORE_AGGS
+
+        agg = str(cfg.training.multi_regime_eval_agg).lower()
+        if agg not in MULTI_REGIME_SCORE_AGGS:
+            raise ValueError(
+                f"training.multi_regime_eval_agg must be one of "
+                f"{sorted(MULTI_REGIME_SCORE_AGGS)}, got {agg!r}"
+            )
+    if int(cfg.training.eval_score_burn_in_bars) < 0:
+        raise ValueError(
+            f"training.eval_score_burn_in_bars must be >= 0, "
+            f"got {cfg.training.eval_score_burn_in_bars}"
+        )
+    dd_reject = float(cfg.training.best_model_max_dd_reject)
+    if not (0.0 <= dd_reject < 1.0):
+        raise ValueError(
+            f"training.best_model_max_dd_reject must be in [0, 1), got {dd_reject}"
+        )
+    if cfg.environment.dd_exposure_taper:
+        t0 = float(cfg.environment.dd_exposure_taper_start)
+        t1 = float(cfg.environment.dd_exposure_taper_end)
+        gmin = float(cfg.environment.dd_exposure_taper_min_gross)
+        if not (0.0 <= t0 < t1 <= 1.0):
+            raise ValueError(
+                "environment.dd_exposure_taper_start/end must satisfy "
+                f"0 <= start < end <= 1, got start={t0}, end={t1}"
+            )
+        if not (0.0 <= gmin < 1.0):
+            raise ValueError(
+                "environment.dd_exposure_taper_min_gross must be in [0, 1), "
+                f"got {gmin}"
+            )
+    lrs = str(cfg.hyperparameters.lr_schedule).lower()
+    if lrs not in ("cosine", "phase_aware"):
+        raise ValueError(
+            f"hyperparameters.lr_schedule must be 'cosine' or 'phase_aware', got {lrs!r}"
         )
     return cfg
 

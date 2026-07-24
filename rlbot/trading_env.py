@@ -8,15 +8,18 @@ Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
     (1 + gamma * dd_pre), capped at drawdown_amp_max when > 0
   - drawdown penalty: dd_increase * reward_scale * drawdown_increase_penalty
     + max(dd_next - drawdown_level_floor, 0) * drawdown_level_penalty
+      * ((1 - coupling) + coupling * gross) when drawdown_level_exposure_coupling > 0
+      (de-risking to cash zeros the persistent level tax; increase still hits the bad step)
   - concentration: concentration_penalty * max(target_eff_n - eff_n, 0) on risky weights
   - cash accrual (optional): cash *= (1 + cash_daily_yield) when yield > 0
   - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
   - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
   - Sortino + benchmark capped at a constant |sortino+benchmark| <= benchmark_combined_abs_cap
-  - inactivity: linear in cash fraction (plus extra ramp above 90%); scaled down by
-    the VIX relief multiplier when inactivity_vix_relief > 0 (cash is cheaper in stress)
-  - participation: gross exposure * bonus * scale; scaled down by the same VIX relief
-    multiplier when participation_vix_relief > 0 (no pay for being invested in stress)
+  - inactivity: linear in cash fraction (plus extra ramp above 90%); scaled by the
+    most-relief-wins combine of VIX relief and own-drawdown relief (cash is cheaper
+    in market stress *or* when the agent is already underwater)
+  - participation: gross exposure * bonus * scale; same stress-relief combine when
+    participation_*_relief > 0 (no pay for riding risk through own drawdowns / VIX spikes)
   - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
 
@@ -45,7 +48,7 @@ from rlbot.reward_terms import (
     drawdown_amp_factor,
     drawdown_penalty_from_nav,
     exposure_risk_penalty_from_state,
-    inactivity_vix_relief_multiplier,
+    shaping_stress_relief_multiplier,
     vol_penalty_from_returns,
 )
 from rlbot.data_utils import MACRO_VIX_INDEX, N_MACRO
@@ -169,7 +172,18 @@ def portfolio_weights_from_action(
 
     Cash competes for probability mass with every asset. Risky legs are long-only with a
     per-asset cap; overflow is redistributed across other active risky assets before cash.
+
+    When ``environment.two_head_actions`` is enabled, delegates to
+    :func:`rlbot.two_head_actions.portfolio_weights_two_head` (exposure head + allocation
+    head). That path changes the policy class — keep it off for reward/curriculum A/Bs.
     """
+    if bool(getattr(get_config().environment, "two_head_actions", False)):
+        from rlbot.two_head_actions import portfolio_weights_two_head
+
+        return portfolio_weights_two_head(
+            action, n_actions=n_actions, asset_live=asset_live
+        )
+
     x = np.asarray(action, dtype=np.float64).reshape(-1)
     n_act = int(n_actions if n_actions is not None else x.shape[0])
     if x.shape[0] != n_act:
@@ -355,7 +369,9 @@ class MultiAssetPortfolioEnv(gym.Env):
     Action: Box(-3,3)^(n_assets+1) → softmax(cash + assets), long-only risky weights, per-asset cap.
 
     Reward: return (drawdown-amplified downside) + benchmark excess + Sortino diff
-    + participation - inactivity - cost-linked churn - drawdown penalty - concentration.
+    + participation - inactivity - cost-linked churn - exposure-coupled drawdown
+    penalty - concentration. Cash/participation shaping is stress-relieved by VIX
+    and/or the agent's own drawdown (see module docstring).
     Per-step ``info`` includes ``rew_decomp/*`` for each component (see ``config.yaml`` reward section).
 
     Feature arrays after ``macd`` are keyword-only so walk-forward packs
@@ -489,6 +505,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         self.fee_scale = self._fee_scale_default
         # Training curriculum (fee ramp / churn off early); None = use domain_randomize or default
         self._curriculum_fee_override: Optional[float] = None
+        self._eval_fee_override: float | None = None
+        self._eval_obs_lag_override: int | None = None
         self._churn_scale = 1.0
         self._fee_dr_min = env_cfg.domain_randomize_fee_dr_min
         self._fee_dr_max = env_cfg.domain_randomize_fee_dr_max
@@ -600,6 +618,30 @@ class MultiAssetPortfolioEnv(gym.Env):
                 self.fee_scale = float(fee_override)
             else:
                 self.fee_scale = self._fee_scale_default
+
+    def set_eval_controls(
+        self,
+        fee_scale: float | None = None,
+        obs_lag: int | None = None,
+    ) -> None:
+        """Pin fee/lag for a deterministic stress eval (both ``None`` restores defaults)."""
+        if fee_scale is None and obs_lag is None:
+            self._eval_fee_override = None
+            self._eval_obs_lag_override = None
+            if not self.domain_randomize:
+                self.fee_scale = (
+                    float(self._curriculum_fee_override)
+                    if self._curriculum_fee_override is not None
+                    else self._fee_scale_default
+                )
+                self.obs_lag = self._obs_lag_default
+            return
+        if fee_scale is not None:
+            self._eval_fee_override = float(fee_scale)
+            self.fee_scale = float(fee_scale)
+        if obs_lag is not None:
+            self._eval_obs_lag_override = int(obs_lag)
+            self.obs_lag = int(obs_lag)
 
     def set_randomization_bounds(
         self,
@@ -974,6 +1016,11 @@ class MultiAssetPortfolioEnv(gym.Env):
                 self.fee_scale = float(self._curriculum_fee_override)
             else:
                 self.fee_scale = self._fee_scale_default
+        # Stress-suite pins win over curriculum/default for the duration of the pin.
+        if self._eval_obs_lag_override is not None:
+            self.obs_lag = int(self._eval_obs_lag_override)
+        if self._eval_fee_override is not None:
+            self.fee_scale = float(self._eval_fee_override)
 
         panel_end = self._max_t + 2
         self._current_seg_end = panel_end
@@ -1046,6 +1093,20 @@ class MultiAssetPortfolioEnv(gym.Env):
             n_actions=self.n_actions,
             asset_live=live_t,
         )
+        # Soft DD exposure taper (728+): de-risk toward cash as episode drawdown deepens.
+        # Applied before rebalance so fills and reward see the tapered target.
+        peak_before = self._episode_peak_nav
+        dd_frac_pre = max(0.0, (peak_before - v_pre) / max(peak_before, 1e-12))
+        if bool(getattr(self._env_cfg, "dd_exposure_taper", False)):
+            from rlbot.eval_selection import apply_dd_exposure_taper
+
+            w = apply_dd_exposure_taper(
+                w,
+                dd_frac_pre,
+                start=float(self._env_cfg.dd_exposure_taper_start),
+                end=float(self._env_cfg.dd_exposure_taper_end),
+                min_gross=float(self._env_cfg.dd_exposure_taper_min_gross),
+            )
         rwd = self._reward_cfg
         # Scale churn with live VIX, read at the same obs_lag the observation uses
         # (undifferenced close) so churn shaping is causally consistent with policy input.
@@ -1069,8 +1130,7 @@ class MultiAssetPortfolioEnv(gym.Env):
         close_next = self.ohlcv[self._t + 1, :, 3]
         v_next = max(self._nav(close_next), 1e-12)
 
-        peak_before = self._episode_peak_nav
-        dd_frac_pre = max(0.0, (peak_before - v_pre) / max(peak_before, 1e-12))
+        # peak_before / dd_frac_pre already computed above for the taper.
 
         log_ret = float(np.log(v_next / v_pre))
         clipped_ret = float(
@@ -1117,27 +1177,8 @@ class MultiAssetPortfolioEnv(gym.Env):
         )
         benchmark_component = excess_ret * rwd.benchmark_excess_scale
 
-        cash_frac = self._cash / max(v_next, 1e-12)
-        inact = self._inactivity_penalty_scale
-        inactivity_component = float(cash_frac * rwd.inactivity_penalty_over_50 * inact)
-        if cash_frac > 0.90:
-            inactivity_component += float(
-                ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90 * inact
-            )
-        # VIX-conditional relief: don't punish cash in stress regimes like calm idling.
-        inactivity_component *= inactivity_vix_relief_multiplier(
-            current_vix, rwd.inactivity_vix_relief, baseline=VIX_CHURN_BASELINE
-        )
         gross_exposure = float(np.sum(w[1:]))
-        participation_component = (
-            gross_exposure * rwd.participation_bonus * rwd.participation_reward_scale
-        )
-        # Mirror of the inactivity relief: in stress regimes the agent is not paid
-        # merely for being invested, so cash vs invested is shaping-neutral at high
-        # VIX and the return/Sortino/benchmark terms decide.
-        participation_component *= inactivity_vix_relief_multiplier(
-            current_vix, rwd.participation_vix_relief, baseline=VIX_CHURN_BASELINE
-        )
+        cash_frac = self._cash / max(v_next, 1e-12)
 
         churn_component = (
             tx_cost_frac * rwd.churn_penalty * rwd.reward_scale * active_churn_scale
@@ -1153,21 +1194,66 @@ class MultiAssetPortfolioEnv(gym.Env):
         )
 
         vol_penalty_component = 0.0
+        vol_excess_raw = 0.0
+        vol_active = 0.0
         if rwd.vol_penalty_scale > 0.0 and available_steps >= rwd.sortino_min_steps:
             active_lookback = min(available_steps, rwd.risk_window)
-            vol_penalty_component, _, _ = vol_penalty_from_returns(
+            vol_penalty_component, agent_dv, bench_dv = vol_penalty_from_returns(
                 np.array(self._return_buffer[-active_lookback:], dtype=np.float64),
                 np.array(self._market_return_buffer[-active_lookback:], dtype=np.float64),
                 rwd,
             )
+            vol_excess_raw = max(float(agent_dv - bench_dv), 0.0)
+            vol_active = 1.0 if vol_penalty_component > 0.0 else 0.0
 
-        drawdown_penalty_component, dd_next, _ = drawdown_penalty_from_nav(
+        (
+            drawdown_penalty_component,
+            dd_next,
+            _,
+            dd_increase_term,
+            dd_level_term,
+        ) = drawdown_penalty_from_nav(
             peak_before=peak_before,
             v_pre=v_pre,
             v_next=v_next,
             dd_frac_pre=dd_frac_pre,
             rwd=rwd,
+            gross_exposure=gross_exposure,
         )
+
+        # State-dependent cash/participation shaping: most-relief-wins of VIX and
+        # own-drawdown. Underwater-and-invested pays the coupled DD level tax;
+        # underwater-and-cash waives inactivity so de-risking is the escape hatch.
+        inact_stress_mult = shaping_stress_relief_multiplier(
+            vix=current_vix,
+            dd_frac=dd_next,
+            vix_relief=rwd.inactivity_vix_relief,
+            drawdown_relief=rwd.inactivity_drawdown_relief,
+            drawdown_floor=rwd.drawdown_level_floor,
+            drawdown_relief_span=rwd.inactivity_drawdown_relief_span,
+            vix_baseline=VIX_CHURN_BASELINE,
+        )
+        part_stress_mult = shaping_stress_relief_multiplier(
+            vix=current_vix,
+            dd_frac=dd_next,
+            vix_relief=rwd.participation_vix_relief,
+            drawdown_relief=rwd.participation_drawdown_relief,
+            drawdown_floor=rwd.drawdown_level_floor,
+            drawdown_relief_span=rwd.inactivity_drawdown_relief_span,
+            vix_baseline=VIX_CHURN_BASELINE,
+        )
+        inact = self._inactivity_penalty_scale
+        inactivity_component = float(cash_frac * rwd.inactivity_penalty_over_50 * inact)
+        if cash_frac > 0.90:
+            inactivity_component += float(
+                ((cash_frac - 0.90) / 0.10) * rwd.inactivity_penalty_over_90 * inact
+            )
+        inactivity_component *= inact_stress_mult
+        participation_component = (
+            gross_exposure * rwd.participation_bonus * rwd.participation_reward_scale
+        )
+        participation_component *= part_stress_mult
+
         concentration_component, eff_n = concentration_penalty_from_weights(w, rwd)
         active_returns = np.asarray(self._return_buffer[-min(len(self._return_buffer), rwd.risk_window) :], dtype=np.float64)
         exposure_risk_component = exposure_risk_penalty_from_state(
@@ -1220,11 +1306,17 @@ class MultiAssetPortfolioEnv(gym.Env):
             "rew_decomp/churn": -churn_component,
             "rew_decomp/turnover": -turnover_component,
             "rew_decomp/vix_churn_mult": vix_multiplier,
+            "rew_decomp/inactivity_stress_mult": inact_stress_mult,
+            "rew_decomp/participation_stress_mult": part_stress_mult,
             "rew_decomp/drawdown": drawdown_component,
             "rew_decomp/drawdown_penalty": -drawdown_penalty_component,
+            "rew_decomp/drawdown_increase": -dd_increase_term,
+            "rew_decomp/drawdown_level": -dd_level_term,
             "rew_decomp/concentration": -concentration_component,
             "rew_decomp/exposure_risk": -exposure_risk_component,
             "rew_decomp/volatility": -vol_penalty_component,
+            "rew_decomp/volatility_excess_raw": vol_excess_raw,
+            "rew_decomp/volatility_active": vol_active,
             "rew_decomp/effective_n_assets": eff_n,
         }
 

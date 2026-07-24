@@ -783,6 +783,36 @@ def reserve_chronological_holdout(
     return (train_idx, *train_arrays), (hold_idx, *hold_arrays)
 
 
+def reserve_chronological_validation_tail(
+    index: pd.DatetimeIndex,
+    *arrays: np.ndarray,
+    n_bars: int,
+    min_remaining: int = 500,
+) -> Tuple[Tuple, Tuple]:
+    """Hold out the last ``n_bars`` of a trainable panel for continuous validation.
+
+    Used for OOS-aligned checkpoint selection: a single contiguous window with
+    continuous feature memory, never used for training gradients or alternating
+    block eval. Returns ``(remaining, validation)`` each as ``(index, *arrays)``.
+    """
+    n = int(n_bars)
+    if n <= 0:
+        raise ValueError(f"n_bars must be positive, got {n}")
+    if len(index) == 0:
+        raise ValueError("Empty dataset")
+    if len(index) < n + int(min_remaining):
+        raise ValueError(
+            f"Need at least {n + int(min_remaining)} trainable bars to reserve a "
+            f"{n}-bar validation tail (have {len(index)})."
+        )
+    cut = len(index) - n
+    rem_idx = index[:cut]
+    val_idx = index[cut:]
+    rem_arrays = tuple(a[:cut] for a in arrays)
+    val_arrays = tuple(a[cut:] for a in arrays)
+    return (rem_idx, *rem_arrays), (val_idx, *val_arrays)
+
+
 class WalkforwardEnvPack(NamedTuple):
     """
     Arrays from ``train_test_split_alternating`` in canonical order.
@@ -826,6 +856,148 @@ class WalkforwardEnvPack(NamedTuple):
             "block_boundaries": self.block_boundaries,
             "asset_live": self.asset_live,
         }
+
+
+def build_continuous_walkforward_pack(
+    index: pd.DatetimeIndex,
+    ohlcv: np.ndarray,
+    macro: np.ndarray,
+    asset_live: np.ndarray,
+    *,
+    rsi: np.ndarray,
+    macd: np.ndarray,
+    fracdiff: np.ndarray,
+    fracdiff_macro: np.ndarray,
+    trend: np.ndarray,
+    asset_vol: np.ndarray,
+    macro_vol: np.ndarray,
+) -> WalkforwardEnvPack:
+    """Build a single contiguous env pack (no block joins) with precomputed features."""
+    n = len(index)
+    for name, arr in (
+        ("ohlcv", ohlcv),
+        ("macro", macro),
+        ("asset_live", asset_live),
+        ("rsi", rsi),
+        ("macd", macd),
+        ("fracdiff", fracdiff),
+        ("fracdiff_macro", fracdiff_macro),
+        ("trend", trend),
+        ("asset_vol", asset_vol),
+        ("macro_vol", macro_vol),
+    ):
+        if arr.shape[0] != n:
+            raise ValueError(f"{name} length {arr.shape[0]} != timeline length {n}")
+    return WalkforwardEnvPack(
+        idx=index,
+        ohlcv=ohlcv,
+        rsi=rsi,
+        macd=macd,
+        macro=macro,
+        fracdiff=fracdiff,
+        fracdiff_macro=fracdiff_macro,
+        trend=trend,
+        asset_vol=asset_vol,
+        macro_vol=macro_vol,
+        block_boundaries=[],
+        asset_live=asset_live,
+    )
+
+
+def multi_regime_slice_bounds(
+    n_bars: int,
+    *,
+    n_slices: int,
+    slice_bars: int,
+) -> list[tuple[int, int]]:
+    """Evenly spaced continuous ``[start, end)`` windows spanning a panel.
+
+    Used for multi-regime checkpoint selection (cohort 727+): score the same policy
+    on several discontinuous continuous paths so the selection signal is not
+    dominated by the single calendar window immediately before the OOS holdout.
+    """
+    n = int(n_bars)
+    k = int(n_slices)
+    length = int(slice_bars)
+    if k < 1:
+        raise ValueError(f"n_slices must be >= 1, got {k}")
+    if length < 64:
+        raise ValueError(f"slice_bars must be >= 64, got {length}")
+    if n < length:
+        raise ValueError(
+            f"panel too short for a {length}-bar regime slice (have {n} bars)"
+        )
+    if k == 1:
+        return [(n - length, n)]
+    span = n - length
+    starts = [int(round(i * span / (k - 1))) for i in range(k)]
+    # De-dupe while preserving order (short panels can collapse endpoints).
+    uniq: list[int] = []
+    for s in starts:
+        s = int(np.clip(s, 0, span))
+        if not uniq or s != uniq[-1]:
+            uniq.append(s)
+    if len(uniq) < k and span > 0:
+        # Fill any collapsed slots with midpoints between existing starts.
+        while len(uniq) < k:
+            best_gap = -1
+            insert_at = 0
+            insert_val = uniq[0]
+            for i in range(len(uniq) - 1):
+                gap = uniq[i + 1] - uniq[i]
+                if gap > best_gap:
+                    best_gap = gap
+                    insert_at = i + 1
+                    insert_val = uniq[i] + gap // 2
+            if best_gap <= 0:
+                break
+            uniq.insert(insert_at, insert_val)
+    return [(s, s + length) for s in uniq]
+
+
+def build_multi_regime_walkforward_packs(
+    index: pd.DatetimeIndex,
+    ohlcv: np.ndarray,
+    macro: np.ndarray,
+    asset_live: np.ndarray,
+    *,
+    rsi: np.ndarray,
+    macd: np.ndarray,
+    fracdiff: np.ndarray,
+    fracdiff_macro: np.ndarray,
+    trend: np.ndarray,
+    asset_vol: np.ndarray,
+    macro_vol: np.ndarray,
+    n_slices: int,
+    slice_bars: int,
+) -> list[WalkforwardEnvPack]:
+    """Build ``n_slices`` continuous env packs spanning the trainable panel.
+
+    Unlike chronological validation-tail reservation, these packs are **overlays**
+    (training still uses the full panel). Each pack has continuous feature memory
+    inside its window.
+    """
+    bounds = multi_regime_slice_bounds(
+        len(index), n_slices=n_slices, slice_bars=slice_bars
+    )
+    packs: list[WalkforwardEnvPack] = []
+    for start, end in bounds:
+        packs.append(
+            build_continuous_walkforward_pack(
+                index[start:end],
+                ohlcv[start:end],
+                macro[start:end],
+                asset_live[start:end],
+                rsi=rsi[start:end],
+                macd=macd[start:end],
+                fracdiff=fracdiff[start:end],
+                fracdiff_macro=fracdiff_macro[start:end],
+                trend=trend[start:end],
+                asset_vol=asset_vol[start:end],
+                macro_vol=macro_vol[start:end],
+            )
+        )
+    return packs
 
 
 def align_panel_to_timeline(

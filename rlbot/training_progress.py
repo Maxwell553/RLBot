@@ -47,25 +47,63 @@ def churn_scale_at_step(
     return floor + (1.0 - floor) * fee_progress
 
 
+def lr_at_step(
+    t: int,
+    *,
+    initial_lr: float,
+    floor_lr: float,
+    budget: int,
+    hold_until_step: int = 0,
+) -> float:
+    """LR value at absolute step ``t``.
+
+    ``hold_until_step == 0`` (legacy "cosine"): global cosine ``initial → floor``
+    over the whole budget.
+    ``hold_until_step > 0`` ("phase_aware"): hold ``initial_lr`` through the
+    curriculum/DR-widening phase, then cosine-decay to ``floor_lr`` over the
+    remaining ``budget - hold_until_step`` steps — the policy keeps a meaningful
+    LR while fee/lag conditions are still changing and anneals only once the
+    training distribution is stationary.
+    """
+    budget_i = max(1, int(budget))
+    hold = max(0, min(int(hold_until_step), budget_i))
+    t_i = max(0, int(t))
+    if hold <= 0:
+        progress_done = min(1.0, t_i / budget_i)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress_done))
+        return floor_lr + (initial_lr - floor_lr) * cosine
+    if t_i < hold:
+        return float(initial_lr)
+    span = max(budget_i - hold, 1)
+    progress_done = min(1.0, (t_i - hold) / span)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress_done))
+    return floor_lr + (initial_lr - floor_lr) * cosine
+
+
 def lr_schedule_with_floor_for_budget(
     initial_lr: float,
     floor_lr: float,
     budget: int,
+    *,
+    hold_until_step: int = 0,
 ):
     """Cosine LR keyed to absolute ``num_timesteps / budget`` (resume-safe).
 
     Stable-Baselines3 passes ``progress_remaining`` relative to the current
     ``learn()`` call; this schedule ignores that argument and reads
     ``sync_num_timesteps`` instead so crash-resume stays on the global budget curve.
+    ``hold_until_step > 0`` enables the phase-aware hold (see :func:`lr_at_step`).
     """
-    budget_i = max(1, int(budget))
     state = {"num_timesteps": 0}
 
     def schedule(_progress_remaining: float) -> float:
-        progress_done = min(1.0, state["num_timesteps"] / budget_i)
-        progress_remaining_eff = 1.0 - progress_done
-        cosine = 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress_remaining_eff)))
-        return floor_lr + (initial_lr - floor_lr) * cosine
+        return lr_at_step(
+            state["num_timesteps"],
+            initial_lr=initial_lr,
+            floor_lr=floor_lr,
+            budget=budget,
+            hold_until_step=hold_until_step,
+        )
 
     def sync_num_timesteps(num_timesteps: int) -> None:
         state["num_timesteps"] = int(num_timesteps)

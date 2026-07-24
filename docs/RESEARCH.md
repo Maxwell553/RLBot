@@ -6,24 +6,40 @@ run trees live under `Runs/`, which is gitignored, so result tables here are sel
 For implementation and operations, see [README.md](../README.md),
 [TRAINING.md](TRAINING.md), and [MODAL.md](MODAL.md). This file focuses on the walk-forward protocol, OOS results, and interpretations.
 
-## Known Issues — Contaminated Cohorts (read first)
+## Known Issues — Contaminated / Non-Comparable Cohorts (read first)
 
-> **Cohorts `W*_622` through `W*_625` were trained with a poorly scaled volatility
-> penalty and should be discarded / re-run.** (Run snapshots confirm `622` already
-> carried `vol_penalty_scale: 300.0`; `626`+ trained after the fix.)
->
-> The `reward.vol_penalty_scale` term was changed (commit `12b940f`) to multiply by
-> `reward_scale` (2000) **without** lowering the scale value (`300.0`), so the effective
-> coefficient became `300 × 2000 = 600,000`. On typical excess downside vol this produced
-> per-step penalties of roughly **600–2400 reward units**, hundreds to thousands of times
-> larger than the return/benchmark/drawdown terms, so the volatility penalty dominated the
-> reward signal (visible as per-step rewards spiking to ≈ -1200 in training plots).
->
-> **Fix (Jun 2026):** keep the `× reward_scale` formula and set `vol_penalty_scale: 0.15`
-> (`0.15 × 2000 = 300`, the pre-bug effective magnitude). Any cohort trained with a non-zero
-> `vol_penalty_scale` before this fix (`W*_622`–`W*_625`) is invalid and must not be compared
-> against the `W*_612`–`W*_617` published grid (which predates the volatility penalty). Re-run
-> those cohorts with the rescaled penalty before drawing conclusions.
+> **Backtest summaries under `Runs/<id>/backtest_summary.json` override any stale
+> prose claims in this file.** Use `python scripts/audit_runs.py` for labeled
+> provenance + OOS metrics.
+
+### Exclude: `W*_623`–`W*_625` (invalid)
+
+Trained with a poorly scaled volatility penalty (`vol_penalty_scale: 300` ×
+`reward_scale` 2000 → effective ~600,000). Per-step penalties of hundreds to
+thousands of reward units dominated the signal. **Do not use for method
+comparisons.** Fix (Jun 2026): keep `× reward_scale` and set
+`vol_penalty_scale: 0.15`.
+
+### Separate (do not bundle with 623–625): `W*_622`
+
+`622` also carried the pre-fix `vol_penalty_scale`, but treat it as its **own**
+flagged cell — not identically “bundled invalid” with 623–625. Audit label:
+`vol_penalty_bug_present`.
+
+### Label, do not grid-compare: resumed `W3_619`–`W5_619`
+
+Crash-resumed past the nominal 50M budget (~82–84M cumulative steps; manifests
+show `--resume` from late checkpoints). Audit label: `resumed_long_budget`.
+W1–W2_619 were single-pass 50M and remain comparable within the extended grid.
+
+### Other caveats
+
+- **`W*_612` is mixed-era** (see published-cohort notes below).
+- Prefer run-local `config.yaml` + `manifest.json` over backtest-time `git_*`.
+- New tooling: `scripts/audit_runs.py`, `scripts/preflight.py`,
+  `scripts/dashboard.py`.
+
+---
 
 ## Protocol
 
@@ -128,6 +144,9 @@ run's `backtest_summary.json` (`--checkpoint best`):
 | `W*_627` | 80             | 42   | 0.60 | +125.4%        | 0.55        | -18.5%      |
 
 
+**`W*_619` caveat:** W3–W5 were crash-resumed (~82–84M cumulative steps). Treat those
+windows as `resumed_long_budget` (see Known Issues); W1–W2_619 were single-pass 50M.
+
 Findings across the full clean set (`612`–`621`, cap 0.20, n=50 window
 backtests):
 
@@ -225,10 +244,18 @@ steps on W3 (return signal +0.2 → −0.95, p75 dd_frac 0.047 → 0.127) and W5
 **Reverted to 2.5.**
 - Kept from 721: `drawdown_level_floor: 0.05`, `participation_vix_relief:
 1.0`, `best_model_score_dd_coef: 3.0`.
-- Open structural note: with `dr_widen_span_fraction: 0.65`, curriculum end
-= min(50M, 29.25M + 32.5M) = 50M, so `early_stop_patience` can never fire
-on a 50M run — declining-eval runs train to the full budget (best/ still
-protects the checkpoint).
+- Schedule rephased (post-723/724; default recipe): every 723/724 window showed
+**monotonically declining post-gate eval scores** — the old 0.13/0.585 fractions put
+the best-model gate at 29.25M and DR widening to 50M, so the policy never trained
+under settled final conditions, and the global-cosine LR was ~1e-4 at the gate /
+~2e-5 at full DR (adaptation frozen while fee/lag conditions were still changing).
+New recipe: `fee_free_fraction: 0.10` (~5M), `fee_ramp_fraction: 0.45` (gate ~22.5M),
+`dr_widen_span_fraction: 0.25` (full DR ~35M), entropy decay/floors moved to 0.45,
+`early_stop_patience: 12`, and `hyperparameters.lr_schedule: phase_aware` (hold 3e-4
+until dr_widen_end, then cosine → floor over the 15M settled remainder). Checkpoint
+selection hardened: trailing-3 median of post-gate scores + 0.3-weight fixed stress
+eval (1.5× fees / lag 2, benchmark priced identically). Runs ≤ 724 used the old
+schedule (curriculum end = budget; early stop never fired).
 
 ## Per-Window OOS Results
 
