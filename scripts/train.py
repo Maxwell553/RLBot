@@ -32,6 +32,7 @@ _bootstrap_spec.loader.exec_module(_bootstrap_mod)
 
 import argparse
 import shutil
+import subprocess
 import sys
 import json
 import re
@@ -1368,6 +1369,151 @@ class RewardDecompCallback(BaseCallback):
         return True
 
 
+def _load_json_if_exists(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[train] WARNING: could not read {path}: {exc}")
+        return None
+
+
+def _print_reward_decomp(paths: RunPaths) -> dict | None:
+    """Print best-checkpoint (preferred) or final reward decomposition."""
+    best = _load_json_if_exists(paths.eval_log_dir / "reward_decomp_best.json")
+    final = _load_json_if_exists(paths.eval_log_dir / "reward_decomp.json")
+    payload = best or final
+    label = "best-checkpoint" if best is not None else "final-window"
+    if payload is None:
+        print("[train] reward decomp: (no reward_decomp_best.json / reward_decomp.json yet)")
+        return None
+    mean = payload.get("mean") or {}
+    share = payload.get("abs_share") or {}
+    print(f"\n=== Reward decomp ({label}, timesteps={payload.get('timesteps', '?')}) ===")
+    # Stable term order for scanning across runs.
+    preferred = [
+        "return",
+        "benchmark",
+        "sortino",
+        "participation",
+        "inactivity",
+        "churn",
+        "turnover",
+        "drawdown",
+        "drawdown_penalty",
+        "drawdown_increase",
+        "drawdown_level",
+        "concentration",
+        "volatility",
+        "exposure_risk",
+    ]
+    keys = [k for k in preferred if k in mean] + [
+        k for k in sorted(mean) if k not in preferred
+    ]
+    print(f"{'term':<22} {'mean':>10} {'abs_share':>10}")
+    for k in keys:
+        m = float(mean.get(k, 0.0))
+        s = float(share.get(k, 0.0))
+        print(f"{k:<22} {m:+10.4f} {s:10.1%}")
+    return payload
+
+
+def _print_backtest_cash(summary: dict) -> None:
+    pd = summary.get("portfolio_diagnostics") or {}
+    weights = pd.get("per_asset_mean_weights") or {}
+    print("\n=== OOS backtest allocation (best checkpoint) ===")
+    print(
+        f"  return={float(summary.get('total_return', float('nan'))):+.2%}  "
+        f"sharpe={float(summary.get('sharpe', float('nan'))):.2f}  "
+        f"max_dd={float(summary.get('max_drawdown', float('nan'))):+.2%}  "
+        f"window={summary.get('oos_window', '?')}"
+    )
+    print(
+        f"  mean_cash={float(pd.get('mean_cash_frac', float('nan'))):.1%}  "
+        f"gross={float(pd.get('mean_gross_exposure', float('nan'))):.1%}  "
+        f"eff_n={float(pd.get('mean_effective_n_assets', float('nan'))):.2f}  "
+        f"turnover={float(pd.get('mean_turnover', float('nan'))):.4f}  "
+        f"cap_hit={float(pd.get('cap_hit_fraction', float('nan'))):.1%}"
+    )
+    if weights:
+        ordered = sorted(weights.items(), key=lambda kv: (-float(kv[1]), kv[0]))
+        parts = [f"{k}={float(v):.1%}" for k, v in ordered]
+        print("  mean weights: " + ", ".join(parts))
+
+
+def _run_post_train_backtest_and_report(
+    *,
+    run_id: str,
+    paths: RunPaths,
+    detailed: bool = False,
+) -> None:
+    """OOS backtest best checkpoint, then log cash allocation + reward decomp."""
+    print("\n" + "=" * 72)
+    print(f"[train] Post-train OOS backtest + allocation / reward report ({run_id})")
+    print("=" * 72)
+
+    decomp = _print_reward_decomp(paths)
+
+    best_zip = paths.best_model_dir / "best_model.zip"
+    if not best_zip.is_file():
+        print(
+            f"[train] Skipping post-backtest: missing {best_zip} "
+            "(no best checkpoint was saved)."
+        )
+        report = {
+            "run_id": run_id,
+            "backtest": None,
+            "reward_decomp": decomp,
+            "skipped_reason": "missing_best_model",
+        }
+        write_manifest(paths.run_meta_dir / "post_train_report.json", report)
+        return
+
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "backtest.py"),
+        "--run-id",
+        run_id,
+        "--checkpoint",
+        "best",
+    ]
+    if detailed:
+        cmd.append("--detailed")
+    print(f"[train] Running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=str(ROOT))
+    summary_path = paths.run_dir / "backtest_summary.json"
+    summary = _load_json_if_exists(summary_path) if proc.returncode == 0 else None
+    if proc.returncode != 0:
+        print(f"[train] WARNING: post-backtest exited {proc.returncode}")
+    elif summary is None:
+        print(f"[train] WARNING: post-backtest ok but missing {summary_path}")
+    else:
+        _print_backtest_cash(summary)
+
+    # Re-print decomp after backtest so it sits next to allocation in the log tail.
+    if decomp is not None:
+        _print_reward_decomp(paths)
+
+    report = {
+        "run_id": run_id,
+        "backtest_summary_path": str(summary_path) if summary_path.is_file() else None,
+        "backtest": {
+            "total_return": summary.get("total_return"),
+            "sharpe": summary.get("sharpe"),
+            "max_drawdown": summary.get("max_drawdown"),
+            "oos_window": summary.get("oos_window"),
+            "portfolio_diagnostics": summary.get("portfolio_diagnostics"),
+        }
+        if summary
+        else None,
+        "reward_decomp": decomp,
+        "backtest_exit_code": int(proc.returncode),
+    }
+    write_manifest(paths.run_meta_dir / "post_train_report.json", report)
+    print(f"[train] Wrote {paths.run_meta_dir / 'post_train_report.json'}")
+
+
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default=str(ROOT / "config" / "config.yaml"))
@@ -1504,6 +1650,21 @@ def main() -> None:
         help="Allow training into an existing Runs/<run-id>/ directory (overwrites its "
              "manifest/models; refused by default — reuse also restores the old run's "
              "best-eval threshold, which can suppress best_model saves).",
+    )
+    parser.add_argument(
+        "--post-backtest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After a completed run, automatically OOS-backtest --checkpoint best and "
+            "print cash allocation + reward decomposition (default: on). "
+            "Use --no-post-backtest to skip (e.g. research tiers that must not burn OOS)."
+        ),
+    )
+    parser.add_argument(
+        "--post-backtest-detailed",
+        action="store_true",
+        help="Pass --detailed to the post-train OOS backtest (slower; bootstrap/ensemble).",
     )
     args = parser.parse_args()
     if args.resume.strip() and args.finetune.strip():
@@ -2636,6 +2797,17 @@ def main() -> None:
         print(f"Training plot: {paths.training_plot}")
         if args.show_viz:
             open_plot_file(paths.training_plot)
+
+    if interrupted:
+        print("[train] Interrupted — skipping post-train backtest.")
+    elif bool(getattr(args, "post_backtest", True)):
+        _run_post_train_backtest_and_report(
+            run_id=run_id,
+            paths=paths,
+            detailed=bool(getattr(args, "post_backtest_detailed", False)),
+        )
+    else:
+        print("[train] Post-train backtest disabled (--no-post-backtest).")
 
 
 if __name__ == "__main__":
