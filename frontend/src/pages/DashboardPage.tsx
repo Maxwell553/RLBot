@@ -7,6 +7,7 @@ import { sampleResultRows, sampleRuns, sampleSummary } from '../lib/demo-data'
 import { fmtNum, fmtSteps, statusLabel, statusTone } from '../lib/format'
 import type { ApiDashboard, ApiResultRow, DataState } from '../lib/types'
 import type { WorkflowMandate } from '../lib/mandate-requests'
+import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 function useDashboardData() {
   const [state, setState] = useState<DataState<ApiDashboard>>({ kind: 'loading' })
@@ -34,7 +35,11 @@ function useDashboardData() {
     load(controller.signal)
     return () => controller.abort()
   }, [load])
-  return { state, refreshing, refreshError, reload: () => load() }
+
+  const reload = useCallback(() => load(), [load])
+  useAutoRefresh(reload, { enabled: state.kind === 'live' || state.kind === 'error', refreshing })
+
+  return { state, refreshing, refreshError, reload }
 }
 
 /** Median model Sharpe per window, computed from the served cohort table. */

@@ -1,25 +1,19 @@
 """
 Multi-asset portfolio Gymnasium environment (universe size from OHLCV panel / config).
 
-Reward = return (drawdown amp) + benchmark excess + Sortino diff + participation
-  - inactivity - cost-linked churn - drawdown penalty - concentration penalty
-  - volatility penalty - exposure risk penalty
+Reward = return (drawdown amp) + benchmark excess + Sortino diff
+  - cost-linked churn - turnover - drawdown penalty - vol penalty - exposure risk
+  Optional legacy terms (parser default 0; off in active config): participation,
+  inactivity, concentration — still computed so old run snapshots load unchanged.
   - return: clipped_log_return * reward_scale; negative returns amplified by
     (1 + gamma * dd_pre), capped at drawdown_amp_max when > 0
   - drawdown penalty: dd_increase * reward_scale * drawdown_increase_penalty
     + max(dd_next - drawdown_level_floor, 0) * drawdown_level_penalty
       * ((1 - coupling) + coupling * gross) when drawdown_level_exposure_coupling > 0
-      (de-risking to cash zeros the persistent level tax; increase still hits the bad step)
-  - concentration: concentration_penalty * max(target_eff_n - eff_n, 0) on risky weights
   - cash accrual (optional): cash *= (1 + cash_daily_yield) when yield > 0
   - benchmark excess: clip(agent_log_ret - cap_weight_bench_log_ret) * benchmark_excess_scale
   - sortino diff: benchmark-relative Sortino over last RISK_WINDOW steps (moving window)
   - Sortino + benchmark capped at a constant |sortino+benchmark| <= benchmark_combined_abs_cap
-  - inactivity: linear in cash fraction (plus extra ramp above 90%); scaled by the
-    most-relief-wins combine of VIX relief and own-drawdown relief (cash is cheaper
-    in market stress *or* when the agent is already underwater)
-  - participation: gross exposure * bonus * scale; same stress-relief combine when
-    participation_*_relief > 0 (no pay for riding risk through own drawdowns / VIX spikes)
   - churn: realized tx cost (slippage + fees) * churn_penalty * reward_scale * VIX * curriculum scale
   - Soft per-asset long-only cap after softmax (see config max_single_asset_weight)
 
@@ -1196,16 +1190,6 @@ class MultiAssetPortfolioEnv(gym.Env):
         vol_penalty_component = 0.0
         vol_excess_raw = 0.0
         vol_active = 0.0
-        if rwd.vol_penalty_scale > 0.0 and available_steps >= rwd.sortino_min_steps:
-            active_lookback = min(available_steps, rwd.risk_window)
-            vol_penalty_component, agent_dv, bench_dv = vol_penalty_from_returns(
-                np.array(self._return_buffer[-active_lookback:], dtype=np.float64),
-                np.array(self._market_return_buffer[-active_lookback:], dtype=np.float64),
-                rwd,
-            )
-            vol_excess_raw = max(float(agent_dv - bench_dv), 0.0)
-            vol_active = 1.0 if vol_penalty_component > 0.0 else 0.0
-
         (
             drawdown_penalty_component,
             dd_next,
@@ -1220,6 +1204,17 @@ class MultiAssetPortfolioEnv(gym.Env):
             rwd=rwd,
             gross_exposure=gross_exposure,
         )
+
+        if rwd.vol_penalty_scale > 0.0 and available_steps >= rwd.sortino_min_steps:
+            active_lookback = min(available_steps, rwd.risk_window)
+            vol_penalty_component, agent_dv, bench_dv = vol_penalty_from_returns(
+                np.array(self._return_buffer[-active_lookback:], dtype=np.float64),
+                np.array(self._market_return_buffer[-active_lookback:], dtype=np.float64),
+                rwd,
+                gross_exposure=gross_exposure,
+            )
+            vol_excess_raw = max(float(agent_dv - bench_dv), 0.0)
+            vol_active = 1.0 if vol_penalty_component > 0.0 else 0.0
 
         # State-dependent cash/participation shaping: most-relief-wins of VIX and
         # own-drawdown. Underwater-and-invested pays the coupled DD level tax;

@@ -155,12 +155,46 @@ class RunPaths:
     def config_snapshot(self) -> Path:
         return self.run_meta_dir / "config.yaml"
 
+    @property
+    def backtest_summary(self) -> Path:
+        """Canonical dashboard summary path (best-checkpoint OOS metrics)."""
+        return self.run_meta_dir / "backtest_summary.json"
+
     def mkdirs(self) -> None:
         """Create the unified ``Runs/<run_id>/`` tree (always new layout)."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         for name in ("plots", "models", "logs", "tb_logs", "eval_logs"):
             (self.run_dir / name).mkdir(parents=True, exist_ok=True)
         (self.run_dir / "models" / "best").mkdir(parents=True, exist_ok=True)
+
+
+# Preference order for OOS metrics shown on dashboards / audit.
+# ``backtest_summary.json`` is the best-checkpoint canonical file; final/latest
+# fall back so post-train / manual latest scores still surface when best is absent.
+BACKTEST_SUMMARY_CANDIDATES = (
+    "backtest_summary.json",
+    "backtest_summary_final.json",
+    "backtest_summary_latest.json",
+)
+
+
+def resolve_backtest_summary_path(
+    run_id: str | RunPaths | Path,
+    *,
+    root: Path = PROJECT_ROOT,
+) -> Path | None:
+    """Return the preferred existing backtest summary for a run, or None."""
+    if isinstance(run_id, Path):
+        meta = run_id
+    elif isinstance(run_id, RunPaths):
+        meta = run_id.run_meta_dir
+    else:
+        meta = RunPaths(run_id=str(run_id), root=root).run_meta_dir
+    for name in BACKTEST_SUMMARY_CANDIDATES:
+        path = meta / name
+        if path.is_file():
+            return path
+    return None
 
 
 def write_manifest(path: Path, payload: Mapping[str, Any]) -> None:

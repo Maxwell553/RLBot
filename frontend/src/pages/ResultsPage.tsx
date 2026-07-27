@@ -5,6 +5,7 @@ import { fetchResults } from '../lib/api'
 import { sampleResultRows } from '../lib/demo-data'
 import { fmtNum, fmtPct } from '../lib/format'
 import type { ApiResultRow, ApiResults, DataState } from '../lib/types'
+import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 function median(values: Array<number | null | undefined>): number | null {
   const finite = values.filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
@@ -91,6 +92,9 @@ export function ResultsPage() {
     return () => controller.abort()
   }, [load])
 
+  const reload = useCallback(() => load(), [load])
+  useAutoRefresh(reload, { enabled: state.kind === 'live' || state.kind === 'error', refreshing })
+
   const rows = useMemo(
     () => (state.kind === 'live' ? state.data.rows : state.kind === 'offline' ? sampleResultRows : []),
     [state],
@@ -158,7 +162,7 @@ export function ResultsPage() {
           </p>
           {state.kind === 'live' && refreshing && <p className="mt-2 text-[11px] text-ink/55">Refreshing evidence…</p>}
           {state.kind === 'live' && refreshError && (
-            <button type="button" onClick={() => load()} className="mt-2 text-[11px] font-semibold text-amber-800">
+            <button type="button" onClick={reload} className="mt-2 text-[11px] font-semibold text-amber-800">
               Refresh failed: {refreshError}. Retry
             </button>
           )}
@@ -176,7 +180,7 @@ export function ResultsPage() {
         </div>
       </header>
 
-      {state.kind === 'error' && <div className="mt-8"><ErrorPanel message={state.message} onRetry={() => load()} /></div>}
+      {state.kind === 'error' && <div className="mt-8"><ErrorPanel message={state.message} onRetry={reload} /></div>}
       {state.kind === 'loading' && (
         <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           {Array.from({ length: 4 }).map((_, index) => <Skeleton key={index} className="h-32" />)}
@@ -186,7 +190,7 @@ export function ResultsPage() {
         <div className="mt-8">
           <EmptyPanel
             title="No OOS results yet"
-            body="No Runs/*/backtest_summary.json files were found. Score holdouts with scripts/backtest.py to populate this page."
+            body="No backtest summaries found under Runs/*/ (backtest_summary.json, or final/latest fallbacks). Score holdouts with scripts/backtest.py — post-train backtests write the canonical file automatically."
           />
         </div>
       )}
@@ -225,7 +229,8 @@ export function ResultsPage() {
           </section>
           <p className="mt-3 text-[11px] leading-5 text-ink/55">
             Cohort filter lists every cohort with a local backtest summary. Rows are rebuilt from{' '}
-            <span className="font-mono">Runs/*/backtest_summary.json</span>
+            <span className="font-mono">Runs/*/backtest_summary*.json</span>
+            {' '}(best preferred; final/latest used when best is absent) and refresh automatically.
             {withBenchmarks != null && withBenchmarks < rows.length
               ? `; ${rows.length - withBenchmarks} older summaries lack EW/SPY sleeves.`
               : '.'}

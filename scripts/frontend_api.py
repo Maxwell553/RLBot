@@ -45,7 +45,13 @@ from pydantic import BaseModel, Field
 
 from rlbot.curriculum_preflight import build_curriculum_preflight
 from rlbot.rl_config import load_config, validate_config_for_universe
-from rlbot.run_artifacts import PROJECT_ROOT, RUNS_ROOT, RunPaths, read_run_manifest
+from rlbot.run_artifacts import (
+    PROJECT_ROOT,
+    RUNS_ROOT,
+    RunPaths,
+    read_run_manifest,
+    resolve_backtest_summary_path,
+)
 from rlbot.run_audit import audit_runs, discover_audit_run_ids
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
@@ -81,6 +87,8 @@ class _AuditCache:
             paths.run_meta_dir / "manifest.json",
             paths.config_snapshot,
             paths.run_meta_dir / "backtest_summary.json",
+            paths.run_meta_dir / "backtest_summary_final.json",
+            paths.run_meta_dir / "backtest_summary_latest.json",
             paths.eval_nav_history,
             paths.eval_log_dir / "reward_decomp.jsonl",
             paths.eval_log_dir / "reward_decomp.json",
@@ -97,21 +105,33 @@ class _AuditCache:
 
     def get(self) -> list[Any]:
         now = time.monotonic()
-        if self._records is None or (now - self._at) > _AUDIT_CACHE_TTL_SECONDS:
-            ids = discover_audit_run_ids(root=PROJECT_ROOT)
-            id_set = set(ids)
-            for stale_id in set(self._by_id) - id_set:
-                self._by_id.pop(stale_id, None)
-                self._signatures.pop(stale_id, None)
-            for run_id in ids:
-                signature = self._signature(run_id)
-                if self._signatures.get(run_id) == signature and run_id in self._by_id:
-                    continue
-                records = audit_runs([run_id], root=PROJECT_ROOT)
-                if records:
-                    self._by_id[run_id] = records[0]
-                    self._signatures[run_id] = signature
-            self._records = [self._by_id[run_id] for run_id in ids if run_id in self._by_id]
+        ids = discover_audit_run_ids(root=PROJECT_ROOT)
+        id_set = set(ids)
+        for stale_id in set(self._by_id) - id_set:
+            self._by_id.pop(stale_id, None)
+            self._signatures.pop(stale_id, None)
+
+        # Always re-audit runs whose watched artifacts changed (manifest, backtest
+        # summaries, checkpoints). Full rediscover also runs on TTL so new run dirs
+        # appear promptly for the ops dashboard auto-refresh.
+        need_full = self._records is None or (now - self._at) > _AUDIT_CACHE_TTL_SECONDS
+        for run_id in ids:
+            signature = self._signature(run_id)
+            if (
+                not need_full
+                and self._signatures.get(run_id) == signature
+                and run_id in self._by_id
+            ):
+                continue
+            records = audit_runs([run_id], root=PROJECT_ROOT)
+            if records:
+                self._by_id[run_id] = records[0]
+                self._signatures[run_id] = signature
+            else:
+                self._by_id.pop(run_id, None)
+                self._signatures.pop(run_id, None)
+        self._records = [self._by_id[run_id] for run_id in ids if run_id in self._by_id]
+        if need_full:
             self._at = now
         return self._records
 
@@ -416,9 +436,9 @@ def _oos_row_from_backtest(run_id: str, backtest: dict[str, Any], published: dic
 def _oos_result_rows() -> list[dict[str, Any]]:
     """Build OOS comparison rows from every local backtest summary.
 
-    Prefer live ``backtest_summary.json`` (including detailed EW/SPY sleeves).
-    Fall back to ``cohort_vs_benchmark.json`` only for missing benchmark fields
-    on older summaries.
+    Prefer live backtest summaries (canonical ``backtest_summary.json``, else
+    final/latest). Fall back to ``cohort_vs_benchmark.json`` only for missing
+    benchmark fields on older summaries.
     """
     published = _published_benchmark_index()
     rows: list[dict[str, Any]] = []
@@ -431,7 +451,8 @@ def _oos_result_rows() -> list[dict[str, Any]]:
         run_id = path.name
         if not _RUN_ID_RE.match(run_id):
             continue
-        summary = _load_json(path / "backtest_summary.json")
+        summary_path = resolve_backtest_summary_path(path)
+        summary = _load_json(summary_path) if summary_path is not None else None
         if not isinstance(summary, dict):
             continue
         row = _oos_row_from_backtest(run_id, summary, published.get(run_id))
@@ -567,7 +588,8 @@ def run_detail(run_id: str) -> dict[str, Any]:
 
     manifest = read_run_manifest(run_id) or {}
     paths = RunPaths(run_id=run_id, root=PROJECT_ROOT)
-    backtest = _load_json(paths.run_meta_dir / "backtest_summary.json")
+    summary_path = resolve_backtest_summary_path(paths)
+    backtest = _load_json(summary_path) if summary_path is not None else None
 
     audit_row = _run_record(rec)
 
@@ -625,7 +647,7 @@ def results(cohort: str = "") -> dict[str, Any]:
         "cohorts": cohorts,
         "rows": rows,
         "coverage": {
-            "source": "Runs/*/backtest_summary.json",
+            "source": "Runs/*/backtest_summary*.json (best preferred; final/latest fallback)",
             "published_rows": len(rows),
             "published_runs": len({str(row["run_id"]) for row in rows}),
             "runs_with_backtest": len(rows),

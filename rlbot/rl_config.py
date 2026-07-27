@@ -132,6 +132,15 @@ class RewardConfig:
     exposure_risk_mode: str
     exposure_risk_penalty_scale: float
     vol_penalty_scale: float
+    # "excess" (legacy parser default): tax only agent_dv - bench_dv.
+    # "absolute" (729+): tax agent_dv * gross — fires when invested even if
+    # calmer than the equal-weight sleeve (excess mode was ~0.02% active on 728).
+    vol_penalty_mode: str = "excess"
+    # When True, level_term *= reward_scale (same units as increase/return).
+    # Parser default False preserves old snapshots where penalty was a large raw
+    # coefficient (e.g. 100–160) that was dimensionally dwarfed by return (~0.4%
+    # abs_share on 730). Cohort 731 sets True with penalty ~0.08–0.12.
+    drawdown_level_times_reward_scale: bool = False
     # VIX-conditional relief on the inactivity penalty: multiplier
     # 1 - clip((VIX/18 - 1) * relief, 0, 1). 0 disables (old behavior): holding
     # cash in elevated-vol regimes is not penalized as hard as in calm ones.
@@ -243,9 +252,23 @@ class TrainingConfig:
     # eval benchmark, with p75(max_dd_frac) penalty (unitless, era-comparable).
     # "defensive_sharpe": same excess-Sharpe signal, but DD penalty uses max(max_dd_frac).
     best_model_score_mode: str = "excess_nav"
-    # Reject a candidate best checkpoint when continuous/multi-regime eval max DD
-    # exceeds this fraction (0 disables). Cohort 728+: prefer shallow-DD policies.
+    # Reject / penalize when continuous/multi-regime eval max DD exceeds this
+    # fraction (0 disables). Cohort 728+: prefer shallow-DD policies.
     best_model_max_dd_reject: float = 0.0
+    # True (parser default): hard -inf when over threshold. False: soft score
+    # penalty ``coef * (max_dd - threshold)`` so a best can still be saved when
+    # every post-gate eval overshoots (W1_729 failure mode).
+    best_model_max_dd_reject_hard: bool = True
+    best_model_max_dd_reject_coef: float = 50.0
+    # Cohort 729+: penalize low cash on the highest-DD multi-regime slice so
+    # selection cannot look defensive on calm overlays while the stress slice
+    # (and later OOS) stays nearly fully invested. 0 disables.
+    best_model_worst_regime_cash_coef: float = 0.0
+    best_model_worst_regime_cash_target: float = 0.0
+    # Cohort 730+: penalize mean multi-regime cash above ``cap`` so cash-park
+    # policies cannot win defensive_sharpe via vol collapse (W5_729). 0 coef disables.
+    best_model_mean_cash_coef: float = 0.0
+    best_model_mean_cash_cap: float = 1.0
     # Trailing window over post-gate eval scores before replacing best (0/1 = legacy).
     best_model_trailing_evals: int = 0
     best_model_trailing_agg: str = "median"  # median | mean
@@ -496,6 +519,13 @@ def _validate_reward_config(rew: RewardConfig) -> None:
         raise ValueError(
             f"reward.vol_penalty_scale must be >= 0, got {rew.vol_penalty_scale}"
         )
+    from rlbot.eval_selection import VOL_PENALTY_MODES
+
+    if rew.vol_penalty_mode not in VOL_PENALTY_MODES:
+        raise ValueError(
+            f"reward.vol_penalty_mode must be one of {sorted(VOL_PENALTY_MODES)}, "
+            f"got {rew.vol_penalty_mode!r}"
+        )
     if rew.turnover_penalty < 0.0:
         raise ValueError(
             f"reward.turnover_penalty must be >= 0, got {rew.turnover_penalty}"
@@ -640,18 +670,24 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
                 rew.get("concentration_target_eff_assets", 5.5)
             ),
             cash_daily_yield=float(rew.get("cash_daily_yield", 0.0)),
-            inactivity_penalty_over_50=float(_req(rew, "inactivity_penalty_over_50", "reward")),
-            inactivity_penalty_over_90=float(_req(rew, "inactivity_penalty_over_90", "reward")),
+            # Optional (parser default 0): omitted inactivity / participation stay
+            # off (729+); concentration may be re-enabled in active config.
+            inactivity_penalty_over_50=float(rew.get("inactivity_penalty_over_50", 0.0)),
+            inactivity_penalty_over_90=float(rew.get("inactivity_penalty_over_90", 0.0)),
             eval_inactivity_penalty_scale=float(
-                _req(rew, "eval_inactivity_penalty_scale", "reward")
+                rew.get("eval_inactivity_penalty_scale", 1.0)
             ),
-            participation_bonus=float(_req(rew, "participation_bonus", "reward")),
+            participation_bonus=float(rew.get("participation_bonus", 0.0)),
             participation_reward_scale=float(
-                _req(rew, "participation_reward_scale", "reward")
+                rew.get("participation_reward_scale", 10.0)
             ),
             exposure_risk_mode=str(rew.get("exposure_risk_mode", "realized_vol")),
             exposure_risk_penalty_scale=float(rew.get("exposure_risk_penalty_scale", 0.0)),
             vol_penalty_scale=float(rew.get("vol_penalty_scale", 0.0)),
+            vol_penalty_mode=str(rew.get("vol_penalty_mode", "excess")).lower(),
+            drawdown_level_times_reward_scale=bool(
+                rew.get("drawdown_level_times_reward_scale", False)
+            ),
             # Defaults 0.0 preserve old run snapshots (no relief, uncapped amp,
             # level penalty not coupled to gross, no own-DD cash relief).
             inactivity_vix_relief=float(rew.get("inactivity_vix_relief", 0.0)),
@@ -729,6 +765,16 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             best_model_benchmark=str(tr.get("best_model_benchmark", "equal_weight_daily")),
             best_model_score_mode=str(tr.get("best_model_score_mode", "excess_nav")),
             best_model_max_dd_reject=float(tr.get("best_model_max_dd_reject", 0.0)),
+            best_model_max_dd_reject_hard=bool(tr.get("best_model_max_dd_reject_hard", True)),
+            best_model_max_dd_reject_coef=float(tr.get("best_model_max_dd_reject_coef", 50.0)),
+            best_model_worst_regime_cash_coef=float(
+                tr.get("best_model_worst_regime_cash_coef", 0.0)
+            ),
+            best_model_worst_regime_cash_target=float(
+                tr.get("best_model_worst_regime_cash_target", 0.0)
+            ),
+            best_model_mean_cash_coef=float(tr.get("best_model_mean_cash_coef", 0.0)),
+            best_model_mean_cash_cap=float(tr.get("best_model_mean_cash_cap", 1.0)),
             best_model_trailing_evals=int(tr.get("best_model_trailing_evals", 0)),
             best_model_trailing_agg=str(tr.get("best_model_trailing_agg", "median")),
             best_model_confirm_evals=int(tr.get("best_model_confirm_evals", 0)),
@@ -852,6 +898,36 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
     if not (0.0 <= dd_reject < 1.0):
         raise ValueError(
             f"training.best_model_max_dd_reject must be in [0, 1), got {dd_reject}"
+        )
+    cash_coef = float(cfg.training.best_model_worst_regime_cash_coef)
+    cash_target = float(cfg.training.best_model_worst_regime_cash_target)
+    if cash_coef < 0.0:
+        raise ValueError(
+            "training.best_model_worst_regime_cash_coef must be >= 0, "
+            f"got {cash_coef}"
+        )
+    if not (0.0 <= cash_target < 1.0):
+        raise ValueError(
+            "training.best_model_worst_regime_cash_target must be in [0, 1), "
+            f"got {cash_target}"
+        )
+    mean_cash_coef = float(cfg.training.best_model_mean_cash_coef)
+    mean_cash_cap = float(cfg.training.best_model_mean_cash_cap)
+    if mean_cash_coef < 0.0:
+        raise ValueError(
+            "training.best_model_mean_cash_coef must be >= 0, "
+            f"got {mean_cash_coef}"
+        )
+    if not (0.0 < mean_cash_cap <= 1.0):
+        raise ValueError(
+            "training.best_model_mean_cash_cap must be in (0, 1], "
+            f"got {mean_cash_cap}"
+        )
+    dd_rej_coef = float(cfg.training.best_model_max_dd_reject_coef)
+    if dd_rej_coef < 0.0:
+        raise ValueError(
+            "training.best_model_max_dd_reject_coef must be >= 0, "
+            f"got {dd_rej_coef}"
         )
     if cfg.environment.dd_exposure_taper:
         t0 = float(cfg.environment.dd_exposure_taper_start)

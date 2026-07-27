@@ -16,11 +16,99 @@ from rlbot.portfolio_metrics import summarize_weight_panel
 EXPOSURE_RISK_MODES = frozenset({"realized_vol", "vix_positive"})
 EVAL_BENCHMARK_MODES = frozenset({"balanced_6040", "equal_weight_daily"})
 BEST_MODEL_SCORE_MODES = frozenset({"excess_nav", "excess_sharpe", "defensive_sharpe"})
+VOL_PENALTY_MODES = frozenset({"excess", "absolute"})
 VIX_RISK_BASELINE = 18.0
 TRADING_DAYS_PER_YEAR = 252
 # Segment Sharpe clip: near-zero-vol excess paths (agent ≈ benchmark) otherwise
 # produce unbounded ratios that would dominate the selection score.
 EXCESS_SHARPE_CLIP = 10.0
+
+
+def apply_worst_regime_cash_penalty(
+    score: float,
+    per_max_dds: list[float] | tuple[float, ...],
+    per_cash: list[float] | tuple[float, ...],
+    *,
+    coef: float,
+    target: float,
+) -> tuple[float, float, float]:
+    """Penalize low cash on the highest-DD multi-regime slice.
+
+    Returns ``(adjusted_score, worst_regime_cash, penalty)``. No-op when
+    ``coef <= 0``, ``target <= 0``, or inputs are empty/mismatched. Addresses the
+    728 eval↔OOS cash gap: short overlays looked ~30–50% cash while OOS on W2/W4
+    collapsed to ~7–13% invested through the crash.
+    """
+    raw = float(score)
+    if coef <= 0.0 or target <= 0.0 or not per_max_dds or not per_cash:
+        return raw, float("nan"), 0.0
+    n = min(len(per_max_dds), len(per_cash))
+    if n <= 0:
+        return raw, float("nan"), 0.0
+    dds = np.asarray(per_max_dds[:n], dtype=np.float64)
+    cash = np.asarray(per_cash[:n], dtype=np.float64)
+    worst_i = int(np.argmax(dds))
+    worst_cash = float(cash[worst_i])
+    penalty = float(coef) * max(0.0, float(target) - worst_cash)
+    return raw - penalty, worst_cash, penalty
+
+
+def apply_mean_cash_cap_penalty(
+    score: float,
+    per_cash: list[float] | tuple[float, ...],
+    *,
+    coef: float,
+    cap: float,
+) -> tuple[float, float, float]:
+    """Penalize high *mean* multi-regime cash (anti cash-park).
+
+    Returns ``(adjusted_score, mean_cash, penalty)``. No-op when ``coef <= 0``
+    or ``cap >= 1``. Complements :func:`apply_worst_regime_cash_penalty`: 729
+    required cash on the stress slice but never capped calm-slice parking, so
+    ``defensive_sharpe`` + ``cash_daily_yield`` selected ~50–65% mean-cash
+    policies that went to ~94% cash OOS on W5 (Sharpe 4–6 from vol collapse,
+    −19pp excess vs equal-weight).
+    """
+    raw = float(score)
+    if coef <= 0.0 or cap >= 1.0 or not per_cash:
+        return raw, float("nan"), 0.0
+    mean_cash = float(np.mean(np.asarray(per_cash, dtype=np.float64)))
+    penalty = float(coef) * max(0.0, mean_cash - float(cap))
+    return raw - penalty, mean_cash, penalty
+
+
+def apply_max_dd_reject_penalty(
+    score: float,
+    max_dd_frac: float,
+    *,
+    threshold: float,
+    coef: float = 50.0,
+    hard: bool = True,
+) -> tuple[float, float, bool]:
+    """Apply max-DD gate to a selection score.
+
+    Returns ``(adjusted_score, penalty, over_threshold)``.
+
+    ``hard=True`` (legacy / parser default): score → ``-inf`` when
+    ``max_dd_frac > threshold`` (0 disables). W1_729 with threshold 0.10 hard-rejected
+    **every** post-gate eval (regime max DD ~18.6%), so no ``best_model.zip`` was
+    saved and post-train backtest skipped.
+
+    ``hard=False``: subtract ``coef * max(0, max_dd - threshold)`` so deep-DD
+    checkpoints still rank relative to each other and a best can be chosen.
+    """
+    raw = float(score)
+    thr = float(threshold)
+    if thr <= 0.0:
+        return raw, 0.0, False
+    dd = float(max(max_dd_frac, 0.0))
+    if dd <= thr:
+        return raw, 0.0, False
+    over = dd - thr
+    if hard:
+        return float("-inf"), float("inf"), True
+    penalty = float(max(coef, 0.0)) * over
+    return raw - penalty, penalty, True
 
 
 def apply_dd_exposure_taper(

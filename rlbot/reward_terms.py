@@ -17,18 +17,32 @@ def vol_penalty_from_returns(
     agent_rets: np.ndarray,
     benchmark_rets: np.ndarray,
     rwd: RewardConfig,
+    *,
+    gross_exposure: float = 1.0,
 ) -> tuple[float, float, float]:
     """Return (penalty, agent_downside_vol, benchmark_downside_vol).
 
-    Penalty is ``vol_penalty_scale * reward_scale
-    * max(agent_downside_vol - benchmark_downside_vol, 0)``.
+    ``vol_penalty_mode="excess"`` (legacy):
+      ``scale * reward_scale * max(agent_dv - bench_dv, 0)``
+      — dead when the agent is calmer than the equal-weight book (common under cash).
+
+    ``vol_penalty_mode="absolute"`` (cohort 729+):
+      ``scale * reward_scale * agent_dv * gross``
+      — taxes invested downside vol even when below the passive benchmark, so
+      risk-on books cannot hide behind a volatile EW sleeve.
     """
     if rwd.vol_penalty_scale <= 0.0:
         return 0.0, 0.0, 0.0
     agent_dv = downside_vol_from_returns(agent_rets, rwd.sortino_downside_floor)
     bench_dv = downside_vol_from_returns(benchmark_rets, rwd.sortino_downside_floor)
-    excess = max(agent_dv - bench_dv, 0.0)
-    return float(rwd.vol_penalty_scale * rwd.reward_scale * excess), agent_dv, bench_dv
+    mode = str(getattr(rwd, "vol_penalty_mode", "excess")).lower()
+    if mode == "absolute":
+        g = float(np.clip(gross_exposure, 0.0, 1.0))
+        pen = float(rwd.vol_penalty_scale * rwd.reward_scale * agent_dv * g)
+    else:
+        excess = max(agent_dv - bench_dv, 0.0)
+        pen = float(rwd.vol_penalty_scale * rwd.reward_scale * excess)
+    return pen, agent_dv, bench_dv
 
 
 def drawdown_amp_factor(dd_frac_pre: float, rwd: RewardConfig) -> float:
@@ -169,9 +183,11 @@ def drawdown_penalty_from_nav(
     """Return ``(penalty, dd_next, dd_increase, increase_term, level_term)``.
 
     ``increase_term`` is the fresh-expansion component (× ``reward_scale``);
-    ``level_term`` is the persistent underwater component (not × scale), optionally
-    scaled by gross exposure when ``drawdown_level_exposure_coupling > 0`` so that
-    de-risking to cash stops the ongoing level tax.
+    ``level_term`` is the persistent underwater component, optionally scaled by
+    gross exposure when ``drawdown_level_exposure_coupling > 0`` so that
+    de-risking to cash stops the ongoing level tax. When
+    ``drawdown_level_times_reward_scale`` is True, level also multiplies
+    ``reward_scale`` (731+); legacy snapshots keep raw units.
     """
     peak = max(float(peak_before), 1e-12)
     dd_next = max(0.0, (peak - float(v_next)) / peak)
@@ -179,6 +195,8 @@ def drawdown_penalty_from_nav(
     dd_excess = max(dd_next - float(rwd.drawdown_level_floor), 0.0)
     increase_term = float(dd_increase * rwd.reward_scale * rwd.drawdown_increase_penalty)
     level_raw = float(dd_excess * rwd.drawdown_level_penalty)
+    if bool(getattr(rwd, "drawdown_level_times_reward_scale", False)):
+        level_raw *= float(rwd.reward_scale)
     level_term = level_raw * drawdown_level_exposure_factor(
         gross_exposure, float(rwd.drawdown_level_exposure_coupling)
     )

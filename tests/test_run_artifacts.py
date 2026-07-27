@@ -10,6 +10,7 @@ from rlbot.run_artifacts import (
     _run_exists,
     new_run_id,
     persist_dirty_source_snapshot,
+    resolve_backtest_summary_path,
     write_manifest,
 )
 
@@ -43,6 +44,25 @@ def test_run_exists_when_run_dir_present(tmp_path: Path) -> None:
     (tmp_path / "Runs" / "W9").mkdir(parents=True)
     assert _run_exists("W9", tmp_path)
     assert not _run_exists("missing", tmp_path)
+
+
+def test_resolve_backtest_summary_prefers_best_then_fallbacks(tmp_path: Path) -> None:
+    rp = RunPaths(run_id="W1_729", root=tmp_path)
+    rp.mkdirs()
+    assert resolve_backtest_summary_path(rp) is None
+
+    latest = rp.run_meta_dir / "backtest_summary_latest.json"
+    latest.write_text('{"sharpe": 1.0}', encoding="utf-8")
+    assert resolve_backtest_summary_path(rp) == latest
+
+    final = rp.run_meta_dir / "backtest_summary_final.json"
+    final.write_text('{"sharpe": 1.1}', encoding="utf-8")
+    assert resolve_backtest_summary_path(rp) == final
+
+    best = rp.backtest_summary
+    best.write_text('{"sharpe": 1.9}', encoding="utf-8")
+    assert resolve_backtest_summary_path(rp) == best
+    assert resolve_backtest_summary_path("W1_729", root=tmp_path) == best
 
 
 def test_new_run_id_format_and_duplicates(tmp_path: Path) -> None:

@@ -13,6 +13,8 @@ from rlbot.eval_selection import (
     aggregate_eval_portfolio_diagnostics,
     annualized_sharpe,
     append_eval_diagnostics_jsonl,
+    apply_max_dd_reject_penalty,
+    apply_worst_regime_cash_penalty,
     compute_robust_eval_score,
     compute_stitched_eval_metrics,
     exposure_risk_penalty,
@@ -489,3 +491,78 @@ def test_compute_robust_eval_score_burn_in_changes_signal() -> None:
     assert np.isfinite(burned["score"])
     # Not required to differ for flat EW bench, but burn-in must not crash / go -inf.
     assert burned["score"] > float("-inf")
+
+
+def test_apply_worst_regime_cash_penalty_targets_highest_dd_slice() -> None:
+    score, worst_cash, pen = apply_worst_regime_cash_penalty(
+        1.0,
+        [0.02, 0.12, 0.05],
+        [0.50, 0.10, 0.40],
+        coef=3.0,
+        target=0.25,
+    )
+    assert worst_cash == pytest.approx(0.10)
+    assert pen == pytest.approx(3.0 * 0.15)
+    assert score == pytest.approx(1.0 - 3.0 * 0.15)
+
+    # Already at target on worst-DD slice → no penalty.
+    score2, _, pen2 = apply_worst_regime_cash_penalty(
+        1.0, [0.12], [0.30], coef=3.0, target=0.25
+    )
+    assert pen2 == pytest.approx(0.0)
+    assert score2 == pytest.approx(1.0)
+
+    # coef=0 disables.
+    score3, _, pen3 = apply_worst_regime_cash_penalty(
+        1.0, [0.12], [0.0], coef=0.0, target=0.25
+    )
+    assert pen3 == pytest.approx(0.0)
+    assert score3 == pytest.approx(1.0)
+
+
+def test_apply_mean_cash_cap_penalty_anti_park() -> None:
+    from rlbot.eval_selection import apply_mean_cash_cap_penalty
+
+    # W5_729-style mean cash ~0.60 above 0.45 cap.
+    score, mean_cash, pen = apply_mean_cash_cap_penalty(
+        1.0, [0.80, 0.50, 0.50, 0.60, 0.60], coef=4.0, cap=0.45
+    )
+    assert mean_cash == pytest.approx(0.60)
+    assert pen == pytest.approx(4.0 * 0.15)
+    assert score == pytest.approx(1.0 - 4.0 * 0.15)
+
+    score2, _, pen2 = apply_mean_cash_cap_penalty(
+        1.0, [0.40, 0.30], coef=4.0, cap=0.45
+    )
+    assert pen2 == pytest.approx(0.0)
+    assert score2 == pytest.approx(1.0)
+
+    score3, _, pen3 = apply_mean_cash_cap_penalty(
+        1.0, [0.90], coef=0.0, cap=0.45
+    )
+    assert pen3 == pytest.approx(0.0)
+    assert score3 == pytest.approx(1.0)
+
+
+def test_apply_max_dd_reject_penalty_hard_vs_soft() -> None:
+    hard_score, hard_pen, over = apply_max_dd_reject_penalty(
+        1.0, 0.186, threshold=0.10, coef=50.0, hard=True
+    )
+    assert over is True
+    assert hard_score == float("-inf")
+    assert hard_pen == float("inf")
+
+    soft_score, soft_pen, over2 = apply_max_dd_reject_penalty(
+        1.0, 0.186, threshold=0.10, coef=50.0, hard=False
+    )
+    assert over2 is True
+    assert soft_pen == pytest.approx(50.0 * 0.086)
+    assert soft_score == pytest.approx(1.0 - 50.0 * 0.086)
+    assert soft_score > float("-inf")
+
+    ok_score, ok_pen, over3 = apply_max_dd_reject_penalty(
+        1.0, 0.08, threshold=0.10, coef=50.0, hard=False
+    )
+    assert over3 is False
+    assert ok_pen == pytest.approx(0.0)
+    assert ok_score == pytest.approx(1.0)

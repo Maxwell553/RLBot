@@ -5,6 +5,7 @@ import { fetchRunDetail, fetchRuns } from '../lib/api'
 import { sampleRuns } from '../lib/demo-data'
 import { fmtDate, fmtNum, fmtPct, fmtSteps, statusLabel, statusTone } from '../lib/format'
 import type { ApiRun, ApiRunDetail, ApiRunsPage, DataState } from '../lib/types'
+import { useAutoRefresh } from '../lib/use-auto-refresh'
 import { cn } from '../lib/utils'
 
 const filters = ['All', 'Completed', 'In progress', 'Interrupted'] as const
@@ -200,6 +201,12 @@ export function RunsPage() {
     return () => controller.abort()
   }, [load])
 
+  const reload = useCallback(() => load(), [load])
+  useAutoRefresh(reload, {
+    enabled: runsState.kind === 'live' || runsState.kind === 'error',
+    refreshing,
+  })
+
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250)
     return () => window.clearTimeout(timer)
@@ -264,7 +271,7 @@ export function RunsPage() {
           </p>
           {runsState.kind === 'live' && refreshing && <p className="mt-2 text-[11px] text-ink/55">Refreshing runs…</p>}
           {runsState.kind === 'live' && refreshError && (
-            <button type="button" onClick={() => load()} className="mt-2 text-[11px] font-semibold text-amber-800">
+            <button type="button" onClick={reload} className="mt-2 text-[11px] font-semibold text-amber-800">
               Refresh failed: {refreshError}. Retry
             </button>
           )}
@@ -318,7 +325,7 @@ export function RunsPage() {
         {runsState.kind === 'loading' && (
           <div className="space-y-3 p-5">{Array.from({ length: 5 }).map((_, index) => <Skeleton key={index} className="h-16" />)}</div>
         )}
-        {runsState.kind === 'error' && <div className="p-5"><ErrorPanel message={runsState.message} onRetry={() => load()} /></div>}
+        {runsState.kind === 'error' && <div className="p-5"><ErrorPanel message={runsState.message} onRetry={reload} /></div>}
         {runsState.kind !== 'loading' && runsState.kind !== 'error' && runs.length === 0 && (
           <div className="p-5">
             <EmptyPanel

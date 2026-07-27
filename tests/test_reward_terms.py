@@ -33,6 +33,7 @@ def test_drawdown_penalty_increase_and_level() -> None:
         drawdown_level_penalty=3.0,
         drawdown_level_floor=0.08,
         drawdown_level_exposure_coupling=0.0,  # legacy uncoupled
+        drawdown_level_times_reward_scale=False,  # raw-unit level (pre-731)
     )
     pen, dd_next, dd_inc, inc_term, lvl_term = drawdown_penalty_from_nav(
         peak_before=100_000.0,
@@ -67,6 +68,7 @@ def test_drawdown_level_coupled_to_gross_exposure() -> None:
         drawdown_level_penalty=100.0,
         drawdown_level_floor=0.05,
         drawdown_level_exposure_coupling=1.0,
+        drawdown_level_times_reward_scale=False,  # raw-unit level (pre-731)
     )
     # 15% underwater, flat NAV → dd_excess = 0.10 → raw level = 10.
     kwargs = dict(
@@ -165,12 +167,18 @@ def test_participation_vix_relief_parse_and_validation() -> None:
 
     from rlbot.rl_config import _parse_config, _validate_reward_config
 
-    # Active config ships H1 stress relief on both channels.
-    assert get_config().reward.participation_vix_relief == pytest.approx(1.0)
-    assert get_config().reward.participation_drawdown_relief == pytest.approx(1.0)
-    assert get_config().reward.drawdown_level_exposure_coupling == pytest.approx(1.0)
+    # Active config omits inactivity/participation/concentration (parser default 0).
+    # Coupling stays partial (0.5) so invested-underwater still pays a level tax.
+    assert get_config().reward.participation_vix_relief == pytest.approx(0.0)
+    assert get_config().reward.participation_drawdown_relief == pytest.approx(0.0)
+    assert get_config().reward.inactivity_drawdown_relief == pytest.approx(0.0)
+    assert get_config().reward.inactivity_penalty_over_50 == pytest.approx(0.0)
+    assert get_config().reward.participation_bonus == pytest.approx(0.0)
+    assert get_config().reward.concentration_penalty == pytest.approx(1.25)
+    assert get_config().reward.drawdown_level_exposure_coupling == pytest.approx(0.5)
+    assert get_config().reward.drawdown_level_times_reward_scale is True
 
-    # Legacy run snapshots without the keys parse to 0 (uncoupled / no DD relief).
+    # Legacy run snapshots without the keys still parse to 0.
     raw = copy.deepcopy(get_config().raw)
     raw["reward"].pop("participation_vix_relief", None)
     raw["reward"].pop("participation_drawdown_relief", None)
@@ -182,6 +190,16 @@ def test_participation_vix_relief_parse_and_validation() -> None:
     assert parsed.reward.inactivity_drawdown_relief == 0.0
     assert parsed.reward.drawdown_level_exposure_coupling == 0.0
 
+    # Old snapshots that re-enable the knobs still load.
+    raw2 = copy.deepcopy(get_config().raw)
+    raw2["reward"]["participation_bonus"] = 0.01
+    raw2["reward"]["inactivity_penalty_over_50"] = 0.15
+    raw2["reward"]["concentration_penalty"] = 0.75
+    enabled = _parse_config(raw2, get_config().path)
+    assert enabled.reward.participation_bonus == pytest.approx(0.01)
+    assert enabled.reward.inactivity_penalty_over_50 == pytest.approx(0.15)
+    assert enabled.reward.concentration_penalty == pytest.approx(0.75)
+
     with pytest.raises(ValueError, match="participation_vix_relief"):
         _validate_reward_config(_reward_cfg(participation_vix_relief=-0.5))
     with pytest.raises(ValueError, match="drawdown_level_exposure_coupling"):
@@ -191,18 +209,63 @@ def test_participation_vix_relief_parse_and_validation() -> None:
 
 
 def test_drawdown_dominates_inactivity_at_config_scales() -> None:
-    """Dimensional check: underwater-and-invested DD level >> max calm inactivity."""
+    """Dimensional check: underwater-and-invested DD level >> any residual inactivity."""
     rwd = get_config().reward
     max_inactivity = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    dd_excess = 0.10  # 15% off peak with floor 0.05
+    # 10% underwater (floor 0 → dd_excess 0.10).
+    dd_excess = 0.10
+    level_coef = float(rwd.drawdown_level_penalty)
+    if bool(getattr(rwd, "drawdown_level_times_reward_scale", False)):
+        level_coef *= float(rwd.reward_scale)
     level_at_full_gross = (
         dd_excess
-        * rwd.drawdown_level_penalty
+        * level_coef
         * drawdown_level_exposure_factor(1.0, rwd.drawdown_level_exposure_coupling)
     )
-    assert max_inactivity == pytest.approx(0.20, rel=1e-6)
-    assert level_at_full_gross == pytest.approx(10.0, rel=1e-6)
-    assert level_at_full_gross > 20.0 * max_inactivity
+    # Inactivity stays off; level (× reward_scale in 731+) is the cash-vs-invested lever.
+    assert max_inactivity == pytest.approx(0.0, abs=1e-12)
+    assert level_at_full_gross > 1.0
+    # Material vs return-scale terms even with coupling < 1.
+    assert level_at_full_gross >= 0.4 * level_coef * dd_excess
+
+
+def test_drawdown_level_times_reward_scale_matches_increase_units() -> None:
+    """731 mode: level uses reward_scale so 10% DD @ full gross is O(10), not O(0.01)."""
+    rwd = _reward_cfg(
+        reward_scale=2000.0,
+        drawdown_increase_penalty=0.0,
+        drawdown_level_penalty=0.10,
+        drawdown_level_floor=0.0,
+        drawdown_level_exposure_coupling=0.0,
+        drawdown_level_times_reward_scale=True,
+    )
+    _, _, _, _, lvl = drawdown_penalty_from_nav(
+        peak_before=100_000.0,
+        v_pre=90_000.0,
+        v_next=90_000.0,
+        dd_frac_pre=0.10,
+        rwd=rwd,
+        gross_exposure=1.0,
+    )
+    assert lvl == pytest.approx(0.10 * 0.10 * 2000.0, rel=1e-6)  # 20.0
+
+    legacy = _reward_cfg(
+        reward_scale=2000.0,
+        drawdown_increase_penalty=0.0,
+        drawdown_level_penalty=160.0,
+        drawdown_level_floor=0.0,
+        drawdown_level_exposure_coupling=0.0,
+        drawdown_level_times_reward_scale=False,
+    )
+    _, _, _, _, lvl_legacy = drawdown_penalty_from_nav(
+        peak_before=100_000.0,
+        v_pre=90_000.0,
+        v_next=90_000.0,
+        dd_frac_pre=0.10,
+        rwd=legacy,
+        gross_exposure=1.0,
+    )
+    assert lvl_legacy == pytest.approx(16.0, rel=1e-6)
 
 
 def test_concentration_penalty_shortfall() -> None:
@@ -225,7 +288,11 @@ def test_downside_vol_uses_floor_on_no_losses() -> None:
 
 
 def test_vol_penalty_only_on_excess_downside_vol() -> None:
-    rwd = _reward_cfg(vol_penalty_scale=300.0, sortino_downside_floor=0.001)
+    rwd = _reward_cfg(
+        vol_penalty_scale=300.0,
+        vol_penalty_mode="excess",
+        sortino_downside_floor=0.001,
+    )
     agent = np.array([-0.02, -0.01, 0.01, 0.0], dtype=np.float64)
     bench = np.array([-0.01, -0.005, 0.01, 0.0], dtype=np.float64)
     agent_dv = downside_vol_from_returns(agent, rwd.sortino_downside_floor)
@@ -241,3 +308,28 @@ def test_vol_penalty_only_on_excess_downside_vol() -> None:
 
     pen_off, _, _ = vol_penalty_from_returns(agent, bench, _reward_cfg(vol_penalty_scale=0.0))
     assert pen_off == pytest.approx(0.0)
+
+
+def test_vol_penalty_absolute_taxes_invested_downside_vol() -> None:
+    """Absolute mode fires even when agent is calmer than the benchmark."""
+    rwd = _reward_cfg(
+        vol_penalty_scale=0.20,
+        vol_penalty_mode="absolute",
+        sortino_downside_floor=0.001,
+    )
+    agent = np.array([-0.005, 0.01, 0.0, 0.0], dtype=np.float64)
+    bench = np.array([-0.02, -0.01, 0.01, 0.0], dtype=np.float64)
+    agent_dv = downside_vol_from_returns(agent, rwd.sortino_downside_floor)
+    pen_full, _, _ = vol_penalty_from_returns(
+        agent, bench, rwd, gross_exposure=1.0
+    )
+    pen_cash, _, _ = vol_penalty_from_returns(
+        agent, bench, rwd, gross_exposure=0.0
+    )
+    pen_excess, _, _ = vol_penalty_from_returns(
+        agent, bench, _reward_cfg(vol_penalty_scale=0.20, vol_penalty_mode="excess")
+    )
+    assert pen_full == pytest.approx(0.20 * rwd.reward_scale * agent_dv)
+    assert pen_cash == pytest.approx(0.0)
+    assert pen_excess == pytest.approx(0.0)  # agent calmer than bench
+    assert pen_full > 0.0

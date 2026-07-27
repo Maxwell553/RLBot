@@ -127,6 +127,9 @@ from rlbot.eval_selection import (
     aggregate_eval_portfolio_diagnostics,
     aggregate_multi_regime_scores,
     append_eval_diagnostics_jsonl,
+    apply_max_dd_reject_penalty,
+    apply_mean_cash_cap_penalty,
+    apply_worst_regime_cash_penalty,
     blend_block_and_oos_aligned_scores,
     compute_robust_eval_score,
 )
@@ -279,6 +282,12 @@ class EvalNavBestModelCallback(EvalCallback):
         multi_regime_eval_agg: str = "p25",
         eval_score_burn_in_bars: int = 0,
         best_model_max_dd_reject: float = 0.0,
+        best_model_max_dd_reject_hard: bool = True,
+        best_model_max_dd_reject_coef: float = 50.0,
+        best_model_worst_regime_cash_coef: float = 0.0,
+        best_model_worst_regime_cash_target: float = 0.0,
+        best_model_mean_cash_coef: float = 0.0,
+        best_model_mean_cash_cap: float = 1.0,
         reward_decomp_callback: "RewardDecompCallback | None" = None,
         **kwargs,
     ):
@@ -295,6 +304,12 @@ class EvalNavBestModelCallback(EvalCallback):
         self.multi_regime_eval_agg = str(multi_regime_eval_agg).lower()
         self.eval_score_burn_in_bars = int(eval_score_burn_in_bars)
         self.best_model_max_dd_reject = float(best_model_max_dd_reject)
+        self.best_model_max_dd_reject_hard = bool(best_model_max_dd_reject_hard)
+        self.best_model_max_dd_reject_coef = float(best_model_max_dd_reject_coef)
+        self.best_model_worst_regime_cash_coef = float(best_model_worst_regime_cash_coef)
+        self.best_model_worst_regime_cash_target = float(best_model_worst_regime_cash_target)
+        self.best_model_mean_cash_coef = float(best_model_mean_cash_coef)
+        self.best_model_mean_cash_cap = float(best_model_mean_cash_cap)
         self._last_oos_aligned_max_dd = float("nan")
         self.score_std_coef = float(score_std_coef)
         self.score_dd_coef = float(score_dd_coef)
@@ -806,15 +821,30 @@ class EvalNavBestModelCallback(EvalCallback):
                 )
                 max_dd = float(max(per_max_dds)) if per_max_dds else 0.0
                 self._last_oos_aligned_max_dd = max_dd
-                rejected = (
-                    self.best_model_max_dd_reject > 0.0
-                    and max_dd > self.best_model_max_dd_reject
+                agg_score, worst_cash, cash_pen = apply_worst_regime_cash_penalty(
+                    agg_score,
+                    per_max_dds,
+                    cash_fracs,
+                    coef=self.best_model_worst_regime_cash_coef,
+                    target=self.best_model_worst_regime_cash_target,
                 )
-                if rejected:
-                    agg_score = float("-inf")
+                agg_score, mean_cash, mean_cash_pen = apply_mean_cash_cap_penalty(
+                    agg_score,
+                    cash_fracs,
+                    coef=self.best_model_mean_cash_coef,
+                    cap=self.best_model_mean_cash_cap,
+                )
+                agg_score, dd_pen, over_thr = apply_max_dd_reject_penalty(
+                    agg_score,
+                    max_dd,
+                    threshold=self.best_model_max_dd_reject,
+                    coef=self.best_model_max_dd_reject_coef,
+                    hard=self.best_model_max_dd_reject_hard,
+                )
+                rejected = bool(over_thr and self.best_model_max_dd_reject_hard)
                 self.logger.record("eval/oos_aligned_score", float(agg_score) if np.isfinite(agg_score) else -1e9)
                 self.logger.record("eval/oos_aligned_max_dd_frac", max_dd)
-                self.logger.record("eval/oos_aligned_dd_rejected", float(rejected))
+                self.logger.record("eval/oos_aligned_dd_rejected", float(over_thr))
                 self.logger.record(
                     "eval/oos_aligned_score_min", float(min(per_scores)) if per_scores else 0.0
                 )
@@ -826,6 +856,14 @@ class EvalNavBestModelCallback(EvalCallback):
                     self.logger.record(
                         "eval/oos_aligned_mean_cash_frac", float(np.mean(cash_fracs))
                     )
+                if np.isfinite(worst_cash):
+                    self.logger.record("eval/oos_aligned_worst_regime_cash", worst_cash)
+                if cash_pen > 0.0:
+                    self.logger.record("eval/oos_aligned_cash_penalty", cash_pen)
+                if mean_cash_pen > 0.0:
+                    self.logger.record("eval/oos_aligned_mean_cash_penalty", mean_cash_pen)
+                if over_thr and np.isfinite(dd_pen):
+                    self.logger.record("eval/oos_aligned_dd_penalty", float(dd_pen))
                 append_eval_diagnostics_jsonl(
                     self.eval_diagnostics_path,
                     {
@@ -834,8 +872,21 @@ class EvalNavBestModelCallback(EvalCallback):
                         "agg": self.multi_regime_eval_agg,
                         "per_regime_scores": per_scores,
                         "per_regime_max_dd": per_max_dds,
+                        "per_regime_cash": cash_fracs,
                         "max_dd_frac": max_dd,
-                        "dd_rejected": bool(rejected),
+                        "worst_regime_cash": (
+                            float(worst_cash) if np.isfinite(worst_cash) else None
+                        ),
+                        "cash_penalty": float(cash_pen),
+                        "mean_cash": (
+                            float(mean_cash) if np.isfinite(mean_cash) else None
+                        ),
+                        "mean_cash_penalty": float(mean_cash_pen),
+                        "dd_penalty": (
+                            float(dd_pen) if np.isfinite(dd_pen) else None
+                        ),
+                        "dd_rejected": bool(over_thr),
+                        "dd_reject_hard": bool(self.best_model_max_dd_reject_hard),
                         "dd_reject_threshold": float(self.best_model_max_dd_reject),
                         "score": float(agg_score) if np.isfinite(agg_score) else None,
                     },
@@ -853,11 +904,13 @@ class EvalNavBestModelCallback(EvalCallback):
             )
             max_dd = float(metrics.get("max_max_drawdown_frac", 0.0))
             self._last_oos_aligned_max_dd = max_dd
-            rejected = (
-                self.best_model_max_dd_reject > 0.0
-                and max_dd > self.best_model_max_dd_reject
+            score_out, dd_pen, over_thr = apply_max_dd_reject_penalty(
+                float(metrics["score"]),
+                max_dd,
+                threshold=self.best_model_max_dd_reject,
+                coef=self.best_model_max_dd_reject_coef,
+                hard=self.best_model_max_dd_reject_hard,
             )
-            score_out = float("-inf") if rejected else float(metrics["score"])
             # Log continuous-path portfolio diagnostics alongside block diagnostics.
             diag = aggregate_eval_portfolio_diagnostics(
                 episodes,
@@ -876,7 +929,9 @@ class EvalNavBestModelCallback(EvalCallback):
                     panel.get("mean_gross_exposure", 0.0),
                 )
             self.logger.record("eval/oos_aligned_max_dd_frac", max_dd)
-            self.logger.record("eval/oos_aligned_dd_rejected", float(rejected))
+            self.logger.record("eval/oos_aligned_dd_rejected", float(over_thr))
+            if over_thr and np.isfinite(dd_pen):
+                self.logger.record("eval/oos_aligned_dd_penalty", float(dd_pen))
             append_eval_diagnostics_jsonl(
                 self.eval_diagnostics_path,
                 {
@@ -885,8 +940,10 @@ class EvalNavBestModelCallback(EvalCallback):
                     "score": metrics,
                     "portfolio": panel,
                     "segments": diag.get("segments", []),
-                    "dd_rejected": bool(rejected),
+                    "dd_rejected": bool(over_thr),
+                    "dd_reject_hard": bool(self.best_model_max_dd_reject_hard),
                     "dd_reject_threshold": float(self.best_model_max_dd_reject),
+                    "dd_penalty": float(dd_pen) if np.isfinite(dd_pen) else None,
                 },
             )
             return float(score_out)
@@ -1408,8 +1465,22 @@ def _print_reward_decomp(paths: RunPaths) -> dict | None:
         "volatility",
         "exposure_risk",
     ]
-    keys = [k for k in preferred if k in mean] + [
-        k for k in sorted(mean) if k not in preferred
+    # Hide terms that are off in the active config (parser-default 0) so a 0.0%
+    # row is not mistaken for a live-but-weak signal.
+    rwd = get_config().reward
+    skip: set[str] = set()
+    if float(rwd.participation_bonus) <= 0.0:
+        skip.add("participation")
+    if float(rwd.inactivity_penalty_over_50) <= 0.0 and float(rwd.inactivity_penalty_over_90) <= 0.0:
+        skip.add("inactivity")
+    if float(rwd.concentration_penalty) <= 0.0:
+        skip.add("concentration")
+    if float(rwd.vol_penalty_scale) <= 0.0:
+        skip.add("volatility")
+    if float(rwd.exposure_risk_penalty_scale) <= 0.0:
+        skip.add("exposure_risk")
+    keys = [k for k in preferred if k in mean and k not in skip] + [
+        k for k in sorted(mean) if k not in preferred and k not in skip
     ]
     print(f"{'term':<22} {'mean':>10} {'abs_share':>10}")
     for k in keys:
@@ -1456,19 +1527,28 @@ def _run_post_train_backtest_and_report(
     decomp = _print_reward_decomp(paths)
 
     best_zip = paths.best_model_dir / "best_model.zip"
+    checkpoint = "best"
     if not best_zip.is_file():
+        final_zip = Path(paths.final_model)
+        if not final_zip.is_file():
+            print(
+                f"[train] Skipping post-backtest: missing {best_zip} "
+                "(no best checkpoint was saved)."
+            )
+            report = {
+                "run_id": run_id,
+                "backtest": None,
+                "reward_decomp": decomp,
+                "skipped_reason": "missing_best_model",
+            }
+            write_manifest(paths.run_meta_dir / "post_train_report.json", report)
+            return
+        checkpoint = "best"  # resolve via --allow-latest-checkpoint → final.zip
         print(
-            f"[train] Skipping post-backtest: missing {best_zip} "
-            "(no best checkpoint was saved)."
+            f"[train] No best_model.zip (selection never saved a best) — "
+            f"falling back to final weights via --allow-latest-checkpoint:\n"
+            f"  {final_zip}"
         )
-        report = {
-            "run_id": run_id,
-            "backtest": None,
-            "reward_decomp": decomp,
-            "skipped_reason": "missing_best_model",
-        }
-        write_manifest(paths.run_meta_dir / "post_train_report.json", report)
-        return
 
     cmd = [
         sys.executable,
@@ -1476,18 +1556,33 @@ def _run_post_train_backtest_and_report(
         "--run-id",
         run_id,
         "--checkpoint",
-        "best",
+        checkpoint,
+        "--allow-latest-checkpoint",
+        # Always write the canonical dashboard path so /ops picks it up even when
+        # falling back to final/latest weights (those would otherwise only write
+        # backtest_summary_{final,latest}.json).
+        "--summary-json",
+        str(paths.backtest_summary),
     ]
     if detailed:
         cmd.append("--detailed")
     print(f"[train] Running: {' '.join(cmd)}")
     proc = subprocess.run(cmd, cwd=str(ROOT))
-    summary_path = paths.run_dir / "backtest_summary.json"
+    summary_path = paths.backtest_summary
     summary = _load_json_if_exists(summary_path) if proc.returncode == 0 else None
     if proc.returncode != 0:
         print(f"[train] WARNING: post-backtest exited {proc.returncode}")
     elif summary is None:
-        print(f"[train] WARNING: post-backtest ok but missing {summary_path}")
+        from rlbot.run_artifacts import resolve_backtest_summary_path
+
+        alt = resolve_backtest_summary_path(paths)
+        if alt is not None:
+            summary = _load_json_if_exists(alt)
+            summary_path = alt
+        if summary is None:
+            print(f"[train] WARNING: post-backtest ok but missing {paths.backtest_summary}")
+        else:
+            _print_backtest_cash(summary)
     else:
         _print_backtest_cash(summary)
 
@@ -1497,6 +1592,8 @@ def _run_post_train_backtest_and_report(
 
     report = {
         "run_id": run_id,
+        "checkpoint": checkpoint,
+        "model_path": str(best_zip if best_zip.is_file() else paths.final_model),
         "backtest_summary_path": str(summary_path) if summary_path.is_file() else None,
         "backtest": {
             "total_return": summary.get("total_return"),
@@ -1509,6 +1606,9 @@ def _run_post_train_backtest_and_report(
         else None,
         "reward_decomp": decomp,
         "backtest_exit_code": int(proc.returncode),
+        "skipped_reason": (
+            "fallback_final_no_best" if not best_zip.is_file() else None
+        ),
     }
     write_manifest(paths.run_meta_dir / "post_train_report.json", report)
     print(f"[train] Wrote {paths.run_meta_dir / 'post_train_report.json'}")
@@ -2156,20 +2256,14 @@ def main() -> None:
         f"+ bench_excess*{cfg.reward.benchmark_excess_scale:g} "
         f"+ Sortino*{cfg.reward.risk_bonus_scale:g} "
         f"(combined abs cap {cfg.reward.benchmark_combined_abs_cap:g}) "
-        f"+ participation*{cfg.reward.participation_bonus:g}*{cfg.reward.participation_reward_scale:g} "
-        f"- inactivity - drawdown_penalty(inc={cfg.reward.drawdown_increase_penalty:g}, "
+        f"- drawdown_penalty(inc={cfg.reward.drawdown_increase_penalty:g}, "
         f"lvl={cfg.reward.drawdown_level_penalty:g}@{cfg.reward.drawdown_level_floor:.0%}) "
-        f"- concentration({cfg.reward.concentration_penalty:g}→{cfg.reward.concentration_target_eff_assets:g} eff) "
         f"- exposure_risk({cfg.reward.exposure_risk_mode}, scale={cfg.reward.exposure_risk_penalty_scale:g}) "
-        f"- vol_penalty(scale={cfg.reward.vol_penalty_scale:g}) "
+        f"- vol_penalty({cfg.reward.vol_penalty_mode}, scale={cfg.reward.vol_penalty_scale:g}) "
         f"- tx_cost*{cfg.reward.churn_penalty:g}*{cfg.reward.reward_scale:g} "
         f"- turnover*{cfg.reward.turnover_penalty:g}*{cfg.reward.reward_scale:g} "
         f"(both × curriculum_churn_scale×VIX) "
         f"| cash_yield={cfg.reward.cash_daily_yield:g}/day"
-    )
-    print(
-        f"  eval inactivity scale: {cfg.reward.eval_inactivity_penalty_scale} "
-        f"(train=1.0)"
     )
     print(
         f"  eval selection ({cfg.training.best_model_benchmark}): "
@@ -2572,6 +2666,24 @@ def main() -> None:
         multi_regime_eval_agg=str(getattr(tr_cfg, "multi_regime_eval_agg", "p25")),
         eval_score_burn_in_bars=int(tr_cfg.eval_score_burn_in_bars),
         best_model_max_dd_reject=float(getattr(tr_cfg, "best_model_max_dd_reject", 0.0)),
+        best_model_max_dd_reject_hard=bool(
+            getattr(tr_cfg, "best_model_max_dd_reject_hard", True)
+        ),
+        best_model_max_dd_reject_coef=float(
+            getattr(tr_cfg, "best_model_max_dd_reject_coef", 50.0)
+        ),
+        best_model_worst_regime_cash_coef=float(
+            getattr(tr_cfg, "best_model_worst_regime_cash_coef", 0.0)
+        ),
+        best_model_worst_regime_cash_target=float(
+            getattr(tr_cfg, "best_model_worst_regime_cash_target", 0.0)
+        ),
+        best_model_mean_cash_coef=float(
+            getattr(tr_cfg, "best_model_mean_cash_coef", 0.0)
+        ),
+        best_model_mean_cash_cap=float(
+            getattr(tr_cfg, "best_model_mean_cash_cap", 1.0)
+        ),
         log_path=str(paths.eval_log_dir),
         n_eval_episodes=n_validation_blocks,
         deterministic=True,

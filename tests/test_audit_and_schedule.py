@@ -46,8 +46,9 @@ def test_curriculum_preflight_default_early_stop_reachable() -> None:
     # span 0.25 × 50M = 12.5M → full DR at 35M, 15M settled residual.
     assert pf.dr_widen_end == 35_000_000
     assert pf.stationary_full_dr_steps == 15_000_000
-    assert pf.early_stop_patience == 12
-    assert pf.early_stop_reachable is True
+    # Cohort 729+: early stop off (full 50M budget); patience=0 → not "reachable".
+    assert pf.early_stop_patience == 0
+    assert pf.early_stop_reachable is False
     assert not any("early_stop" in w for w in pf.warnings)
     # Phase-aware LR: full LR through DR widening, decayed after.
     assert pf.lr_schedule == "phase_aware"
@@ -62,8 +63,10 @@ def test_curriculum_preflight_long_dr_makes_early_stop_unreachable() -> None:
     cfg = load_config()
     from dataclasses import replace
 
+    # Force patience on so the unreachable warning path is exercised.
+    tr = replace(cfg.training, early_stop_patience=12)
     cur = replace(cfg.curriculum, dr_widen_span_fraction=0.65)
-    cfg2 = replace(cfg, curriculum=cur)
+    cfg2 = replace(cfg, training=tr, curriculum=cur)
     pf = build_curriculum_preflight(cfg2, budget=50_000_000)
     assert pf.dr_widen_end == pf.budget
     assert pf.stationary_full_dr_steps == 0

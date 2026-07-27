@@ -466,10 +466,14 @@ def test_rebalance_tx_cost_scales_with_fee_scale() -> None:
 
 
 def test_inactivity_penalty_bounded_at_full_cash() -> None:
-    """100% cash inactivity penalty matches config (over_50 + over_90 tail)."""
+    """100% cash inactivity penalty matches config (over_50 + over_90 tail).
+
+    Cohort 729 zeros inactivity so cash is not taxed while learning to de-risk;
+    the identity still holds (expected == sum of the two knobs).
+    """
     rwd = get_config().reward
     expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    assert expected == pytest.approx(0.20, rel=1e-6)
+    assert expected == pytest.approx(0.0, abs=1e-12)
 
 
 def test_turnover_penalty_ramps_with_churn_curriculum() -> None:
@@ -614,6 +618,11 @@ def test_drawdown_penalty_logged_on_level_and_increase() -> None:
     expected_level = (
         max(dd_frac_pre - rwd.drawdown_level_floor, 0.0)
         * rwd.drawdown_level_penalty
+        * (
+            float(rwd.reward_scale)
+            if bool(getattr(rwd, "drawdown_level_times_reward_scale", False))
+            else 1.0
+        )
         * drawdown_level_exposure_factor(gross, rwd.drawdown_level_exposure_coupling)
     )
     assert info.get("rew_decomp/drawdown_level", 0.0) == pytest.approx(
@@ -629,38 +638,53 @@ def test_drawdown_penalty_logged_on_level_and_increase() -> None:
         )
     else:
         assert gross > 0.5
-    # Own-DD relief should waive participation/inactivity shaping once deep underwater.
-    assert info.get("rew_decomp/inactivity_stress_mult", 1.0) == pytest.approx(0.0, abs=1e-9)
-    assert info.get("rew_decomp/participation_stress_mult", 1.0) == pytest.approx(0.0, abs=1e-9)
+    # Own-DD / VIX relief knobs are omitted from active config (mult stays 1.0).
+    assert info.get("rew_decomp/inactivity_stress_mult", 1.0) == pytest.approx(1.0, abs=1e-9)
+    assert info.get("rew_decomp/participation_stress_mult", 1.0) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_concentration_penalty_on_single_asset_book() -> None:
-    """Highly concentrated risky sleeve triggers concentration penalty in info."""
+    """Highly concentrated risky sleeve triggers concentration penalty when enabled."""
+    from dataclasses import replace
+
+    from rlbot.rl_config import get_config, set_config
+
     n_assets = _N_ASSETS
     t = 80
     ohlcv, rsi, macd, fracdiff, fracdiff_macro, trend, macro = _synthetic_panel(t, n_assets)
-    env = MultiAssetPortfolioEnv(
-        ohlcv,
-        rsi,
-        macd,
-        macro=macro,
-        fracdiff=fracdiff,
-        fracdiff_macro=fracdiff_macro,
-        trend=trend,
-        random_start=False,
-        domain_randomize=False,
-        max_episode_steps=30,
-        fee_scale_default=0.0,
+    base = get_config()
+    patched = replace(
+        base,
+        reward=replace(
+            base.reward,
+            concentration_penalty=0.75,
+            concentration_target_eff_assets=6.0,
+        ),
     )
-    env.reset()
-    action = np.zeros(env.n_actions)
-    action[1] = 50.0
-    _, _, _, _, info = env.step(action)
-    conc = info.get("rew_decomp/concentration", 0.0)
-    assert conc < -1e-6
-    assert info.get("rew_decomp/effective_n_assets", 99.0) < float(
-        get_config().reward.concentration_target_eff_assets
-    )
+    set_config(patched)
+    try:
+        env = MultiAssetPortfolioEnv(
+            ohlcv,
+            rsi,
+            macd,
+            macro=macro,
+            fracdiff=fracdiff,
+            fracdiff_macro=fracdiff_macro,
+            trend=trend,
+            random_start=False,
+            domain_randomize=False,
+            max_episode_steps=30,
+            fee_scale_default=0.0,
+        )
+        env.reset()
+        action = np.zeros(env.n_actions)
+        action[1] = 50.0
+        _, _, _, _, info = env.step(action)
+        conc = info.get("rew_decomp/concentration", 0.0)
+        assert conc < -1e-6
+        assert info.get("rew_decomp/effective_n_assets", 99.0) < 6.0
+    finally:
+        set_config(base)
 
 
 def test_benchmark_combined_abs_cap_scales_proportionally() -> None:

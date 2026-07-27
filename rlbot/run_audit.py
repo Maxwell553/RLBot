@@ -19,7 +19,7 @@ import yaml
 from rlbot.cohort_labels import label_run
 from rlbot.curriculum_preflight import build_curriculum_preflight, dr_widen_end_for_budget
 from rlbot.rl_config import load_config, trade_curriculum_milestones
-from rlbot.run_artifacts import PROJECT_ROOT, RunPaths, read_run_manifest
+from rlbot.run_artifacts import PROJECT_ROOT, RunPaths, read_run_manifest, resolve_backtest_summary_path
 
 _RUN_DIR_RE = re.compile(r"^W\d+_\d+")
 
@@ -240,7 +240,10 @@ def audit_run(run_id: str, *, root: Path = PROJECT_ROOT) -> RunAuditRecord:
     except Exception as exc:  # noqa: BLE001 — audit must not crash on one bad config
         rec.warnings.append(f"curriculum_preflight_failed: {exc}")
 
-    bt = _load_json(paths.run_meta_dir / "backtest_summary.json")
+    # Prefer canonical best summary; fall back to final/latest so dashboards still
+    # show OOS when post-train / manual backtests did not write best_model metrics.
+    resolved = resolve_backtest_summary_path(paths)
+    bt = _load_json(resolved) if resolved is not None else None
     if bt:
         rec.oos_return = bt.get("total_return")
         rec.oos_sharpe = bt.get("sharpe")

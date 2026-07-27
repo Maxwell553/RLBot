@@ -63,22 +63,19 @@ Edit `universe.assets` and all per-asset lists (length **N**, same order), refre
 | `benchmark_cap_weights` | Passive book used by reward benchmark excess and Sortino diff (default equal 1/N; feasible under the 20% asset cap) |
 | `benchmark_excess_scale` / `benchmark_excess_clip` | Per-step excess return vs the friction-aware passive book above |
 | `benchmark_combined_abs_cap` | Constant cap on combined \|sortino+benchmark\| per step in reward units (default **24.0**; `0` disables both; never relative to the other terms) |
-| `inactivity_penalty_over_50` / `over_90` | Linear cash penalty (default **0.15 + 0.05** tail above 90% cash; max ~0.20 at 100% cash — kept well below underwater DD level) |
-| `inactivity_vix_relief` | VIX-conditional relief on the inactivity penalty: multiplier `1 - clip((VIX/18 - 1) × relief, 0, 1)` (default **1.0** — half penalty at VIX 27, none at VIX ≥ 36; parser default 0 preserves old snapshots) |
-| `inactivity_drawdown_relief` / `inactivity_drawdown_relief_span` | Own-NAV-drawdown relief on inactivity: `1 - clip((dd − floor) / span, 0, 1) × relief` (defaults **1.0** / **0.10** → full waiver by dd ≥ floor+10%; parser default relief 0 preserves old snapshots). Combined with VIX relief by most-relief-wins |
-| `participation_vix_relief` / `participation_drawdown_relief` | Same stress-relief combine applied to the participation bonus (defaults **1.0** / **1.0**; parser defaults 0). With reliefs on, cash-vs-invested shaping goes neutral in VIX stress *or* once the agent is underwater |
-| `participation_bonus` / `participation_reward_scale` | Gross-exposure bonus (default **0.01 × 10** = +0.10/step at full gross) |
 | `turnover_penalty` | Direct `turnover_frac × turnover_penalty × reward_scale × VIX_mult × curriculum_churn_scale` (default **0.007**; ramps with churn, off during fee-free) |
-| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **100.0** for realized vol — the published-grid optimum, see [docs/RESEARCH.md](../docs/RESEARCH.md) — use **~1–3** if switching to `vix_positive`) |
-| `vol_penalty_scale` | Penalize excess downside vol vs the passive benchmark: `scale × reward_scale × max(agent_downside_vol − benchmark_downside_vol, 0)` over the Sortino window (default **0.15**; multiplied by `reward_scale`, so keep it small; `0` disables) |
+| `exposure_risk_mode` / `exposure_risk_penalty_scale` | Cut gross exposure in high-vol regimes (`realized_vol` or `vix_positive`; default scale **5.0** for `vix_positive`) |
+| `vol_penalty_mode` / `vol_penalty_scale` | `absolute` taxes agent downside vol; `excess` taxes only vs the passive book (default mode **absolute**, scale **0.60**; `0` scale disables) |
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
 | `drawdown_amp_max` | Cap on the `(1 + gamma × dd)` amplification factor (default **4.0**, saturates at dd = 25%; `0` = uncapped legacy behavior). Bounds worst-day reward outliers so VecNormalize clipping keeps gradient on bad days |
-| `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor (defaults **1.0**, **100.0**, **0.05**). Note: the increase term is × `reward_scale`, the level term is **not** — level coefficients ≤ ~10 are invisible next to the return term (the 721 no-op) |
-| `drawdown_level_exposure_coupling` | Scale level term by gross exposure: `level × ((1−c) + c×gross)` (default **1.0** → cash zeros the persistent level tax; parser default 0 = legacy uncoupled level) |
-| `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (defaults 0.75, 6.0 effective assets) |
-| `cash_daily_yield` | Risk-free accrual on cash before MTM (default **0.00015**/day ≈ 3.8% ann.; `0` disables; parser default 0 preserves old snapshots) |
+| `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor |
+| `drawdown_level_times_reward_scale` | When **true** (731+), level multiplies `reward_scale` like the increase term (default **true** with penalty **0.10**; parser default false preserves old raw-unit snapshots where level was ~0.4% abs_share) |
+| `drawdown_level_exposure_coupling` | Scale level term by gross exposure: `level × ((1−c) + c×gross)` (default **0.5**; parser default 0 = legacy uncoupled level) |
+| `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (default **1.25** → **5.5** eff assets; parser default penalty 0) |
+| `cash_daily_yield` | Risk-free accrual on cash before MTM (default **0.00012**/day ≈ 3.0% ann.; `0` disables; parser default 0 preserves old snapshots) |
 | `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 4.0) |
-| `eval_inactivity_penalty_scale` | Eval env inactivity scale (default 1.0) |
+
+Omitted from the active config (parser default **0**, still loadable from old `Runs/*/config.yaml`): `inactivity_penalty_*`, `participation_*`, and their VIX/drawdown relief knobs.
 
 ## `environment` (selected)
 
