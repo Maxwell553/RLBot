@@ -273,9 +273,13 @@ export function RunsPage() {
         : { kind: 'loading' }
     ))
     fetchRuns({ search: debouncedSearch, status, offset, limit: PAGE_SIZE }, signal).then((next) => {
-      if (signal?.aborted || requestId !== requestIdRef.current) return
+      // Superseded by a newer load — that request owns refreshing / UI state.
+      if (requestId !== requestIdRef.current) return
       setRefreshing(false)
-      if (next.kind === 'loading') return
+      // Abort/cancellation surfaces as kind:'loading' from toState; do not freeze
+      // the page in a permanent skeleton — keep prior live data or stay loading
+      // only until the next non-aborted response arrives.
+      if (signal?.aborted || next.kind === 'loading') return
       if (next.kind === 'error') {
         setRefreshError(next.message)
         setRunsState((current) => (

@@ -232,22 +232,27 @@ export type ApiForwardMark = {
     model: number[]
     spy: number[]
     equal_weight: number[]
+    /** Optional companion RL deploy (LIVE_MODEL) alongside FINALMODEL. */
+    live_model?: number[]
   }
   candles?: {
     model: ApiForwardCandle[]
     spy: ApiForwardCandle[]
     equal_weight: ApiForwardCandle[]
+    live_model?: ApiForwardCandle[]
   } | null
   stats: {
     model: ApiForwardStats
     spy: ApiForwardStats
     equal_weight: ApiForwardStats
+    live_model?: ApiForwardStats
   }
   latest_weights: Record<string, number> | null
   weights: Record<string, number>[] | null
   asset_labels: string[]
   positions?: ApiForwardPosition[] | null
   live?: ApiForwardLiveMeta | null
+  companion_run_id?: string | null
   note?: string
 }
 

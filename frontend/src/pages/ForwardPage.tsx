@@ -13,7 +13,8 @@ import type {
 import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 const SERIES = [
-  { key: 'model' as const, label: 'Model (best)', color: '#1f3d34' },
+  { key: 'model' as const, label: 'AlgorithmicModel', color: '#0b6e4f' },
+  { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
   { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#b0892e' },
   { key: 'spy' as const, label: 'S&P (SPY)', color: '#c45c3e' },
 ]
@@ -154,23 +155,17 @@ function windowStats(navs: number[] | undefined, barsPerYear: number, stamps?: s
   }
 }
 
-function rebaseCandles(rows: ApiForwardCandle[], scale: number): ApiForwardCandle[] {
-  return rows.map((r) => ({
-    t: r.t,
-    o: r.o * scale,
-    h: r.h * scale,
-    l: r.l * scale,
-    c: r.c * scale,
-  }))
-}
-
 function markTimestamps(mark: ApiForwardMark): string[] {
   if (mark.timestamps?.length) return mark.timestamps
   if (mark.candles?.model?.length) return mark.candles.model.map((c) => c.t)
   return Array.isArray(mark.dates) ? mark.dates : []
 }
 
-/** Slice mark to the selected lookback and rebase to initial_cash at window start. */
+/**
+ * Slice mark to the selected lookback without rebasing.
+ * Absolute NAV levels stay identical across ranges (same last bar → same NAV);
+ * Return / Max DD / Sharpe are still computed on the visible window only.
+ */
 function sliceMark(mark: ApiForwardMark, range: RangeId): {
   mark: ApiForwardMark
   clipped: boolean
@@ -188,27 +183,20 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
   const n = stamps.length - i0
   const barsPerYear = mark.bar_interval === '5m' || mark.bar_interval === '30m' ? BARS_PER_YEAR_5M : 252
 
-  const sliceNav = (vals: number[] | undefined) => {
-    const raw = (vals ?? []).slice(i0)
-    if (!raw.length) return []
-    const scale = mark.initial_cash / Math.max(raw[0], 1e-12)
-    return raw.map((v) => v * scale)
-  }
+  const sliceNav = (vals: number[] | undefined) => (vals ?? []).slice(i0)
 
-  const sliceCandleSeries = (rows: ApiForwardCandle[] | undefined) => {
-    if (!rows?.length) return []
-    const raw = rows.slice(i0)
-    if (!raw.length) return []
-    const scale = mark.initial_cash / Math.max(raw[0].o, 1e-12)
-    return rebaseCandles(raw, scale)
-  }
+  const sliceCandleSeries = (rows: ApiForwardCandle[] | undefined) =>
+    rows?.length ? rows.slice(i0) : []
 
   const modelCandles = sliceCandleSeries(mark.candles?.model)
+  const liveCandles = sliceCandleSeries(mark.candles?.live_model)
   const spyCandles = sliceCandleSeries(mark.candles?.spy)
   const ewCandles = sliceCandleSeries(mark.candles?.equal_weight)
 
   const model =
     modelCandles.length > 0 ? modelCandles.map((c) => c.c) : sliceNav(mark.nav?.model)
+  const live_model =
+    liveCandles.length > 0 ? liveCandles.map((c) => c.c) : sliceNav(mark.nav?.live_model)
   const spy = spyCandles.length > 0 ? spyCandles.map((c) => c.c) : sliceNav(mark.nav?.spy)
   const equal_weight =
     ewCandles.length > 0 ? ewCandles.map((c) => c.c) : sliceNav(mark.nav?.equal_weight)
@@ -219,19 +207,23 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
     n_bars: n,
     dates: windowStamps,
     timestamps: windowStamps,
-    nav: { model, spy, equal_weight },
+    nav: { model, spy, equal_weight, ...(live_model.length ? { live_model } : {}) },
     candles:
-      modelCandles.length || spyCandles.length || ewCandles.length
+      modelCandles.length || spyCandles.length || ewCandles.length || liveCandles.length
         ? {
             model: modelCandles,
             spy: spyCandles,
             equal_weight: ewCandles,
+            ...(liveCandles.length ? { live_model: liveCandles } : {}),
           }
         : mark.candles,
     stats: {
       model: windowStats(model, barsPerYear, windowStamps),
       spy: windowStats(spy, barsPerYear, windowStamps),
       equal_weight: windowStats(equal_weight, barsPerYear, windowStamps),
+      ...(live_model.length
+        ? { live_model: windowStats(live_model, barsPerYear, windowStamps) }
+        : {}),
     },
     weights: mark.weights ? mark.weights.slice(i0) : mark.weights,
   }
@@ -337,6 +329,7 @@ type HoverPoint = {
   index: number
   date: string
   model: number | null
+  live_model: number | null
   equal_weight: number | null
   spy: number | null
 }
@@ -417,6 +410,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       index: idx,
       date: plot.stamps[idx] ?? `bar ${idx + 1}`,
       model: at('model'),
+      live_model: at('live_model'),
       equal_weight: at('equal_weight'),
       spy: at('spy'),
     })
@@ -580,7 +574,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
         <div className="pointer-events-none absolute right-3 top-3 min-w-[11rem] rounded-xl border border-line bg-paper/95 px-3 py-2 shadow-[var(--shadow-card)] backdrop-blur-sm">
           <p className="font-mono text-[10px] text-ink/55">{shortDate(hover.date)}</p>
           <dl className="mt-1.5 space-y-1 text-[11px]">
-            {SERIES.map((s) => (
+            {SERIES.filter((s) => hover[s.key] != null).map((s) => (
               <div key={s.key} className="flex items-center justify-between gap-4">
                 <dt className="inline-flex items-center gap-1.5 text-ink/65">
                   <span className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} aria-hidden="true" />
@@ -594,7 +588,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       )}
 
       <div className="mt-3 flex flex-wrap gap-4 text-[11px]">
-        {SERIES.map((s) => (
+        {plot.series.map((s) => (
           <span key={s.key} className="inline-flex items-center gap-2 text-ink/70">
             <span className="h-2 w-4 rounded-sm" style={{ backgroundColor: s.color }} aria-hidden="true" />
             {s.label}
@@ -857,8 +851,8 @@ export function ForwardPage() {
           <p className="font-mono text-[11px] uppercase tracking-[.2em] text-ink/55">Forward test</p>
           <h1 className="mt-2 font-display text-3xl text-ink">Live book vs benchmarks</h1>
           <p className="mt-2 max-w-2xl text-sm text-ink/60">
-            Five-minute NAV marks from the live book vs equal-weight and SPY. Prices refresh about
-            every 5 minutes.
+            Five-minute NAV marks from the live paper book (FINALMODEL PIT momentum or a LIVE_*
+            RL deploy) vs equal-weight and SPY. Prices refresh about every 5 minutes.
           </p>
           {state.kind === 'live' && refreshing && (
             <p className="mt-2 text-[11px] text-ink/55">Refreshing forward mark…</p>
@@ -889,10 +883,12 @@ export function ForwardPage() {
           <Badge tone="warning">No forward mark</Badge>
           <p className="mt-3 text-sm text-ink/70">{emptyMessage}</p>
           <pre className="mt-4 overflow-x-auto rounded-xl bg-ink/[.04] p-4 text-[11px] leading-5 text-ink/80">
-{`# Export / refresh the live NAV series (also runs via daily launchd)
-python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data
-# or the full daily loop:
-bash scripts/daily_live_forward.sh --run-id LIVE_MODEL`}
+{`# Locked PIT momentum paper book (shows stock holdings on this page)
+python scripts/paper_pit_momentum.py run-day --refresh-data
+# or: bash scripts/daily_paper_pit_momentum.sh
+
+# Legacy RL LIVE deploy mark:
+python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data`}
           </pre>
         </Card>
       )}
@@ -934,7 +930,7 @@ bash scripts/daily_live_forward.sh --run-id LIVE_MODEL`}
                     return (
                       <>
                         Window {stamps[0] ?? '—'} → {stamps[stamps.length - 1] ?? '—'} ·{' '}
-                        {view.n_bars} bar{view.n_bars === 1 ? '' : 's'} · NAVs rebased at window start
+                        {view.n_bars} bar{view.n_bars === 1 ? '' : 's'} · absolute NAV (same across ranges)
                         {(mark.bar_interval === '5m' || mark.bar_interval === '30m')
                           ? ' · Sharpe hidden until ~1 month of daily closes'
                           : ''}
@@ -947,7 +943,7 @@ bash scripts/daily_live_forward.sh --run-id LIVE_MODEL`}
               {mark.note ? <p className="mt-4 text-[10px] leading-4 text-ink/50">{mark.note}</p> : null}
             </Card>
             <div className="space-y-4">
-              {SERIES.map((s) => (
+              {SERIES.filter((s) => (view.nav?.[s.key]?.length ?? 0) > 0).map((s) => (
                 <StatsCard
                   key={s.key}
                   title={s.label}

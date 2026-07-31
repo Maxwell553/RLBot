@@ -30,14 +30,6 @@ export default defineConfig({
       'framer-motion',
       'lucide-react',
       'yaml',
-      '@fontsource/manrope/400.css',
-      '@fontsource/manrope/500.css',
-      '@fontsource/manrope/600.css',
-      '@fontsource/manrope/700.css',
-      '@fontsource/newsreader/400.css',
-      '@fontsource/newsreader/500.css',
-      '@fontsource/dm-mono/400.css',
-      '@fontsource/dm-mono/500.css',
     ],
   },
   server: {
@@ -79,11 +71,15 @@ export default defineConfig({
       },
     },
     fs: {
+      // macOS resolves /tmp → /private/tmp; allow both so @fontsource woff2 loads
+      // when frontend/node_modules is symlinked to the /tmp install.
       allow: [
         frontendDir,
         path.resolve(frontendDir, '..'),
         '/tmp/markettrainer-frontend',
+        '/private/tmp/markettrainer-frontend',
         '/tmp/markettrainer-vite-cache',
+        '/private/tmp/markettrainer-vite-cache',
       ],
       deny: ['**/Runs/**', '**/.venv/**', '**/execution/logs/**'],
     },

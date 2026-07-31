@@ -41,25 +41,30 @@ async function loadJson<T>(relPath: string, signal?: AbortSignal): Promise<T> {
   const now = Date.now()
   const hit = memory.get(key) as CacheEntry<T> | undefined
   if (hit && hit.data !== undefined && now - hit.at < MEMORY_TTL_MS && !hit.promise) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     return hit.data
   }
-  if (hit?.promise) {
-    return hit.promise
+
+  // Shared in-flight fetch must NOT be tied to any one caller's AbortSignal —
+  // React Strict Mode / tab changes abort the first subscriber and would cancel
+  // the download for everyone waiting on the same promise (Runs "All" stuck loading).
+  let promise = hit?.promise
+  if (!promise) {
+    promise = (async () => {
+      const url = `${DATA_BASE}/${relPath}?v=${Math.floor(now / MEMORY_TTL_MS)}`
+      const response = await fetch(url, { cache: 'no-cache' })
+      if (!response.ok) {
+        throw new Error(`Static data HTTP ${response.status} for /data/${relPath}`)
+      }
+      return (await response.json()) as T
+    })()
+    memory.set(key, { at: now, data: hit?.data as T, promise })
   }
 
-  const promise = (async () => {
-    const url = `${DATA_BASE}/${relPath}?v=${Math.floor(now / MEMORY_TTL_MS)}`
-    const response = await fetch(url, { signal, cache: 'no-cache' })
-    if (!response.ok) {
-      throw new Error(`Static data HTTP ${response.status} for /data/${relPath}`)
-    }
-    return (await response.json()) as T
-  })()
-
-  memory.set(key, { at: now, data: hit?.data as T, promise })
   try {
     const data = await promise
     memory.set(key, { at: Date.now(), data })
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     return data
   } catch (error) {
     const current = memory.get(key)

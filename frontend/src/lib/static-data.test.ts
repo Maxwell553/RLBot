@@ -78,4 +78,63 @@ describe('loadStaticRuns', () => {
     expect(page.runs[0].labels).toEqual([])
     expect(page.counts.all).toBe(2)
   })
+
+  it('does not cancel a shared in-flight snapshot when the first subscriber aborts', async () => {
+    let resolveFetch: ((value: unknown) => void) | undefined
+    const fetchMock = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve
+        }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const controller = new AbortController()
+    const first = loadStaticRuns({ status: 'completed', limit: 10 }, controller.signal)
+    const second = loadStaticRuns({ status: 'completed', limit: 10 })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    controller.abort()
+
+    resolveFetch?.({
+      ok: true,
+      json: async () => ({
+        runs: [
+          {
+            run_id: 'W1_804',
+            window: 'W1',
+            training_status: 'completed',
+            progress_pct: 100,
+            elapsed_timesteps: 1,
+            nominal_timesteps: 1,
+            best_eval_step: null,
+            best_eval_score: null,
+            curriculum_stage_at_best: null,
+            early_stop_reason: null,
+            started_at_utc: null,
+            finished_at_utc: null,
+            oos_sharpe: 1,
+            oos_deflated_sharpe: null,
+            oos_return: 0.1,
+            oos_max_drawdown: -0.1,
+            ew_excess_return: null,
+            has_backtest: true,
+            labels: [],
+            warnings: [],
+            comparable: true,
+            git_dirty: null,
+          },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 1,
+        counts: { all: 1, completed: 1, active: 0, interrupted: 0, with_backtest: 1 },
+      }),
+    })
+
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' })
+    const page = await second
+    expect(page.runs[0]?.run_id).toBe('W1_804')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 })
