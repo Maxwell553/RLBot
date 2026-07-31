@@ -1,0 +1,51 @@
+strategy: cash_long_only_cross_sectional_momentum_dd
+uses_margin: false
+allows_shorts: false
+long_only: true
+universe: static_sp500_from_universe_1000
+base_params:
+  top_n: 20
+  lookback: 189
+  crash_mode: spy_ma200
+  skip: 21
+  exec_lag: 1
+  exec_lag_days: 1
+risk_overlay:
+  kind: vol_then_blend
+  vol_target: 0.19
+  vol_lookback: 63
+  blend_weight: 0.88
+metrics:
+  train:
+    total_return: 1.9204331887588553
+    cagr: 0.14366972107781084
+    sharpe_ratio: 0.9429454864385497
+    max_drawdown: -0.1980647072230559
+    excess: 0.15049091088621225
+    spy: 1.769942277872643
+  oos:
+    total_return: 2.8372455710718807
+    cagr: 0.16990653852034798
+    sharpe_ratio: 1.0368281659368732
+    max_drawdown: -0.1970314657146166
+    excess: 0.7457144170640557
+    spy: 2.091531154007825
+  full:
+    total_return: 10.40335315109388
+    cagr: 0.15828402266828934
+    sharpe_ratio: 0.9986090597672606
+    max_drawdown: -0.1980647072230559
+    excess: 2.778699966454335
+    spy: 7.624653184639545
+    spy_dd: -0.33717269301235486
+params_locked: true
+locked_at: '2026-07-30T23:26:31.755896+00:00'
+strict_winner: true
+no_leakage_notes:
+- execution_lag_days=1 on monthly rebalance
+- vol weight from past returns only (lagged)
+- cash blend applied on lagged portfolio returns
+- crash gate uses SPY < 200d MA before signal date
+- static current S&P membership has mild survivorship bias (not full-sample pair durability
+  leak)
+run_script: scripts/run_cash_momentum.py

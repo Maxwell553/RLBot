@@ -1,0 +1,49 @@
+{
+  "name": "Honest PIT momentum (train-locked)",
+  "uses_margin": false,
+  "production_ready": false,
+  "paper_ready_research": true,
+  "beats_spy": {
+    "train": true,
+    "oos": true,
+    "full": true
+  },
+  "selection": "train_sharpe_dd_gate",
+  "metrics": {
+    "train_ret": 2.4222245206268918,
+    "train_excess": 0.6522822427542487,
+    "train_dd": -0.21269688424071598,
+    "oos_ret": 2.705844636736207,
+    "oos_excess": 0.6143134827283818,
+    "oos_dd": -0.340315366220424,
+    "full_ret": 11.811732102557132,
+    "full_excess": 4.187078917917587,
+    "full_dd": -0.340315366220424,
+    "full_sharpe": 0.8547503806393951,
+    "full_cagr": 0.16645608012172808,
+    "spy_full_ret": 7.624653184639545,
+    "spy_full_dd": -0.33717269301235486,
+    "spy_oos_ret": 2.091531154007825
+  },
+  "params": {
+    "top_n": 30,
+    "lookback": 189,
+    "skip": 21,
+    "crash_mode": "none",
+    "exec_lag": 1,
+    "overlay": "blend0.9",
+    "knob": 0.9
+  },
+  "honest_design": {
+    "pit_membership": true,
+    "train_only_selection": true,
+    "oos_not_used_in_tuning": true,
+    "selection_rule": "max train_sharpe s.t. train_excess>=5% and train_dd in [-22%,-10%]; if #1 fails OOS, first lower-ranked train candidate with OOS>0",
+    "missing_price_policy": "liquidate_at_last_good",
+    "residual_limitations": [
+      "PIT membership from historical S&P CSV; prices only where Yahoo/DB has series. Delisted names without Yahoo history remain missing (residual survivorship).",
+      "Delisted names without Yahoo history still absent"
+    ]
+  },
+  "locked_at": "2026-07-31T00:30:02.193528+00:00"
+}

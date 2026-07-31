@@ -1,0 +1,129 @@
+{
+  "strategy": "cash_long_only_spy_core_rv_satellite",
+  "audit": {
+    "full_sample_durable_universe_leak": true,
+    "fix": "Prior FINALMODEL used durable\u22653 counted over 2010-2026 (look-ahead on candidates).",
+    "remediation": "train_frozen_selected n=75 (WF selected \u22642017-12-29)",
+    "execution_lag_days": 1,
+    "leaked_universe_oos_excess_for_contrast": 0.08694958288576249,
+    "clean_universe_oos_excess": 0.1524779919757453
+  },
+  "uses_margin": false,
+  "locked_params": {
+    "universe_mode": "train_frozen",
+    "universe_note": "train_frozen_selected n=75 (WF selected \u22642017-12-29)",
+    "top_n": 6,
+    "open_z": 1.5,
+    "position_pct": 0.08,
+    "min_spy_pct": 0.7,
+    "max_concurrent_longs": 3,
+    "spy_ma_filter": 200,
+    "execution_lag_days": 1,
+    "formation_days": 252,
+    "trading_days": 63,
+    "min_edge_cost_multiple": 2.0,
+    "uses_margin": false,
+    "allows_shorts": false,
+    "params_locked": true,
+    "locked_at": "2026-07-30T22:18:40.059946+00:00",
+    "train_window": {
+      "start": "2010-01-04",
+      "end": "2017-12-29"
+    },
+    "train_metrics": {
+      "total_return": 1.6635617110586818,
+      "excess_vs_spy": -0.10388761876387576,
+      "sharpe_ratio": 0.920299592219602,
+      "max_drawdown": -0.17528320635635056,
+      "spy_return": 1.7674493298225575
+    },
+    "low_dd_alternative": {
+      "top_n": 6,
+      "open_z": 1.5,
+      "position_pct": 0.08,
+      "min_spy_pct": 0.7,
+      "max_concurrent_longs": 3,
+      "spy_ma_filter": 200,
+      "train_return": 1.6635617110586818,
+      "train_excess": -0.10388761876387576,
+      "train_max_drawdown": -0.17528320635635056,
+      "train_sharpe": 0.920299592219602
+    }
+  },
+  "train": {
+    "total_return": 1.6635617110586818,
+    "excess_vs_spy": -0.10388761876387576,
+    "sharpe_ratio": 0.920299592219602,
+    "max_drawdown": -0.17528320635635056,
+    "spy_return": 1.7674493298225575
+  },
+  "oos": {
+    "start": "2018-01-02",
+    "end": "2026-07-29",
+    "strategy": {
+      "total_return": 2.2894975735711145,
+      "cagr": 0.14906752641121956,
+      "sharpe_ratio": 0.8323114644680166,
+      "max_drawdown": -0.3203247978874181,
+      "ending_equity": 328949.75735711143,
+      "number_of_fills": 245
+    },
+    "spy": {
+      "total_return": 2.137019581595369,
+      "cagr": 0.14272105489943954,
+      "sharpe_ratio": 0.7964872321332657,
+      "max_drawdown": -0.33717269301235486,
+      "ending_equity": 313701.95815953694
+    },
+    "excess_vs_spy": 0.1524779919757453,
+    "beats_spy": true
+  },
+  "full_sample": {
+    "strategy": {
+      "total_return": 7.2000191878284,
+      "cagr": 0.13545189805093805,
+      "sharpe_ratio": 0.8395156338678321,
+      "max_drawdown": -0.3290375843543056,
+      "ending_equity": 820001.91878284,
+      "number_of_fills": 442
+    },
+    "spy": {
+      "total_return": 7.751555322225499,
+      "cagr": 0.13992289608374398,
+      "sharpe_ratio": 0.8537688047049863,
+      "max_drawdown": -0.33717269301235486,
+      "ending_equity": 875155.5322225499
+    },
+    "excess_vs_spy": -0.5515361343970993
+  },
+  "low_dd_alternative_oos": {
+    "params": {
+      "top_n": 6,
+      "open_z": 1.5,
+      "position_pct": 0.08,
+      "min_spy_pct": 0.7,
+      "max_concurrent_longs": 3,
+      "spy_ma_filter": 200,
+      "train_return": 1.6635617110586818,
+      "train_excess": -0.10388761876387576,
+      "train_max_drawdown": -0.17528320635635056,
+      "train_sharpe": 0.920299592219602
+    },
+    "strategy": {
+      "total_return": 2.2894975735711145,
+      "cagr": 0.14906752641121956,
+      "sharpe_ratio": 0.8323114644680166,
+      "max_drawdown": -0.3203247978874181
+    },
+    "excess_vs_spy": 0.1524779919757453
+  },
+  "low_dd_alternative_full": {
+    "strategy": {
+      "total_return": 7.2000191878284,
+      "cagr": 0.13545189805093805,
+      "sharpe_ratio": 0.8395156338678321,
+      "max_drawdown": -0.3290375843543056
+    },
+    "excess_vs_spy": -0.5515361343970993
+  }
+}

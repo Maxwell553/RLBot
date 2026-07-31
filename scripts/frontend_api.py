@@ -1022,7 +1022,7 @@ def forward_dashboard(
             else:
                 refreshed = call_with_timeout(
                     refresh_forward_mark_live,
-                    20.0,
+                    60.0 if force_refresh else 30.0,
                     rid,
                     force_price_refresh=bool(force_refresh),
                 )

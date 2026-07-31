@@ -26,6 +26,8 @@ from rlbot.rl_config import get_config, load_config, set_config
 from rlbot.run_artifacts import PROJECT_ROOT
 
 LIVE_STAMP_NAME = "forward_live_stamp.json"
+# Companion RL deploy shown alongside FINALMODEL on /ops/forward.
+RL_LIVE_RUN_ID = "LIVE_MODEL"
 # Candle grid is 5m; refresh Yahoo about once per new bar.
 DEFAULT_MIN_REFRESH_SECONDS = 300
 BAR_INTERVAL = "5m"
@@ -33,6 +35,11 @@ BAR_INTERVAL = "5m"
 BARS_PER_TRADING_DAY = 78
 # yfinance 5m history is capped (~60d); fetch this much lookback.
 INTRADAY_LOOKBACK_DAYS = 59
+
+
+def _session_date_today() -> str:
+    """US/Eastern trading calendar date (naive YYYY-MM-DD)."""
+    return str(pd.Timestamp.now(tz="America/New_York").date())
 
 
 def _stamp_path(root: Path | None = None) -> Path:
@@ -97,6 +104,41 @@ def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return last
     return last
+
+
+def _is_equity_stock_book(
+    weights: dict[str, float] | None,
+    *,
+    run_id: str,
+    cfg_asset_keys: list[str],
+) -> bool:
+    """True when the live book is individual equities (PIT momentum), not the RL sleeve."""
+    if str(run_id).upper() == "FINALMODEL":
+        return True
+    if not weights:
+        return False
+    cfg = {_normalize_weight_key(k) for k in cfg_asset_keys}
+    cfg.add("CASH")
+    keys = {_normalize_weight_key(k) for k in weights}
+    risky = keys - {"CASH"}
+    if not risky:
+        return False
+    overlap = len(risky & cfg) / len(risky)
+    return overlap < 0.5
+
+
+def _stock_symbols_from_weights(weights: dict[str, float]) -> dict[str, str]:
+    """Map display label → Yahoo symbol for equity books (BRK.B → BRK-B)."""
+    from rlbot.pit_momentum import to_yahoo_symbol
+
+    out: dict[str, str] = {}
+    for k, v in weights.items():
+        lab = str(k).strip()
+        if not lab or lab.upper() == "CASH" or float(v) <= 0:
+            continue
+        out[lab.upper() if "." not in lab else lab] = to_yahoo_symbol(lab)
+    # Prefer uppercase keys consistently.
+    return {str(k).upper(): v for k, v in out.items()}
 
 
 def _cash_yield_per_bar(cash_daily_yield: float) -> float:
@@ -517,27 +559,61 @@ def refresh_forward_mark_live(
     cfg_path = PROJECT_ROOT / "config" / "config.yaml"
     set_config(load_config(cfg_path))
     cfg = get_config()
-    symbols = dict(cfg.universe.assets)
-    tickers = list(cfg.universe.tickers)
-    labels = ["Cash"] + list(symbols.keys())
     initial_cash = float(
         (existing or {}).get("initial_cash") or cfg.environment.initial_cash
     )
-    holdout_start = (existing or {}).get("holdout_start") or stamp.get("holdout_start")
+    # Both FINALMODEL and LIVE_MODEL charts start at today's US session.
+    holdout_start = _session_date_today()
     holdout_end = (existing or {}).get("holdout_end") or stamp.get("holdout_end")
     cash_yield_bar = _cash_yield_per_bar(
         float(getattr(cfg.reward, "cash_daily_yield", 0.0) or 0.0)
     )
+    rl_cash_yield_bar = cash_yield_bar
 
     latest_w = _latest_shadow_weights(rid) or (existing or {}).get("latest_weights")
     if not isinstance(latest_w, dict) or not latest_w:
         latest_w = {"Cash": 1.0}
+
+    rl_symbols = dict(cfg.universe.assets)
+    rl_labels = list(rl_symbols.keys())
+    stock_book = _is_equity_stock_book(
+        latest_w, run_id=rid, cfg_asset_keys=rl_labels
+    )
+    stock_symbols: dict[str, str] = {}
+    if stock_book:
+        stock_symbols = _stock_symbols_from_weights(latest_w)
+        if not stock_symbols:
+            stock_symbols = {"SPY": "SPY"}
+        tickers = list(stock_symbols.keys())
+        labels = ["Cash"] + list(stock_symbols.keys())
+        # Equity paper book: no cash yield (cash account, idle cash = 0).
+        cash_yield_bar = 0.0
+    else:
+        tickers = list(cfg.universe.tickers)
+        labels = ["Cash"] + rl_labels
+
+    # Fetch RL sleeve always (EW-10 + LIVE_MODEL); add stock picks when needed.
+    symbols: dict[str, str] = dict(rl_symbols)
+    symbols.update(stock_symbols)
     live_vec = _weight_vector(latest_w, labels)
+    rl_live_w = _latest_shadow_weights(RL_LIVE_RUN_ID)
+    if not isinstance(rl_live_w, dict) or not rl_live_w:
+        rl_mark = load_forward_mark(RL_LIVE_RUN_ID)
+        rl_live_w = (rl_mark or {}).get("latest_weights") if rl_mark else None
+    if not isinstance(rl_live_w, dict) or not rl_live_w:
+        rl_live_w = None
+    rl_labels_full = ["Cash"] + rl_labels
+    rl_vec = (
+        _weight_vector(rl_live_w, rl_labels_full)
+        if rl_live_w is not None
+        else None
+    )
 
     fetched = False
     times: pd.DatetimeIndex
     o = h = l = c = None  # type: ignore[assignment]
     so = sh = sl = sc = None  # type: ignore[assignment]
+    fetch_labels = list(symbols.keys())
 
     def _apply_holdout(
         t: pd.DatetimeIndex,
@@ -601,7 +677,8 @@ def refresh_forward_mark_live(
         from rlbot.forward_mark import call_with_timeout
 
         try:
-            fetch_timeout = 25.0 if force_price_refresh else 15.0
+            # Stock book + RL sleeve can be ~40 symbols; allow a longer pull.
+            fetch_timeout = 45.0 if (force_price_refresh or stock_book) else 15.0
             times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
                 _fetch_intraday_ohlc,
                 fetch_timeout,
@@ -634,7 +711,7 @@ def refresh_forward_mark_live(
                 spy_high=sh,
                 spy_low=sl,
                 spy_close=sc,
-                labels=np.asarray(list(symbols.keys())),
+                labels=np.asarray(fetch_labels),
             )
             fetched = True
             _write_stamp(
@@ -655,26 +732,30 @@ def refresh_forward_mark_live(
 
     if not fetched and price_cache.is_file():
         blob = np.load(price_cache, allow_pickle=False)
-        times = pd.DatetimeIndex(blob["times"])
-        o = np.asarray(blob["open"], dtype=np.float64)
-        h = np.asarray(blob["high"], dtype=np.float64)
-        l = np.asarray(blob["low"], dtype=np.float64)
-        c = np.asarray(blob["close"], dtype=np.float64)
-        so = np.asarray(blob["spy_open"], dtype=np.float64)
-        sh = np.asarray(blob["spy_high"], dtype=np.float64)
-        sl = np.asarray(blob["spy_low"], dtype=np.float64)
-        sc = np.asarray(blob["spy_close"], dtype=np.float64)
-        times, o, h, l, c, so, sh, sl, sc, holdout_start = _apply_holdout(
-            times, o, h, l, c, so, sh, sl, sc, start=holdout_start
-        )
-    elif not fetched:
-        # No cache yet and throttle says skip — try a forced fetch once.
-        since = str(holdout_start or (pd.Timestamp.utcnow() - pd.Timedelta(days=INTRADAY_LOOKBACK_DAYS)).date())
+        cached_labels = [str(x) for x in blob["labels"].tolist()] if "labels" in blob.files else []
+        if cached_labels != fetch_labels:
+            need_fetch = True
+        else:
+            times = pd.DatetimeIndex(blob["times"])
+            o = np.asarray(blob["open"], dtype=np.float64)
+            h = np.asarray(blob["high"], dtype=np.float64)
+            l = np.asarray(blob["low"], dtype=np.float64)
+            c = np.asarray(blob["close"], dtype=np.float64)
+            so = np.asarray(blob["spy_open"], dtype=np.float64)
+            sh = np.asarray(blob["spy_high"], dtype=np.float64)
+            sl = np.asarray(blob["spy_low"], dtype=np.float64)
+            sc = np.asarray(blob["spy_close"], dtype=np.float64)
+            times, o, h, l, c, so, sh, sl, sc, holdout_start = _apply_holdout(
+                times, o, h, l, c, so, sh, sl, sc, start=holdout_start
+            )
+    if (not fetched) and (need_fetch or not price_cache.is_file() or o is None):
+        # Cold start / stale label set — fetch once.
+        since = str(holdout_start)
         from rlbot.forward_mark import call_with_timeout
 
         times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
             _fetch_intraday_ohlc,
-            20.0,
+            45.0 if (force_price_refresh or stock_book) else 20.0,
             symbols,
             since=since,
         )
@@ -695,7 +776,7 @@ def refresh_forward_mark_live(
             spy_high=sh,
             spy_low=sl,
             spy_close=sc,
-            labels=np.asarray(list(symbols.keys())),
+            labels=np.asarray(fetch_labels),
         )
         fetched = True
         _write_stamp(
@@ -714,23 +795,83 @@ def refresh_forward_mark_live(
             root,
         )
 
-    if len(times) < 1:
+    if o is None or len(times) < 1:
         return existing
 
-    model_ohlc = portfolio_ohlc_candles(
-        o, h, l, c, live_vec, initial_cash=initial_cash, cash_yield_per_bar=cash_yield_bar
-    )
-    ew_ohlc = equal_weight_ohlc_candles(o, h, l, c, initial_cash=initial_cash)
+    lab_index = {lab: i for i, lab in enumerate(fetch_labels)}
+
+    def _cols(labs: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        idx = [lab_index[x] for x in labs if x in lab_index]
+        if not idx:
+            empty = np.zeros((len(times), 0), dtype=np.float64)
+            return empty, empty, empty, empty
+        return o[:, idx], h[:, idx], l[:, idx], c[:, idx]
+
+    if stock_book:
+        book_labs = list(stock_symbols.keys())
+        o_book, h_book, l_book, c_book = _cols(book_labs)
+        model_ohlc = portfolio_ohlc_candles(
+            o_book,
+            h_book,
+            l_book,
+            c_book,
+            live_vec,
+            initial_cash=initial_cash,
+            cash_yield_per_bar=cash_yield_bar,
+        )
+        last_closes_book = c_book[-1] if c_book.shape[1] else None
+    else:
+        model_ohlc = portfolio_ohlc_candles(
+            o, h, l, c, live_vec, initial_cash=initial_cash, cash_yield_per_bar=cash_yield_bar
+        )
+        last_closes_book = c[-1]
+
+    # Equal-weight is always the original N-asset research sleeve (not stock picks).
+    o_rl, h_rl, l_rl, c_rl = _cols(rl_labels)
+    ew_ohlc = equal_weight_ohlc_candles(o_rl, h_rl, l_rl, c_rl, initial_cash=initial_cash)
     spy_ohlc = spy_ohlc_candles(so, sh, sl, sc, initial_cash=initial_cash)
+
+    live_model_ohlc = None
+    if rl_vec is not None and o_rl.shape[1] == len(rl_labels):
+        live_model_ohlc = portfolio_ohlc_candles(
+            o_rl,
+            h_rl,
+            l_rl,
+            c_rl,
+            rl_vec,
+            initial_cash=initial_cash,
+            cash_yield_per_bar=rl_cash_yield_bar,
+        )
 
     nav_model = model_ohlc[:, 3]
     nav_ew = ew_ohlc[:, 3]
     nav_spy = spy_ohlc[:, 3]
+    nav_live = live_model_ohlc[:, 3] if live_model_ohlc is not None else None
 
     w_mat = np.tile(live_vec, (len(times), 1))
+    candles_payload: dict[str, Any] = {
+        "model": _candles_to_payload(times, model_ohlc),
+        "equal_weight": _candles_to_payload(times, ew_ohlc),
+        "spy": _candles_to_payload(times, spy_ohlc),
+    }
+    if live_model_ohlc is not None:
+        candles_payload["live_model"] = _candles_to_payload(times, live_model_ohlc)
+
+    note = (
+        "FINALMODEL PIT momentum + LIVE_MODEL RL sleeve on today's session. "
+        "Equal-weight is the original 10-asset research universe (not stock picks). "
+        if stock_book
+        else "Live 5-minute NAV candles on the SPY session clock from latest target "
+        "weights + Yahoo OHLC (model / EW / SPY). Foreign-session assets carry "
+        "the last print forward. "
+    ) + f"Prices refresh about every {max(min_refresh_seconds, 60) // 60} min."
+
     payload = build_forward_mark_payload(
         run_id=rid,
-        checkpoint_label=str((existing or {}).get("checkpoint_label") or "best"),
+        checkpoint_label=str(
+            (existing or {}).get("checkpoint_label")
+            or ("locked" if stock_book else "best")
+        ),
         dates=times,
         nav_model=nav_model,
         nav_spy=nav_spy,
@@ -740,29 +881,22 @@ def refresh_forward_mark_live(
         initial_cash=initial_cash,
         holdout_start=str(holdout_start) if holdout_start else None,
         holdout_end=str(holdout_end) if holdout_end else None,
-        note=(
-            "Live 5-minute NAV candles on the SPY session clock from latest target "
-            "weights + Yahoo OHLC (model / EW / SPY). Foreign-session assets carry "
-            f"the last print forward. Prices refresh about every "
-            f"{max(min_refresh_seconds, 60) // 60} min."
-        ),
+        note=note,
         bar_interval=BAR_INTERVAL,
         timestamps=[pd.Timestamp(t).isoformat(timespec="minutes") for t in times],
-        candles={
-            "model": _candles_to_payload(times, model_ohlc),
-            "equal_weight": _candles_to_payload(times, ew_ohlc),
-            "spy": _candles_to_payload(times, spy_ohlc),
-        },
+        candles=candles_payload,
         bars_per_year=BARS_PER_TRADING_DAY * 252,
+        nav_live_model=nav_live,
     )
     positions = _positions_snapshot(
         latest_w,
         nav=float(nav_model[-1]),
         labels=labels,
-        last_closes=c[-1],
+        last_closes=last_closes_book,
         tickers=tickers,
     )
     payload["positions"] = positions
+    payload["companion_run_id"] = RL_LIVE_RUN_ID if nav_live is not None else None
     payload["live"] = {
         "prices_refreshed": fetched,
         "as_of_bar": pd.Timestamp(times[-1]).isoformat(timespec="minutes"),
@@ -770,6 +904,7 @@ def refresh_forward_mark_live(
         "min_refresh_seconds": int(min_refresh_seconds),
         "bar_interval": BAR_INTERVAL,
         "source": "yfinance_5m",
+        "session_start": str(holdout_start),
     }
     payload["latest_weights"] = {
         labels[i]: float(live_vec[i]) for i in range(len(labels))

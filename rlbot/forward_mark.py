@@ -144,12 +144,20 @@ def build_forward_mark_payload(
     timestamps: Sequence[str] | None = None,
     candles: dict[str, Any] | None = None,
     bars_per_year: float = 252.0,
+    nav_live_model: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Assemble a browser-friendly forward-mark payload (NAVs start at ``initial_cash``)."""
     model = np.asarray(nav_model, dtype=np.float64).reshape(-1)
     spy = np.asarray(nav_spy, dtype=np.float64).reshape(-1)
     ew = np.asarray(nav_ew, dtype=np.float64).reshape(-1)
+    live = (
+        np.asarray(nav_live_model, dtype=np.float64).reshape(-1)
+        if nav_live_model is not None
+        else None
+    )
     n = int(min(model.size, spy.size, ew.size, len(dates)))
+    if live is not None:
+        n = int(min(n, live.size))
     if n < 1:
         raise ValueError("forward mark requires at least one NAV point")
 
@@ -158,12 +166,18 @@ def build_forward_mark_payload(
         model_s = model[:n].tolist()
         spy_s = spy[:n].tolist()
         ew_s = ew[:n].tolist()
+        live_s = live[:n].tolist() if live is not None else None
     else:
         scale = float(initial_cash) / max(float(model[0]), 1e-12)
         model_s = (model[:n] * scale).tolist()
         # Rebase SPY/EW to the same starting cash for apples-to-apples charting.
         spy_s = (spy[:n] / max(float(spy[0]), 1e-12) * float(initial_cash)).tolist()
         ew_s = (ew[:n] / max(float(ew[0]), 1e-12) * float(initial_cash)).tolist()
+        live_s = (
+            (live[:n] / max(float(live[0]), 1e-12) * float(initial_cash)).tolist()
+            if live is not None and live.size
+            else None
+        )
     if timestamps is not None and len(timestamps) >= n:
         date_strs = [str(timestamps[i]) for i in range(n)]
     else:
@@ -228,6 +242,11 @@ def build_forward_mark_payload(
             "under this cost model (10k vs 100k)."
         ),
     }
+    if live_s is not None:
+        payload["nav"]["live_model"] = live_s
+        payload["stats"]["live_model"] = _series_stats(
+            live_s, bars_per_year=bars_per_year, timestamps=date_strs
+        )
     if bar_interval:
         payload["bar_interval"] = bar_interval
     if timestamps is not None:
@@ -288,7 +307,8 @@ def resolve_active_forward_run_id(root: Path | None = None) -> str | None:
     candidates: list[tuple[float, str]] = []
     for path in exec_dir.glob("forward_mark_*.json"):
         name = path.name.removeprefix("forward_mark_").removesuffix(".json")
-        if name.startswith("LIVE_"):
+        # LIVE_* RL deploy marks, or FINALMODEL (locked PIT momentum paper book).
+        if name.startswith("LIVE_") or name == "FINALMODEL":
             try:
                 candidates.append((path.stat().st_mtime, name))
             except OSError:

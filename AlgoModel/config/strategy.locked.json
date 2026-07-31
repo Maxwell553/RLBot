@@ -1,0 +1,50 @@
+{
+  "strategy_id": "pit_cross_sectional_momentum_v1",
+  "display_name": "PIT S&P Cross-Sectional Momentum (cash long-only)",
+  "uses_margin": false,
+  "allows_shorts": false,
+  "allows_futures": false,
+  "params_locked": true,
+  "locked_at": "2026-07-31T00:30:02.193528+00:00",
+  "params": {
+    "top_n": 30,
+    "lookback_trading_days": 189,
+    "skip_trading_days": 21,
+    "rebalance": "month_end",
+    "execution_lag_trading_days": 1,
+    "crash_mode": "none",
+    "portfolio_gross_weight": 0.9,
+    "cash_weight": 0.1,
+    "weighting": "equal_weight_among_picks",
+    "min_price": 5.0,
+    "momentum_clip": { "min": -0.95, "max": 5.0 }
+  },
+  "universe": {
+    "type": "point_in_time_sp500",
+    "membership_file": "data/pit/sp500_historical_components.csv",
+    "membership_rule": "Use the last snapshot with date <= signal_date. Eligible symbols = members ∩ symbols with valid prices at formation start and end.",
+    "ticker_cleanup": "Drop annotated delist tickers matching TICKER-YYYYMM. Map BRK.B-style dots to broker convention as needed."
+  },
+  "signal": {
+    "when": "Last trading day of each calendar month (month-end close).",
+    "formation_end": "Close of the trading day that is (skip_trading_days + 1) sessions before signal_date (i.e. exclude signal day and skip 21 more).",
+    "formation_start": "Close lookback_trading_days sessions before formation_end.",
+    "score": "price[formation_end] / price[formation_start] - 1",
+    "select": "Highest top_n scores among eligible names.",
+    "fallback": "If fewer than max(5, top_n//2) valid scores, target 90% SPY / 10% cash (or 100% cash if SPY unavailable)."
+  },
+  "execution": {
+    "signal_bar": "month_end close used only for computing the signal (no fills on that bar).",
+    "trade_bar": "Next trading session after signal (lag=1): submit market/MOC orders to reach target weights.",
+    "target_weights": "Each pick gets portfolio_gross_weight / N. Residual cash_weight stays uninvested.",
+    "sells_first": true,
+    "missing_price_policy": "If a held name has no quote on trade day, exit using last good mark / last trade; never delete shares without credit.",
+    "between_rebalances": "Hold target names; optional daily drift rebalance to keep ~90% invested is allowed but not required. Do not change the name list until next month-end signal."
+  },
+  "research_metrics_reference": {
+    "note": "Backtest metrics from research DB; paper results will differ.",
+    "train_excess_vs_spy": 0.652,
+    "oos_excess_vs_spy": 0.614,
+    "full_max_drawdown": -0.340
+  }
+}
