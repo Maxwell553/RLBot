@@ -14,16 +14,34 @@ The source is tracked in this repository and tested in CI
 
 ## Run locally
 
+One command from the repo root (installs frontend deps if needed, then starts
+the research API on `:8787`, workflow API on `:8790`, and Vite on `:5173`):
+
 ```bash
-cd frontend
-npm install       # Node >= 22 (see .nvmrc)
-npm run dev       # starts missing local APIs, then http://localhost:5173
+bash scripts/start_ui.sh
 ```
 
-`npm run dev` starts (or reuses a healthy) research API on `:8787` and workflow
-API on `:8790`, waits until they respond, then serves the UI at
-http://localhost:5173. Use `npm run dev:ui` only when both APIs are managed
-separately.
+Or from `frontend/`:
+
+```bash
+npm install       # Node >= 22 (see .nvmrc); first time only
+npm run dev       # same stack as start_ui.sh → http://127.0.0.1:5173
+```
+
+`npm run dev` publishes `frontend/public/data/*.json` snapshots, starts (or
+reuses) an optional research API on `:8787` and workflow API on `:8790`, then
+serves the UI at http://127.0.0.1:5173. **Ops page GETs load those static JSON
+files** (milliseconds) — they do not wait on `:8787`. The Vite `/api` proxy is
+only needed for preflight and forced forward refresh. Use `npm run dev:ui`
+when APIs are managed separately (still run `python3 scripts/publish_frontend_data.py` first).
+
+On iCloud Desktop, reading `frontend/node_modules` can stall Vite for minutes.
+`npm run dev` therefore runs **`npm ci` into `/tmp/markettrainer-frontend`**,
+symlinks `frontend/node_modules` → that install (moving any real tree aside to
+`frontend/.node_modules.icloud`), and caches Vite prebundles under
+`/tmp/markettrainer-vite-cache`. First start after a lockfile change installs
+once; later starts should open the UI in a few seconds. Set
+`MARKETTRAINER_SKIP_NM_CLONE=1` to leave in-tree `node_modules` alone.
 
 Verification commands (all must pass before committing):
 
@@ -36,17 +54,28 @@ npm run build
 
 ## Data connectivity
 
-The two application surfaces use separate services:
-
-- `scripts/frontend_api.py` is a local, read-only adapter over research
-  artifacts for Research Operations.
-- `scripts/workflow_api.py` owns tenant-scoped mandate workflow records in
-  SQLite. It never stores product records under `Runs/`.
+Ops pages default to **static snapshots** (`VITE_DATA_SOURCE=static`):
 
 ```bash
-# repo root, in the project venv
-pip install -e ".[api]"
-python scripts/frontend_api.py --port 8787
+# repo root — rebuilds frontend/public/data/{dashboard,runs,results,forward,...}.json
+python3 scripts/publish_frontend_data.py
+```
+
+`dev.mjs` runs this on boot (~100ms from `execution/api_*_cache.json`). The SPA
+fetches `/data/*.json` through Vite (typically 1–5ms warm) and keeps an
+in-memory cache across navigations. Filtering/pagination for runs happens in
+the browser.
+
+Optional live API (can stall on iCloud Desktop when scanning `Runs/`):
+
+- `VITE_DATA_SOURCE=api` + `scripts/frontend_api_lite.py` (default) or
+  `frontend_api.py` on `:8787`
+- `scripts/workflow_api.py` owns tenant-scoped mandate workflow records in
+  SQLite (portal). It never stores product records under `Runs/`.
+
+```bash
+# optional research API (preflight / force-forward only when using static data)
+python3 scripts/frontend_api_lite.py --port 8787
 
 # separate terminal; example local actor tokens
 export MARKETTRAINER_WORKFLOW_TOKENS='{
@@ -59,16 +88,8 @@ python scripts/workflow_api.py --port 8790
 cp frontend/.env.example frontend/.env.local
 ```
 
-The `/ops` dashboard, runs, and results pages then read live `Runs/` artifacts
-(manifests, audit records, `backtest_summary.json`,
-`cohort_vs_benchmark.json`) with full provenance. If the configured API fails,
-pages show an error state with retry. Optional shared-secret auth:
-set `MARKETTRAINER_API_TOKEN` for the API process and `VITE_API_TOKEN` in
-`.env.local`.
-
-The operator dashboard uses one narrow `/api/dashboard` startup request.
-`/api/runs` supports server-side status/search filtering and pagination (25
-rows per frontend page).
+Set `VITE_DATA_SOURCE=offline` for the labeled synthetic sandbox. Optional
+shared-secret auth for API mode: `MARKETTRAINER_API_TOKEN` + `VITE_API_TOKEN`.
 
 ## Investor portal
 

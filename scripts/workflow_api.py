@@ -140,26 +140,71 @@ def _approved_symbols() -> set[str]:
 
 
 def _market_history_bars(symbol: str) -> tuple[bool, int, str | None, str | None]:
+    """Daily bar count for eligibility.
+
+    Yahoo's chart API silently downgrades ``range=max&interval=1d`` to monthly
+    bars (~400 points). Prefer explicit ``period1/period2`` daily windows and
+    reject sparse series whose calendar span implies non-daily bars.
+    """
     try:
         from curl_cffi import requests as curl_requests
-
-        params = urllib.parse.urlencode({"range": "max", "interval": "1d", "events": "history"})
-        response = curl_requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{params}",
-            impersonate="chrome",
-            timeout=15,
-        )
-        if response.status_code != 200:
-            return False, 0, None, None
-        result = (response.json().get("chart", {}).get("result") or [None])[0]
-        timestamps = result.get("timestamp") if isinstance(result, dict) else None
-        if not isinstance(timestamps, list) or not timestamps:
-            return False, 0, None, None
         from datetime import datetime, timezone
 
-        first = datetime.fromtimestamp(timestamps[0], timezone.utc).date().isoformat()
-        last = datetime.fromtimestamp(timestamps[-1], timezone.utc).date().isoformat()
-        return True, len(timestamps), first, last
+        last_err_bars = 0
+        last_first: str | None = None
+        last_last: str | None = None
+        now = int(datetime.now(timezone.utc).timestamp())
+        # Explicit unix windows avoid the monthly downgrade that ``range=max`` hits.
+        windows = (
+            ("period", now - 12 * 365 * 86400, now),
+            ("period", now - 8 * 365 * 86400, now),
+            ("range", "10y", None),
+            ("range", "5y", None),
+        )
+        for kind, a, b in windows:
+            if kind == "period":
+                params = urllib.parse.urlencode(
+                    {"period1": int(a), "period2": int(b), "interval": "1d", "events": "history"}
+                )
+            else:
+                params = urllib.parse.urlencode(
+                    {"range": str(a), "interval": "1d", "events": "history"}
+                )
+            response = curl_requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{params}",
+                impersonate="chrome",
+                timeout=15,
+            )
+            if response.status_code != 200:
+                continue
+            result = (response.json().get("chart", {}).get("result") or [None])[0]
+            if not isinstance(result, dict):
+                continue
+            timestamps = result.get("timestamp")
+            meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+            gran = str(meta.get("dataGranularity") or "").lower()
+            if not isinstance(timestamps, list) or not timestamps:
+                continue
+            # Reject monthly/weekly downgrades.
+            if gran and gran not in ("1d", "d", "day", ""):
+                continue
+            first_ts = int(timestamps[0])
+            last_ts = int(timestamps[-1])
+            n = len(timestamps)
+            span_days = max((last_ts - first_ts) / 86400.0, 1.0)
+            # ~400 points over many years ⇒ monthly series slipped through empty gran.
+            if n < 800 and span_days > 1500:
+                continue
+            if n >= 2 and span_days / max(n - 1, 1) > 10:
+                continue
+            first = datetime.fromtimestamp(first_ts, timezone.utc).date().isoformat()
+            last = datetime.fromtimestamp(last_ts, timezone.utc).date().isoformat()
+            if n >= 2_500:
+                return True, n, first, last
+            last_err_bars, last_first, last_last = n, first, last
+        if last_err_bars > 0:
+            return True, last_err_bars, last_first, last_last
+        return False, 0, None, None
     except Exception:  # noqa: BLE001 - network/data failures become a failed eligibility check
         return False, 0, None, None
 
@@ -265,8 +310,36 @@ def instrument_search(
     }
 
 
+def _eligibility_looks_stale(report: list[Any]) -> bool:
+    """Detect Yahoo monthly-bar downgrade reports (~100–500 points, all blocked)."""
+    if not report:
+        return False
+    bars = [int(item.get("historyBars") or 0) for item in report if isinstance(item, dict)]
+    if not bars:
+        return False
+    # Also refresh when every approved symbol is blocked under the 2_500-bar gate
+    # with suspiciously low daily counts (common after a bad Yahoo response).
+    all_blocked = any(isinstance(item, dict) and not item.get("eligible") for item in report)
+    return all_blocked and max(bars) < 2_500
+
+
+def _refresh_stale_eligibility(actor: WorkflowActor, record: dict[str, Any]) -> dict[str, Any]:
+    report = record.get("eligibility") or []
+    if not _eligibility_looks_stale(report):
+        return record
+    fresh = _run_eligibility(record)
+    if record.get("state") in {"draft", "preflight_passed"}:
+        try:
+            return _store.record_preflight(actor, str(record["id"]), fresh)
+        except Exception:  # noqa: BLE001 - fall back to overlay without persist
+            pass
+    return {**record, "eligibility": fresh}
+
+
 @app.get("/api/mandates")
 def mandates(actor: WorkflowActor = Depends(_actor)) -> dict[str, Any]:
+    # Serve SQLite as-is — never block list on Yahoo eligibility refresh.
+    # Explicit ``run_preflight`` action re-checks history when an operator asks.
     return {"mandates": _store.list(actor)}
 
 

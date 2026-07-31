@@ -69,13 +69,15 @@ Edit `universe.assets` and all per-asset lists (length **N**, same order), refre
 | `drawdown_downside_gamma` | Amplifies negative step returns when already in drawdown (default 12.0) |
 | `drawdown_amp_max` | Cap on the `(1 + gamma × dd)` amplification factor (default **4.0**, saturates at dd = 25%; `0` = uncapped legacy behavior). Bounds worst-day reward outliers so VecNormalize clipping keeps gradient on bad days |
 | `drawdown_increase_penalty` / `drawdown_level_penalty` / `drawdown_level_floor` | Direct drawdown penalty on expansion + while sitting above floor |
-| `drawdown_level_times_reward_scale` | When **true** (731+), level multiplies `reward_scale` like the increase term (default **true** with penalty **0.10**; parser default false preserves old raw-unit snapshots where level was ~0.4% abs_share) |
+| `drawdown_level_times_reward_scale` | When **true** (731+), level multiplies `reward_scale` like the increase term (default **true** with penalty **0.07** in cohort 802; parser default false preserves old raw-unit snapshots) |
 | `drawdown_level_exposure_coupling` | Scale level term by gross exposure: `level × ((1−c) + c×gross)` (default **0.5**; parser default 0 = legacy uncoupled level) |
 | `concentration_penalty` / `concentration_target_eff_assets` | Penalize under-diversification of risky weights (default **1.25** → **5.5** eff assets; parser default penalty 0) |
-| `cash_daily_yield` | Risk-free accrual on cash before MTM (default **0.00012**/day ≈ 3.0% ann.; `0` disables; parser default 0 preserves old snapshots) |
+| `cash_daily_yield` | Risk-free accrual on cash before MTM (default **0** in cohort 801+; parser default 0 preserves old snapshots) |
+| `participation_bonus` / `participation_reward_scale` | Stay-invested bonus (`gross × bonus × scale`; default **0** in cohort 802; parser default bonus 0) |
+| `participation_vix_relief` / `participation_drawdown_relief` | Fade participation in VIX stress / own DD (default **0** in cohort 802) |
 | `churn_penalty` | Multiplier on `tx_cost_frac × reward_scale` (default 4.0) |
 
-Omitted from the active config (parser default **0**, still loadable from old `Runs/*/config.yaml`): `inactivity_penalty_*`, `participation_*`, and their VIX/drawdown relief knobs.
+Omitted from the active config when unused (parser default **0**, still loadable from old `Runs/*/config.yaml`): `inactivity_penalty_*` and related inactivity relief knobs.
 
 ## `environment` (selected)
 
@@ -106,12 +108,12 @@ Omitted from the active config (parser default **0**, still loadable from old `R
 | Key | Purpose |
 |-----|---------|
 | `budget_short` | Fraction-of-run schedule anchor (default **50M**; must match `training.timesteps` for standard runs) |
-| `fee_free_fraction` / `fee_ramp_fraction` | Fee-free then linear ramp (defaults **0.10** / **0.45** → ~5M / ~22.5M on a 50M run) |
+| `fee_free_fraction` / `fee_ramp_fraction` | Fee-free then linear ramp (defaults **0.10** / **0.30** → ~5M / ~15M on a 50M run) |
 | `churn_ramp_floor` | Churn scale at fee-ramp start; ramps to 1.0 by `fee_ramp_fraction` (default 0.1) |
-| `dr_widen_span_fraction` | Progressive DR widening span after fee ramp (default **0.25** × learn budget → full DR at ~35M, ~15M stationary full-DR on a 50M run) |
+| `dr_widen_span_fraction` | Progressive DR widening span after fee ramp (default **0.25** × learn budget → full DR at ~27.5M, ~22.5M stationary full-DR on a 50M run) |
 | `best_model_min_step` | Gate `models/best/` saves until this step (`null` → `fee_ramp_end`; `0` → disable gate). Eval + portfolio diagnostics always logged. |
 
-Entropy schedule (`entropy_schedule.decay_start_fraction` / `early_floor_fraction`, default **0.45**) aligns with `fee_ramp_fraction`. LR schedule (`hyperparameters.lr_schedule`, default **`phase_aware`**) holds the initial LR through DR widening (`dr_widen_end`) and cosine-decays to the floor over the settled remainder; `cosine` (parser default, preserves old snapshots) is the legacy global curve.
+Entropy schedule (`entropy_schedule.decay_start_fraction` / `early_floor_fraction`, default **0.30**) aligns with `fee_ramp_fraction`. LR schedule (`hyperparameters.lr_schedule`, default **`phase_aware`**) holds the initial LR through DR widening (`dr_widen_end`) and cosine-decays to the floor over the settled remainder; `cosine` (parser default, preserves old snapshots) is the legacy global curve.
 
 ## Other sections
 

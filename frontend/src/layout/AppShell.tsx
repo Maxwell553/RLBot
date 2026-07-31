@@ -1,4 +1,4 @@
-import { BarChart3, ClipboardList, FlaskConical, LayoutDashboard, Menu, Settings, SlidersHorizontal, X } from 'lucide-react'
+import { BarChart3, ClipboardList, FlaskConical, LayoutDashboard, LineChart, Menu, Settings, SlidersHorizontal, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { Brand } from '../components/Brand'
@@ -7,6 +7,7 @@ import { cn } from '../lib/utils'
 
 const nav = [
   { to: '/ops', label: 'Operations overview', icon: LayoutDashboard, end: true, preload: () => import('../pages/DashboardPage') },
+  { to: '/ops/forward', label: 'Forward test', icon: LineChart, preload: () => import('../pages/ForwardPage') },
   { to: '/ops/requests', label: 'Mandate requests', icon: ClipboardList, preload: () => import('../pages/DeveloperRequestsPage') },
   { to: '/ops/mandates/new', label: 'Config builder', icon: SlidersHorizontal, preload: () => import('../pages/ConfigurePage') },
   { to: '/ops/runs', label: 'Runs', icon: FlaskConical, preload: () => import('../pages/RunsPage') },
@@ -65,11 +66,7 @@ export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
   const location = useLocation()
 
-  useEffect(() => {
-    // Warm ops page chunks once the shell mounts so tab switches skip cold loads.
-    for (const item of nav) void item.preload()
-    void import('../pages/SettingsPage')
-  }, [])
+  // Preload only on hover/focus (see nav items) — never fan-out every page on mount.
 
   useEffect(() => {
     if (!mobileOpen) return

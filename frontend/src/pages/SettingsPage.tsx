@@ -130,10 +130,35 @@ export function SettingsPage() {
               </>
             ) : (
               <>
-                Run data is served by the research API at{' '}
-                <a className="font-semibold text-pine underline" href={`${import.meta.env.VITE_API_URL}/docs`} target="_blank" rel="noreferrer">
-                  {import.meta.env.VITE_API_URL}/docs
-                </a>.
+                Run data is served by the research API
+                {import.meta.env.VITE_API_URL ? (
+                  <>
+                    {' '}
+                    at{' '}
+                    <a
+                      className="font-semibold text-pine underline"
+                      href={`${import.meta.env.VITE_API_URL}/docs`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {import.meta.env.VITE_API_URL}/docs
+                    </a>
+                  </>
+                ) : (
+                  <>
+                    {' '}
+                    via the Vite proxy (
+                    <a
+                      className="font-semibold text-pine underline"
+                      href="http://127.0.0.1:8787/docs"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      http://127.0.0.1:8787/docs
+                    </a>
+                    ).
+                  </>
+                )}
               </>
             )}
           </p>

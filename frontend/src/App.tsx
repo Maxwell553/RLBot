@@ -1,21 +1,51 @@
 import { lazy, Suspense } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
-import { AppShell } from './layout/AppShell'
-import { PortalShell } from './layout/PortalShell'
 import { OPS_UI_ENABLED } from './lib/runtime'
+import { LandingPage } from './pages/LandingPage'
 
-/** Heavy pages stay lazy; shells are eager so mode switches feel instant. */
-const ConfigurePage = lazy(() => import('./pages/ConfigurePage').then((module) => ({ default: module.ConfigurePage })))
-const DashboardPage = lazy(() => import('./pages/DashboardPage').then((module) => ({ default: module.DashboardPage })))
-const DeveloperRequestsPage = lazy(() => import('./pages/DeveloperRequestsPage').then((module) => ({ default: module.DeveloperRequestsPage })))
-const InvestorMandatePage = lazy(() => import('./pages/InvestorMandatePage').then((module) => ({ default: module.InvestorMandatePage })))
-const LandingPage = lazy(() => import('./pages/LandingPage').then((module) => ({ default: module.LandingPage })))
-const PortalPage = lazy(() => import('./pages/PortalPage').then((module) => ({ default: module.PortalPage })))
-const PortalBuildsPage = lazy(() => import('./pages/PortalPage').then((module) => ({ default: module.PortalBuildsPage })))
-const PortalReportsPage = lazy(() => import('./pages/PortalPage').then((module) => ({ default: module.PortalReportsPage })))
-const ResultsPage = lazy(() => import('./pages/ResultsPage').then((module) => ({ default: module.ResultsPage })))
-const RunsPage = lazy(() => import('./pages/RunsPage').then((module) => ({ default: module.RunsPage })))
-const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })))
+/**
+ * Landing is eager so ``/`` does not wait on a route chunk + Suspense flash.
+ * Ops/portal pages stay lazy — they pull heavier charts and forms.
+ */
+const AppShell = lazy(() =>
+  import('./layout/AppShell').then((module) => ({ default: module.AppShell })),
+)
+const PortalShell = lazy(() =>
+  import('./layout/PortalShell').then((module) => ({ default: module.PortalShell })),
+)
+const ConfigurePage = lazy(() =>
+  import('./pages/ConfigurePage').then((module) => ({ default: module.ConfigurePage })),
+)
+const DashboardPage = lazy(() =>
+  import('./pages/DashboardPage').then((module) => ({ default: module.DashboardPage })),
+)
+const DeveloperRequestsPage = lazy(() =>
+  import('./pages/DeveloperRequestsPage').then((module) => ({ default: module.DeveloperRequestsPage })),
+)
+const InvestorMandatePage = lazy(() =>
+  import('./pages/InvestorMandatePage').then((module) => ({ default: module.InvestorMandatePage })),
+)
+const PortalPage = lazy(() =>
+  import('./pages/PortalPage').then((module) => ({ default: module.PortalPage })),
+)
+const PortalBuildsPage = lazy(() =>
+  import('./pages/PortalPage').then((module) => ({ default: module.PortalBuildsPage })),
+)
+const PortalReportsPage = lazy(() =>
+  import('./pages/PortalPage').then((module) => ({ default: module.PortalReportsPage })),
+)
+const ResultsPage = lazy(() =>
+  import('./pages/ResultsPage').then((module) => ({ default: module.ResultsPage })),
+)
+const RunsPage = lazy(() =>
+  import('./pages/RunsPage').then((module) => ({ default: module.RunsPage })),
+)
+const ForwardPage = lazy(() =>
+  import('./pages/ForwardPage').then((module) => ({ default: module.ForwardPage })),
+)
+const SettingsPage = lazy(() =>
+  import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })),
+)
 
 function RouteFallback() {
   return (
@@ -46,6 +76,7 @@ export default function App() {
         {OPS_UI_ENABLED && (
           <Route path="/ops" element={<AppShell />}>
             <Route index element={<DashboardPage />} />
+            <Route path="forward" element={<ForwardPage />} />
             <Route path="requests" element={<DeveloperRequestsPage />} />
             <Route path="mandates/new" element={<ConfigurePage />} />
             <Route path="runs" element={<RunsPage />} />

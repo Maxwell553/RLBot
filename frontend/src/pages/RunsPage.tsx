@@ -4,13 +4,28 @@ import { Badge, Card, EmptyPanel, ErrorPanel, Input, Skeleton } from '../compone
 import { fetchRunDetail, fetchRuns } from '../lib/api'
 import { sampleRuns } from '../lib/demo-data'
 import { fmtDate, fmtNum, fmtPct, fmtSteps, statusLabel, statusTone } from '../lib/format'
-import type { ApiRun, ApiRunDetail, ApiRunsPage, DataState } from '../lib/types'
+import type { ApiPortfolioDiagnostics, ApiRun, ApiRunDetail, ApiRunsPage, DataState } from '../lib/types'
 import { useAutoRefresh } from '../lib/use-auto-refresh'
 import { cn } from '../lib/utils'
 
 const filters = ['All', 'Completed', 'In progress', 'Interrupted'] as const
 type Filter = (typeof filters)[number]
-const PAGE_SIZE = 25
+const PAGE_SIZE = 40
+
+/** Distinct sleeve colors for mean-weight bars (cash first, then risky). */
+const ALLOCATION_COLORS = [
+  '#1f3d34', // cash / pine
+  '#c45c3e',
+  '#2f6f5e',
+  '#b0892e',
+  '#4a6fa5',
+  '#8b5a7c',
+  '#3d7c47',
+  '#a65d3f',
+  '#5c6b7a',
+  '#6b4f3a',
+  '#2a8f8f',
+]
 
 function matchesFilter(run: ApiRun, filter: Filter): boolean {
   if (filter === 'All') return true
@@ -26,7 +41,8 @@ function filterToStatus(filter: Filter): '' | 'completed' | 'active' | 'interrup
 
 /** Only operational blockers belong in the list “needs attention” path. */
 function blockingRunWarnings(run: ApiRun): string[] {
-  return run.warnings.filter((warning) =>
+  const warnings = Array.isArray(run.warnings) ? run.warnings : []
+  return warnings.filter((warning) =>
     warning.startsWith('curriculum_preflight_failed')
     || warning.includes('hash_drift')
     || warning.includes('missing_vec_normalize'),
@@ -38,6 +54,75 @@ function ProvenanceRow({ label, value }: { label: string; value: string }) {
     <div className="flex items-baseline justify-between gap-4 border-b border-line py-2 last:border-0">
       <span className="shrink-0 text-[11px] text-ink/60">{label}</span>
       <span className="truncate font-mono text-[11px] text-ink/80" title={value}>{value}</span>
+    </div>
+  )
+}
+
+function allocationRows(diag: ApiPortfolioDiagnostics): { label: string; weight: number; color: string }[] {
+  const weights = diag.per_asset_mean_weights
+  if (!weights) return []
+  const entries = Object.entries(weights)
+    .filter(([, w]) => typeof w === 'number' && Number.isFinite(w))
+    .map(([label, weight]) => ({ label, weight: Number(weight) }))
+    .sort((a, b) => {
+      if (a.label.toLowerCase() === 'cash') return -1
+      if (b.label.toLowerCase() === 'cash') return 1
+      return b.weight - a.weight
+    })
+  return entries.map((row, index) => ({
+    ...row,
+    color: ALLOCATION_COLORS[index % ALLOCATION_COLORS.length]!,
+  }))
+}
+
+function AllocationPanel({ diag }: { diag: ApiPortfolioDiagnostics }) {
+  const rows = allocationRows(diag)
+  const cash = diag.mean_cash_frac
+  const cashPark = cash != null && cash >= 0.6
+  if (rows.length === 0) {
+    return <p className="mt-2 text-xs text-ink/60">No per-asset mean weights in this backtest summary.</p>
+  }
+  return (
+    <div className="mt-2">
+      <div className="mb-3 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-ink/65">
+        <span>Cash <span className="font-mono text-ink/85">{cash == null ? '—' : `${(cash * 100).toFixed(1)}%`}</span></span>
+        <span>Gross <span className="font-mono text-ink/85">{diag.mean_gross_exposure == null ? '—' : `${(diag.mean_gross_exposure * 100).toFixed(1)}%`}</span></span>
+        <span>Eff. N <span className="font-mono text-ink/85">{fmtNum(diag.mean_effective_n_assets, 2)}</span></span>
+        <span>Turnover <span className="font-mono text-ink/85">{fmtNum(diag.mean_turnover, 3)}</span></span>
+        {diag.n_steps != null && (
+          <span>Steps <span className="font-mono text-ink/85">{diag.n_steps}</span></span>
+        )}
+      </div>
+      {cashPark && (
+        <p className="mb-3 rounded-lg border border-amber-700/15 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+          Mean cash ≥ 60% — treat headline Sharpe as suspect (possible cash-park / vol-collapse).
+        </p>
+      )}
+      <div
+        className="mb-4 flex h-3 overflow-hidden rounded-full bg-ink/8"
+        role="img"
+        aria-label="Mean portfolio allocation stacked bar"
+      >
+        {rows.map((row) => (
+          <div
+            key={row.label}
+            title={`${row.label}: ${(row.weight * 100).toFixed(1)}%`}
+            style={{ width: `${Math.max(row.weight * 100, 0)}%`, backgroundColor: row.color }}
+          />
+        ))}
+      </div>
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        {rows.map((row) => (
+          <div key={row.label} className="flex items-center gap-2 text-[11px]">
+            <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: row.color }} aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate text-ink/65">{row.label}</span>
+            <span className="font-mono text-ink/85">{(row.weight * 100).toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-[10px] leading-4 text-ink/50">
+        OOS mean target weights from backtest portfolio diagnostics (not a live broker book).
+      </p>
     </div>
   )
 }
@@ -59,8 +144,10 @@ function RunDetailPanel({ runId }: { runId: string }) {
   }
   if (detail.kind === 'error') return <p role="alert" className="text-xs text-red-900">Could not load run detail: {detail.message}</p>
 
-  const { provenance, backtest, holdout } = detail.data
-  const auditWarnings = detail.data.audit?.warnings ?? []
+  const provenance = detail.data.provenance ?? {}
+  const backtest = detail.data.backtest ?? null
+  const holdout = detail.data.holdout ?? null
+  const auditWarnings = Array.isArray(detail.data.audit?.warnings) ? detail.data.audit.warnings : []
   const blockers = [
     ...(detail.data.audit ? blockingRunWarnings(detail.data.audit) : []),
     ...(detail.data.audit?.training_status === 'interrupted' ? ['Training was interrupted'] : []),
@@ -150,6 +237,12 @@ function RunDetailPanel({ runId }: { runId: string }) {
           </div>
         </div>
       </div>
+      {backtest?.portfolio_diagnostics && (
+        <section className="mt-5 rounded-xl border border-line bg-white/55 p-4">
+          <p className="font-mono text-[11px] uppercase tracking-[.15em] text-ink/55">OOS allocation</p>
+          <AllocationPanel diag={backtest.portfolio_diagnostics} />
+        </section>
+      )}
     </div>
   )
 }
@@ -251,7 +344,11 @@ export function RunsPage() {
       .sort(([a], [b]) => b.localeCompare(a, undefined, { numeric: true }))
       .map(([cohort, cohortRuns]) => ({
         cohort,
-        runs: cohortRuns,
+        runs: [...cohortRuns].sort((a, b) => {
+          const wa = Number(/^W(\d+)/i.exec(a.run_id)?.[1] ?? 99)
+          const wb = Number(/^W(\d+)/i.exec(b.run_id)?.[1] ?? 99)
+          return wa - wb || a.run_id.localeCompare(b.run_id)
+        }),
         completed: cohortRuns.filter((run) => run.training_status === 'completed').length,
         blocked: cohortRuns.filter((run) => run.training_status === 'interrupted' || blockingRunWarnings(run).length > 0).length,
       }))
@@ -371,7 +468,8 @@ export function RunsPage() {
                           <span className="block truncate text-xs font-semibold">{run.run_id}</span>
                           <span className="mt-1 block text-[11px] text-ink/55">
                             {run.window ?? '—'}
-                            {run.labels.length > 0 && ` · ${run.labels.slice(0, 2).join(', ')}`}
+                            {Array.isArray(run.labels) && run.labels.length > 0
+                              && ` · ${run.labels.slice(0, 2).join(', ')}`}
                           </span>
                         </div>
                         <div>

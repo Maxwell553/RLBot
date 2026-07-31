@@ -1,15 +1,14 @@
-"""Training progress helpers (resume budget + global progress bar)."""
+"""Training progress helpers (resume budget + global progress bar).
+
+Pure schedule helpers are torch-free so the operator API / preflight can import
+them without pulling Stable-Baselines3 (which hangs on some local setups while
+importing torch). The SB3 progress-bar callback is loaded lazily.
+"""
 
 from __future__ import annotations
 
 import math
-
-try:
-    from tqdm.rich import tqdm
-except ImportError:  # pragma: no cover - optional SB3 extra
-    tqdm = None  # type: ignore[misc, assignment]
-
-from stable_baselines3.common.callbacks import BaseCallback
+from typing import Any
 
 
 def absolute_progress_done(num_timesteps: int, budget: int) -> float:
@@ -126,41 +125,10 @@ def resolve_learn_timesteps(*, budget: int, start: int, resume: bool) -> tuple[i
     return budget_i, True
 
 
-class BudgetProgressBarCallback(BaseCallback):
-    """Progress bar against the absolute training budget (not session-only steps)."""
+def __getattr__(name: str) -> Any:
+    """Lazy-load the SB3 progress-bar callback (imports torch)."""
+    if name == "BudgetProgressBarCallback":
+        from rlbot._training_progress_callback import BudgetProgressBarCallback
 
-    def __init__(self, budget_timesteps: int) -> None:
-        super().__init__()
-        if tqdm is None:
-            raise ImportError(
-                "BudgetProgressBarCallback requires tqdm+rich "
-                "(pip install stable-baselines3[extra])"
-            )
-        self.budget_timesteps = int(budget_timesteps)
-        self.pbar: tqdm | None = None
-
-    def _on_training_start(self) -> None:
-        start = int(self.model.num_timesteps)
-        remaining = max(0, self.budget_timesteps - start)
-        self.pbar = tqdm(
-            total=remaining,
-            desc=self._desc(start),
-            unit="step",
-            unit_scale=True,
-        )
-
-    def _on_step(self) -> bool:
-        assert self.pbar is not None
-        self.pbar.update(self.training_env.num_envs)
-        self.pbar.set_description(self._desc(int(self.model.num_timesteps)))
-        return True
-
-    def _on_training_end(self) -> None:
-        if self.pbar is not None:
-            self.pbar.refresh()
-            self.pbar.close()
-            self.pbar = None
-
-    def _desc(self, current: int) -> str:
-        pct = 100.0 * current / self.budget_timesteps if self.budget_timesteps else 100.0
-        return f"{current:,}/{self.budget_timesteps:,} ({pct:.1f}%)"
+        return BudgetProgressBarCallback
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

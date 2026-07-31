@@ -51,8 +51,8 @@ def test_resolve_eval_plot_milestones_from_manifest(tmp_path: Path) -> None:
     }
     gate, best = resolve_eval_plot_milestones(hist, run_dir=run)
     assert best == 30_000_000
-    # Gate = fee_ramp_end from the run's config snapshot (0.45 × 50M on the rephased schedule).
-    assert gate == 22_500_000
+    # Gate = fee_ramp_end from the run's config snapshot (0.30 × 50M, cohort 81).
+    assert gate == 15_000_000
 
 
 def test_robust_score_delta_post_gate_resets_at_fee_ramp() -> None:

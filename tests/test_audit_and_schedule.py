@@ -39,20 +39,20 @@ def test_label_resumed_619_windows() -> None:
 def test_curriculum_preflight_default_early_stop_reachable() -> None:
     cfg = load_config()
     pf = build_curriculum_preflight(cfg, budget=50_000_000)
-    # Rephased schedule: fee-free 10%, full fees/gate 45%, DR widen span 25%.
+    # Cohort 81 schedule: fee-free 10%, full fees/gate 30%, DR widen span 25%.
     assert pf.fee_free_until == 5_000_000
-    assert pf.fee_ramp_end == 22_500_000
-    assert pf.best_model_min_step == 22_500_000
-    # span 0.25 × 50M = 12.5M → full DR at 35M, 15M settled residual.
-    assert pf.dr_widen_end == 35_000_000
-    assert pf.stationary_full_dr_steps == 15_000_000
+    assert pf.fee_ramp_end == 15_000_000
+    assert pf.best_model_min_step == 15_000_000
+    # span 0.25 × 50M = 12.5M → full DR at 27.5M, 22.5M settled residual.
+    assert pf.dr_widen_end == 27_500_000
+    assert pf.stationary_full_dr_steps == 22_500_000
     # Cohort 729+: early stop off (full 50M budget); patience=0 → not "reachable".
     assert pf.early_stop_patience == 0
     assert pf.early_stop_reachable is False
     assert not any("early_stop" in w for w in pf.warnings)
     # Phase-aware LR: full LR through DR widening, decayed after.
     assert pf.lr_schedule == "phase_aware"
-    assert pf.lr_hold_until_step == 35_000_000
+    assert pf.lr_hold_until_step == 27_500_000
     by_name = {m.name: m for m in pf.milestones}
     assert by_name["fee_ramp_end / checkpoint_gate"].learning_rate == pytest.approx(3.0e-4)
     assert by_name["full_DR_start"].learning_rate == pytest.approx(3.0e-4)

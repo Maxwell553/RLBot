@@ -175,21 +175,37 @@ export function DeveloperRequestsPage() {
                   </div>
                 </section>
               </div>
-              {request.eligibility.length > 0 && (
+              {(request.eligibility?.length ?? 0) > 0 && (
                 <section className="border-t border-line px-6 py-5">
                   <h3 className="text-xs font-semibold">Instrument and data eligibility</h3>
                   <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                    {request.eligibility.map((result) => (
+                    {request.eligibility.map((result) => {
+                      const blockReason = !result.symbolFound
+                        ? 'symbol not found'
+                        : !result.approvedPolicy
+                          ? 'outside product universe'
+                          : !result.sufficientHistory
+                            ? `need ≥2,500 daily bars (have ${result.historyBars.toLocaleString()})`
+                            : 'not eligible'
+                      return (
                       <div key={result.ticker} className="rounded-xl bg-ink/[.035] p-3 text-[11px]">
                         <div className="flex items-center justify-between">
                           <span className="font-mono font-semibold">{result.ticker}</span>
                           <Badge tone={result.eligible ? 'success' : 'danger'}>{result.eligible ? 'Eligible' : 'Blocked'}</Badge>
                         </div>
                         <p className="mt-2 text-ink/60">
-                          {result.historyBars.toLocaleString()} bars · policy {result.approvedPolicy ? 'approved' : 'not approved'}
+                          {result.historyBars.toLocaleString()} bars · policy{' '}
+                          {result.approvedPolicy ? 'approved' : 'not approved'}
+                          {!result.eligible && (
+                            <>
+                              {' · '}
+                              {blockReason}
+                            </>
+                          )}
                         </p>
                       </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 </section>
               )}
@@ -197,7 +213,7 @@ export function DeveloperRequestsPage() {
                 <div>
                   <h3 className="text-xs font-semibold">Audit timeline</h3>
                   <ol className="mt-3 space-y-2">
-                    {request.auditLog.map((event, index) => (
+                    {(request.auditLog ?? []).map((event, index) => (
                       <li key={`${event.createdAt}-${index}`} className="flex justify-between gap-4 text-[11px]">
                         <span><span className="font-semibold">{event.eventType.replaceAll('_', ' ')}</span> · {event.actorId}</span>
                         <time className="shrink-0 font-mono text-ink/55">{fmtDate(event.createdAt)}</time>
@@ -208,7 +224,7 @@ export function DeveloperRequestsPage() {
                 <div>
                   <h3 className="text-xs font-semibold">Allowed next action</h3>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {request.allowedActions.map((action) => (
+                    {(request.allowedActions ?? []).map((action) => (
                       <Button
                         key={action}
                         variant={action === 'authorize_oos_evaluation' || action === 'release_report' ? 'secondary' : 'primary'}
@@ -218,7 +234,7 @@ export function DeveloperRequestsPage() {
                         {acting === `${request.id}:${action}` ? 'Working…' : (actionLabels[action] ?? action)}
                       </Button>
                     ))}
-                    {request.allowedActions.length === 0 && <p className="text-[11px] text-ink/55">No transition is available in this state.</p>}
+                    {(request.allowedActions?.length ?? 0) === 0 && <p className="text-[11px] text-ink/55">No transition is available in this state.</p>}
                   </div>
                   {request.state === 'checkout' && (
                     <p className="mt-3 text-[11px] leading-4 text-ink/55">

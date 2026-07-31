@@ -106,14 +106,16 @@ def obs_drift_alarm(z_scores: np.ndarray, threshold: float = 5.0, frac: float = 
 def _refresh_global_cache() -> Path:
     """Fetch fresh bars and rebuild the GLOBAL cache (torch-free; same feature
     pipeline the trainer uses for the full-timeline cache)."""
-    from rlbot.data_utils import _indicators_from_merged, fetch_aligned_daily, save_cache
+    from rlbot.data_utils import fetch_aligned_daily, save_cache
 
     cfg = get_config()
     cache_path = resolve_data_cache()
     print(f"[shadow] refreshing global cache → {cache_path}")
-    merged = fetch_aligned_daily(since=cfg.data.since, until=None)
-    (idx, ohlcv, rsi, macd, macro, fd, fdm, trend, avol, mvol, live) = _indicators_from_merged(
-        merged, list(cfg.universe.tickers), fracdiff_d=cfg.data.fracdiff_d
+    idx, ohlcv, rsi, macd, macro, fd, fdm, trend, avol, mvol, live = fetch_aligned_daily(
+        symbols_dict=cfg.universe.assets,
+        since=cfg.data.since,
+        until=None,
+        fracdiff_d=cfg.data.fracdiff_d,
     )
     save_cache(
         str(cache_path), idx, ohlcv, rsi, macd, macro, fd, fdm, trend, avol, mvol,

@@ -338,6 +338,46 @@ def _seed_from_run_id(run_id: str, prefix: str) -> str:
     return run_id.removeprefix(prefix + "_seed_") if run_id.startswith(prefix + "_seed_") else run_id
 
 
+def _prepend_causal_warmup_for_forward_mark(
+    *,
+    full_idx: pd.DatetimeIndex,
+    full_arrays: tuple[np.ndarray, ...],
+    holdout_idx: pd.DatetimeIndex,
+    holdout_arrays: tuple[np.ndarray, ...],
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Prepend pre-holdout bars so the env lookback/_min_t fits a short live OOS tail.
+
+    ``MultiAssetPortfolioEnv`` starts at ``lookback + max_obs_lag`` (~22 bars). A brand-new
+    LIVE holdout may only have 1–2 calendar bars; without causal warmup the reset indexes
+    off the end of the slice. Warmup bars are *not* OOS — they only prime obs/LSTM state.
+    Callers must trim exported NAV/weights to ``holdout_idx[0]`` onward.
+    """
+    cfg = get_config()
+    need_before = int(cfg.environment.lookback) + int(cfg.environment.max_obs_lag) + 2
+    # Extra headroom for LSTM state (matches infer_weights default warm floor).
+    need_before = max(need_before, 64)
+    oos0 = pd.Timestamp(holdout_idx[0])
+    # First index in the full panel at/after holdout start.
+    pos = int(full_idx.searchsorted(oos0, side="left"))
+    if pos >= len(full_idx):
+        raise RuntimeError(f"holdout start {oos0.date()} is past the end of the cache panel")
+    warm_start = max(0, pos - need_before)
+    if warm_start >= pos:
+        # No pre-holdout history available — keep the raw holdout (caller may still fail).
+        return (holdout_idx, *holdout_arrays)
+    end = pos + len(holdout_idx)
+    sl = slice(warm_start, end)
+    warm_n = pos - warm_start
+    print(
+        f"[backtest] forward-mark causal warmup: +{warm_n} pre-holdout bars "
+        f"({full_idx[warm_start].date()} .. {full_idx[pos - 1].date()}) before OOS "
+        f"{holdout_idx[0].date()} .. {holdout_idx[-1].date()}"
+    )
+    out_idx = full_idx[sl]
+    out_arrays = tuple(arr[sl] for arr in full_arrays)
+    return (out_idx, *out_arrays)  # type: ignore[return-value]
+
+
 def resolve_oos_holdout(
     args: argparse.Namespace,
     idx: pd.DatetimeIndex,
@@ -575,8 +615,67 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         asset_live,
         manifest,
     )
-    if len(test_idx) < 10:
-        raise RuntimeError("Test window too short; fetch more history or reduce holdout days.")
+    # True OOS calendar span (before any causal warmup prepend).
+    oos_n_bars = len(test_idx)
+    oos_start_ts = pd.Timestamp(test_idx[0]) if oos_n_bars else None
+    forward_mark_mode = bool(getattr(args, "export_forward_mark", False))
+    if oos_n_bars < 10:
+        # Live forward marks start with a tiny OOS tail (often 1–2 bars right after
+        # the deploy cut). Allow >=1 OOS bar only in --export-forward-mark mode;
+        # rollout still needs lookback warmup prepended below.
+        if forward_mark_mode and oos_n_bars >= 1:
+            print(
+                f"[backtest] NOTE: forward-mark mode with only {oos_n_bars} OOS bars "
+                "(<10); exporting a short live series. Metrics are provisional."
+            )
+        else:
+            raise RuntimeError(
+                "Test window too short; fetch more history or reduce holdout days."
+            )
+
+    if forward_mark_mode:
+        (
+            test_idx,
+            test_ohlcv,
+            test_rsi,
+            test_macd,
+            test_macro,
+            test_fd,
+            test_fdm,
+            test_trend,
+            test_avol,
+            test_mvol,
+            test_live,
+        ) = _prepend_causal_warmup_for_forward_mark(
+            full_idx=idx,
+            full_arrays=(
+                ohlcv,
+                rsi,
+                macd,
+                macro,
+                fracdiff,
+                fracdiff_macro,
+                trend,
+                asset_vol,
+                macro_vol,
+                asset_live,
+            ),
+            holdout_idx=test_idx,
+            holdout_arrays=(
+                test_ohlcv,
+                test_rsi,
+                test_macd,
+                test_macro,
+                test_fd,
+                test_fdm,
+                test_trend,
+                test_avol,
+                test_mvol,
+                test_live,
+            ),
+        )
+        args._forward_mark_oos_start = oos_start_ts  # type: ignore[attr-defined]
+        args._forward_mark_oos_n_bars = oos_n_bars  # type: ignore[attr-defined]
 
     # Global holdout-burn accounting: EVERY backtest read lands in
     # Runs/oos_ledger.jsonl, recorded before the rollout so a crash still burns
@@ -676,6 +775,8 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         collect_weights=True,
         progress=progress,
         progress_label="deterministic",
+        min_bars=10,
+        include_final_close=bool(getattr(args, "export_forward_mark", False)),
     )
     _bt_log(f"[backtest] Rollout done ({time.perf_counter() - t_roll:.1f}s).")
 
@@ -818,6 +919,106 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         print(f"Backtest plot: {out}")
         if args.show_viz:
             open_plot_file(out)
+    elif bool(getattr(args, "export_forward_mark", False)):
+        # Still need benchmark paths for the forward-mark export when viz is skipped.
+        nav_spy = benchmark_buyhold_nav(
+            navs, test_ohlcv, start_bar, tickers=panel_tickers
+        )
+        nav_ew = equal_weight_daily_cost_aware_nav(
+            navs, test_ohlcv, start_bar, asset_live=test_live
+        )
+        time_nav = test_idx[
+            np.clip(
+                start_bar + np.arange(len(navs), dtype=np.int64),
+                0,
+                len(test_idx) - 1,
+            )
+        ]
+        weights = w_opt if w_opt is not None else np.zeros((0, 1))
+    else:
+        nav_spy = None
+        nav_ew = None
+        time_nav = None
+        weights = w_opt if w_opt is not None else np.zeros((0, 1))
+
+    if bool(getattr(args, "export_forward_mark", False)) and not getattr(
+        args, "_ensemble_mode", False
+    ):
+        if nav_spy is None or nav_ew is None or time_nav is None:
+            nav_spy = benchmark_buyhold_nav(
+                navs, test_ohlcv, start_bar, tickers=panel_tickers
+            )
+            nav_ew = equal_weight_daily_cost_aware_nav(
+                navs, test_ohlcv, start_bar, asset_live=test_live
+            )
+            time_nav = test_idx[
+                np.clip(
+                    start_bar + np.arange(len(navs), dtype=np.int64),
+                    0,
+                    len(test_idx) - 1,
+                )
+            ]
+        from rlbot.forward_mark import (
+            build_forward_mark_payload,
+            set_active_forward_run,
+            write_forward_mark,
+        )
+
+        # Drop causal-warmup bars from the published series — chart starts at deploy.
+        oos_cut = getattr(args, "_forward_mark_oos_start", None)
+        if oos_cut is not None and time_nav is not None and len(time_nav) > 0:
+            mask = pd.DatetimeIndex(time_nav) >= pd.Timestamp(oos_cut)
+            if bool(np.any(mask)):
+                time_nav = pd.DatetimeIndex(time_nav)[mask]
+                navs_pub = np.asarray(navs, dtype=np.float64)[mask]
+                nav_spy = np.asarray(nav_spy, dtype=np.float64)[mask]
+                nav_ew = np.asarray(nav_ew, dtype=np.float64)[mask]
+                if weights is not None and getattr(weights, "ndim", 0) == 2 and weights.shape[0] > 0:
+                    # Weight rows align with steps (nav points after the first).
+                    # Map by date: keep rows whose decision bar date is >= oos_cut.
+                    w_dates = test_idx[
+                        np.clip(
+                            start_bar + np.arange(weights.shape[0], dtype=np.int64),
+                            0,
+                            len(test_idx) - 1,
+                        )
+                    ]
+                    w_mask = pd.DatetimeIndex(w_dates) >= pd.Timestamp(oos_cut)
+                    weights = weights[w_mask] if bool(np.any(w_mask)) else weights[-1:]
+            else:
+                navs_pub = np.asarray(navs, dtype=np.float64)
+        else:
+            navs_pub = np.asarray(navs, dtype=np.float64)
+
+        ch = (manifest or {}).get("chronological_holdout") or {}
+        payload = build_forward_mark_payload(
+            run_id=run_id,
+            checkpoint_label=str(ckpt_label),
+            dates=time_nav,
+            nav_model=navs_pub,
+            nav_spy=nav_spy,
+            nav_ew=nav_ew,
+            weights=weights if weights is not None and getattr(weights, "size", 0) else None,
+            asset_labels=["Cash"] + list(panel_tickers),
+            initial_cash=float(get_config().environment.initial_cash),
+            holdout_start=str(ch.get("holdout_start") or "") or None,
+            holdout_end=str(ch.get("holdout_end") or "") or None,
+            note=(
+                f"provisional short OOS ({getattr(args, '_forward_mark_oos_n_bars', '?')} bars)"
+                if int(getattr(args, "_forward_mark_oos_n_bars", 99)) < 10
+                else ""
+            ),
+        )
+        out_mark = write_forward_mark(payload)
+        set_active_forward_run(run_id)
+        print(f"Forward mark: {out_mark}")
+
+    # Don't overwrite a real OOS backtest_summary with a 1–2 bar provisional mark.
+    if (
+        bool(getattr(args, "export_forward_mark", False))
+        and int(getattr(args, "_forward_mark_oos_n_bars", 99)) < 10
+    ):
+        return result
 
     detailed_stats: dict | None = None
     if args.detailed:
@@ -1218,6 +1419,8 @@ def rollout_policy_on_slice(
     progress: bool = False,
     progress_label: str = "rollout",
     obs_sink: list | None = None,
+    min_bars: int = 10,
+    include_final_close: bool = False,
 ) -> tuple[np.ndarray, int, int, np.ndarray | None]:
     """
     One full episode on a contiguous date slice. Returns
@@ -1227,10 +1430,15 @@ def rollout_policy_on_slice(
     ``obs_sink``: when given, receives the FINAL (normalized, if VecNormalize is
     active) observation — normalized features are z-scores vs frozen training
     stats, so callers can run drift alarms without reloading the pkl.
+
+    ``include_final_close``: when True, allow MTM through the last panel bar
+    (needed for short live forward-mark tails; default OOS backtests keep the
+    stricter ``_max_t = n-2`` guard).
     """
     n_bars = len(test_idx)
-    if n_bars < 10:
-        raise ValueError("Slice too short for a rollout")
+    min_bars = max(2, int(min_bars))
+    if n_bars < min_bars:
+        raise ValueError(f"Slice too short for a rollout (need >={min_bars} bars, got {n_bars})")
     raw_env = MultiAssetPortfolioEnv(
         test_ohlcv,
         test_rsi,
@@ -1249,6 +1457,14 @@ def rollout_policy_on_slice(
         domain_randomize=False,
         asset_live=test_asset_live,
     )
+    # Forward-mark live tails are short; default _max_t=n-2 drops the final close.
+    # Allow MTM through the last panel bar (step still only reads open/close[t+1]).
+    if include_final_close:
+        raw_env._max_t = int(raw_env.ohlcv.shape[0] - 1)
+        raw_env._current_seg_end = int(raw_env.ohlcv.shape[0])
+        raw_env.max_episode_steps = max(int(raw_env.max_episode_steps), n_bars)
+        raw_env._current_ep_max_steps = raw_env.max_episode_steps
+
     vec_env = None
     if use_vec_norm:
         if not vec_norm_path.is_file():
@@ -1744,6 +1960,12 @@ def main() -> None:
         "with norm_obs: true (refused by default — raw-obs metrics are meaningless).",
     )
     parser.add_argument("--no-viz", action="store_true", help="Skip saving backtest plot PNG")
+    parser.add_argument(
+        "--export-forward-mark",
+        action="store_true",
+        help="Write Runs/<id>/forward_mark.json (model/SPY/EW NAV + weights) for the ops "
+        "forward dashboard, and set execution/forward_active.json to this run.",
+    )
     parser.add_argument(
         "--show-viz",
         action="store_true",

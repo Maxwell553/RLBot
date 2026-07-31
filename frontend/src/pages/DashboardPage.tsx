@@ -78,7 +78,7 @@ export function DashboardPage() {
   const awaitingReview = mandates.filter((mandate) => mandate.state === 'draft').length
   const awaitingPayment = mandates.filter((mandate) => ['quote_issued', 'checkout'].includes(mandate.state)).length
   const activeBuilds = mandates.filter((mandate) => ['queued', 'training', 'validation', 'governed_oos_evaluation'].includes(mandate.state)).length
-  const blockingWarnings = (warnings: string[]) => warnings.filter((warning) =>
+  const blockingWarnings = (warnings: string[] | undefined) => (warnings ?? []).filter((warning) =>
     warning.startsWith('curriculum_preflight_failed')
     || warning.includes('hash_drift')
     || warning.includes('missing_vec_normalize'),

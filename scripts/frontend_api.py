@@ -43,23 +43,23 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from rlbot.curriculum_preflight import build_curriculum_preflight
-from rlbot.rl_config import load_config, validate_config_for_universe
-from rlbot.run_artifacts import (
-    PROJECT_ROOT,
-    RUNS_ROOT,
-    RunPaths,
-    read_run_manifest,
-    resolve_backtest_summary_path,
-)
-from rlbot.run_audit import audit_runs, discover_audit_run_ids
+# Keep startup imports tiny. Heavy rlbot modules (audit / config / preflight) touch
+# enough of the package that iCloud Desktop + concurrent training can hang the
+# import for tens of seconds — which leaves :8787 down and the UI in CORS timeouts.
+PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+RUNS_ROOT = PROJECT_ROOT / "Runs"
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")
 _AUDIT_CACHE_TTL_SECONDS = 60.0
+_AUDIT_REFRESH_TIMEOUT_SECONDS = 2.5
+_OOS_CACHE_TTL_SECONDS = 60.0
+_OOS_REFRESH_TIMEOUT_SECONDS = 2.5
 _MAX_PREFLIGHT_YAML_BYTES = 256 * 1024
 _INSTRUMENT_LOOKUP_CACHE_TTL_SECONDS = 300.0
 _YAHOO_USER_AGENT = "Mozilla/5.0 (compatible; MarketTrainer/1.0)"
+_EXECUTION_RUNS_CACHE = PROJECT_ROOT / "execution" / "api_runs_cache.json"
+_EXECUTION_OOS_CACHE = PROJECT_ROOT / "execution" / "api_oos_cache.json"
 
 app = FastAPI(title="MarketTrainer local API", version="0.1.0", docs_url="/docs")
 
@@ -73,26 +73,87 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid bearer token")
 
 
+def _call_with_timeout(fn, timeout_s: float, /, *args, **kwargs):
+    """Run ``fn`` in a worker; never block on shutdown if it overruns (iCloud)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(fn, *args, **kwargs).result(timeout=float(timeout_s))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _atomic_write_json(path: _Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
 class _AuditCache:
+    """Audit snapshot that never blocks the request thread on iCloud ``Runs/``.
+
+    Desktop/iCloud + concurrent training makes ``Runs.iterdir()`` / ``Path.stat()``
+    hang for tens of seconds. The UI polls ``/api/runs`` every 15s with a 10s
+    client timeout — any blocking refresh looks like a site-wide outage.
+    """
+
     def __init__(self) -> None:
         self._records: list[Any] | None = None
         self._by_id: dict[str, Any] = {}
         self._signatures: dict[str, tuple[tuple[int, int], ...]] = {}
         self._at = 0.0
+        self._refreshing = False
+        self._lock = __import__("threading").Lock()
+        self._load_disk_snapshot()
+
+    def _load_disk_snapshot(self) -> None:
+        try:
+            if not _EXECUTION_RUNS_CACHE.is_file():
+                return
+            payload = json.loads(_EXECUTION_RUNS_CACHE.read_text(encoding="utf-8"))
+            rows = payload.get("records") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or not rows:
+                return
+            # Rehydrate minimal dict-backed stand-ins via audit_runs is too slow;
+            # keep dicts and teach _run_record to accept both.
+            self._records = rows  # type: ignore[assignment]
+            self._by_id = {str(r["run_id"]): r for r in rows if isinstance(r, dict) and r.get("run_id")}
+            self._at = time.monotonic()
+        except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            pass
+
+    def _persist_disk_snapshot(self) -> None:
+        if not self._records:
+            return
+        try:
+            rows = []
+            for rec in self._records:
+                if hasattr(rec, "to_dict"):
+                    rows.append(rec.to_dict())
+                elif isinstance(rec, dict):
+                    rows.append(rec)
+            _atomic_write_json(
+                _EXECUTION_RUNS_CACHE,
+                {
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "n": len(rows),
+                    "records": rows,
+                },
+            )
+        except OSError:
+            pass
 
     @staticmethod
     def _signature(run_id: str) -> tuple[tuple[int, int], ...]:
+        from rlbot.run_artifacts import RunPaths
+
+        # Minimal watch set — fewer iCloud stats per run.
         paths = RunPaths(run_id=run_id, root=PROJECT_ROOT)
         watched = (
             paths.run_meta_dir / "manifest.json",
-            paths.config_snapshot,
             paths.run_meta_dir / "backtest_summary.json",
-            paths.run_meta_dir / "backtest_summary_final.json",
-            paths.run_meta_dir / "backtest_summary_latest.json",
-            paths.eval_nav_history,
-            paths.eval_log_dir / "reward_decomp.jsonl",
-            paths.eval_log_dir / "reward_decomp.json",
-            paths.models_dir / "checkpoints",
         )
         signature: list[tuple[int, int]] = []
         for path in watched:
@@ -103,19 +164,37 @@ class _AuditCache:
                 signature.append((0, 0))
         return tuple(signature)
 
-    def get(self) -> list[Any]:
-        now = time.monotonic()
-        ids = discover_audit_run_ids(root=PROJECT_ROOT)
+    def _discover_ids(self) -> list[str]:
+        # Name-only discovery via os.listdir (faster / less sticky than Path.iterdir
+        # on iCloud Desktop). Avoid per-dir manifest.is_file().
+        runs = PROJECT_ROOT / "Runs"
+        try:
+            names = os.listdir(runs)
+        except OSError:
+            return list(self._by_id.keys())
+        out: list[str] = []
+        for name in sorted(names):
+            if name.startswith(".") or "." in name:
+                continue
+            if _RUN_ID_RE.match(name):
+                out.append(name)
+        return out
+
+    def _refresh_blocking(self) -> list[Any]:
+        ids = self._discover_ids()
         id_set = set(ids)
         for stale_id in set(self._by_id) - id_set:
             self._by_id.pop(stale_id, None)
             self._signatures.pop(stale_id, None)
 
-        # Always re-audit runs whose watched artifacts changed (manifest, backtest
-        # summaries, checkpoints). Full rediscover also runs on TTL so new run dirs
-        # appear promptly for the ops dashboard auto-refresh.
+        now = time.monotonic()
         need_full = self._records is None or (now - self._at) > _AUDIT_CACHE_TTL_SECONDS
+        # Cap work per refresh so one hung run cannot scan the whole tree.
+        checked = 0
+        max_checks = 40 if need_full else 12
         for run_id in ids:
+            if checked >= max_checks and run_id in self._by_id:
+                continue
             signature = self._signature(run_id)
             if (
                 not need_full
@@ -123,6 +202,9 @@ class _AuditCache:
                 and run_id in self._by_id
             ):
                 continue
+            checked += 1
+            from rlbot.run_audit import audit_runs
+
             records = audit_runs([run_id], root=PROJECT_ROOT)
             if records:
                 self._by_id[run_id] = records[0]
@@ -131,16 +213,142 @@ class _AuditCache:
                 self._by_id.pop(run_id, None)
                 self._signatures.pop(run_id, None)
         self._records = [self._by_id[run_id] for run_id in ids if run_id in self._by_id]
-        if need_full:
-            self._at = now
+        self._at = now
+        self._persist_disk_snapshot()
         return self._records
 
+    def _kick_background_refresh(self) -> None:
+        import threading
+
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def _worker() -> None:
+            try:
+                _call_with_timeout(self._refresh_blocking, 45.0)
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        threading.Thread(target=_worker, name="audit-cache-refresh", daemon=True).start()
+
+    def get(self) -> list[Any]:
+        now = time.monotonic()
+        if self._records is not None:
+            if (now - self._at) > _AUDIT_CACHE_TTL_SECONDS:
+                self._kick_background_refresh()
+            return list(self._records or [])
+
+        # Cold start with no disk snapshot: one short attempt, then background.
+        try:
+            return list(
+                _call_with_timeout(self._refresh_blocking, _AUDIT_REFRESH_TIMEOUT_SECONDS)
+            )
+        except Exception:
+            self._kick_background_refresh()
+            return []
+
     def get_by_id(self, run_id: str) -> Any | None:
-        self.get()
-        return self._by_id.get(run_id)
+        # Prefer cached; only touch disk for the single id with a tight timeout.
+        if run_id in self._by_id and (time.monotonic() - self._at) <= _AUDIT_CACHE_TTL_SECONDS:
+            return self._by_id.get(run_id)
+        try:
+            def _one() -> Any | None:
+                from rlbot.run_audit import audit_runs
+
+                records = audit_runs([run_id], root=PROJECT_ROOT)
+                if records:
+                    self._by_id[run_id] = records[0]
+                    return records[0]
+                return self._by_id.get(run_id)
+
+            return _call_with_timeout(_one, _AUDIT_REFRESH_TIMEOUT_SECONDS)
+        except Exception:
+            return self._by_id.get(run_id)
 
 
 _audit_cache = _AuditCache()
+
+
+class _OosRowsCache:
+    def __init__(self) -> None:
+        self._rows: list[dict[str, Any]] | None = None
+        self._at = 0.0
+        self._refreshing = False
+        self._lock = __import__("threading").Lock()
+        self._load_disk()
+
+    def _load_disk(self) -> None:
+        try:
+            if not _EXECUTION_OOS_CACHE.is_file():
+                return
+            payload = json.loads(_EXECUTION_OOS_CACHE.read_text(encoding="utf-8"))
+            rows = payload.get("rows") if isinstance(payload, dict) else None
+            if isinstance(rows, list):
+                self._rows = rows
+                self._at = time.monotonic()
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    def _persist(self) -> None:
+        if self._rows is None:
+            return
+        try:
+            _atomic_write_json(
+                _EXECUTION_OOS_CACHE,
+                {
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "n": len(self._rows),
+                    "rows": self._rows,
+                },
+            )
+        except OSError:
+            pass
+
+    def _build(self) -> list[dict[str, Any]]:
+        rows = _oos_result_rows_uncached()
+        self._rows = rows
+        self._at = time.monotonic()
+        self._persist()
+        return rows
+
+    def _kick(self) -> None:
+        import threading
+
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def _worker() -> None:
+            try:
+                _call_with_timeout(self._build, 45.0)
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        threading.Thread(target=_worker, name="oos-cache-refresh", daemon=True).start()
+
+    def get(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if self._rows is not None:
+            if (now - self._at) > _OOS_CACHE_TTL_SECONDS:
+                self._kick()
+            return list(self._rows)
+        try:
+            return list(_call_with_timeout(self._build, _OOS_REFRESH_TIMEOUT_SECONDS))
+        except Exception:
+            self._kick()
+            return []
+
+
+_oos_cache = _OosRowsCache()
 
 
 class _InstrumentLookupCache:
@@ -302,7 +510,7 @@ def _progress_pct(elapsed: int | None, nominal: int | None) -> float | None:
 
 
 def _run_record(rec: Any) -> dict[str, Any]:
-    d = rec.to_dict()
+    d = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
     return {
         "run_id": d["run_id"],
         "window": _window_of(d["run_id"]),
@@ -319,7 +527,7 @@ def _run_record(rec: Any) -> dict[str, Any]:
         "oos_sharpe": d.get("oos_sharpe"),
         "oos_deflated_sharpe": d.get("oos_deflated_sharpe"),
         "oos_return": d.get("oos_return"),
-        "oos_max_drawdown": d.get("oos_max_dd"),
+        "oos_max_drawdown": d.get("oos_max_dd") if "oos_max_dd" in d else d.get("oos_max_drawdown"),
         "ew_excess_return": d.get("ew_excess_return"),
         "has_backtest": d.get("oos_sharpe") is not None or d.get("oos_return") is not None,
         "labels": d.get("labels") or [],
@@ -433,7 +641,7 @@ def _oos_row_from_backtest(run_id: str, backtest: dict[str, Any], published: dic
     }
 
 
-def _oos_result_rows() -> list[dict[str, Any]]:
+def _oos_result_rows_uncached() -> list[dict[str, Any]]:
     """Build OOS comparison rows from every local backtest summary.
 
     Prefer live backtest summaries (canonical ``backtest_summary.json``, else
@@ -443,15 +651,28 @@ def _oos_result_rows() -> list[dict[str, Any]]:
     published = _published_benchmark_index()
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    if not RUNS_ROOT.is_dir():
+    try:
+        entries = list(RUNS_ROOT.iterdir()) if RUNS_ROOT.exists() else []
+    except OSError:
         return []
-    for path in sorted(RUNS_ROOT.iterdir()):
-        if not path.is_dir():
+    for path in sorted(entries):
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
             continue
         run_id = path.name
         if not _RUN_ID_RE.match(run_id):
             continue
-        summary_path = resolve_backtest_summary_path(path)
+        summary_path = None
+        try:
+            from rlbot.run_artifacts import resolve_backtest_summary_path
+
+            summary_path = resolve_backtest_summary_path(path)
+        except Exception:
+            summary_path = path / "backtest_summary.json"
+            if not summary_path.is_file():
+                summary_path = None
         summary = _load_json(summary_path) if summary_path is not None else None
         if not isinstance(summary, dict):
             continue
@@ -489,15 +710,20 @@ def _oos_result_rows() -> list[dict[str, Any]]:
     return rows
 
 
+def _oos_result_rows() -> list[dict[str, Any]]:
+    return _oos_cache.get()
+
 def _cohort_sort_key(cohort: str) -> tuple[int, str]:
     return (int(cohort), cohort) if cohort.isdigit() else (10**9, cohort)
 
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    # Do not touch RUNS_ROOT here — Path.is_dir() on iCloud Desktop can hang and
+    # make npm run dev believe the research API never came up.
     return {
         "status": "ok",
-        "runs_root_exists": RUNS_ROOT.is_dir(),
+        "runs_root": str(RUNS_ROOT),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "auth_required": bool(os.environ.get("MARKETTRAINER_API_TOKEN", "").strip()),
         # Bumped when /api/results aggregation contract changes; used by frontend/scripts/dev.mjs
@@ -586,10 +812,21 @@ def run_detail(run_id: str) -> dict[str, Any]:
     if rec is None:
         raise HTTPException(status_code=404, detail="Unknown run id")
 
-    manifest = read_run_manifest(run_id) or {}
-    paths = RunPaths(run_id=run_id, root=PROJECT_ROOT)
-    summary_path = resolve_backtest_summary_path(paths)
-    backtest = _load_json(summary_path) if summary_path is not None else None
+    manifest: dict[str, Any] = {}
+    backtest = None
+    try:
+        from rlbot.run_artifacts import RunPaths, read_run_manifest, resolve_backtest_summary_path
+
+        def _load_detail() -> tuple[dict[str, Any], dict[str, Any] | None]:
+            man = read_run_manifest(run_id) or {}
+            paths = RunPaths(run_id=run_id, root=PROJECT_ROOT)
+            summary_path = resolve_backtest_summary_path(paths)
+            bt = _load_json(summary_path) if summary_path is not None else None
+            return man, bt
+
+        manifest, backtest = _call_with_timeout(_load_detail, 2.0)
+    except Exception:
+        manifest, backtest = {}, None
 
     audit_row = _run_record(rec)
 
@@ -677,6 +914,9 @@ def preflight(body: PreflightRequest) -> dict[str, Any]:
         tmp.write(raw)
         tmp.close()
         try:
+            from rlbot.curriculum_preflight import build_curriculum_preflight
+            from rlbot.rl_config import load_config, validate_config_for_universe
+
             cfg = load_config(tmp.name)
             n_assets = len(cfg.universe.assets)
             validate_config_for_universe(cfg, n_assets)
@@ -717,6 +957,114 @@ def instrument_search(
     }
 
 
+@app.get("/api/forward", dependencies=[Depends(_require_token)])
+def forward_dashboard(
+    run_id: str = "",
+    live: bool = True,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Serve the active (or requested) forward-mark series for the ops live chart.
+
+    When ``live`` is true (default), rebuilds model / EW / SPY **5-minute**
+    NAV marks from the latest target weights and a throttled Yahoo OHLC pull
+    (~every 5 minutes) — without re-running torch. Live refresh is bounded so a
+    hung Yahoo/iCloud pull cannot take down the whole API process.
+    """
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    from rlbot.forward_mark import (
+        call_with_timeout,
+        load_forward_mark,
+        resolve_active_forward_run_id,
+    )
+
+    rid = (run_id or "").strip() or (resolve_active_forward_run_id() or "")
+    if not rid:
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "available": False,
+            "run_id": None,
+            "mark": None,
+            "message": (
+                "No forward mark yet. Train a LIVE_* run through the deploy date, then "
+                "python scripts/forward_mark.py --run-id <LIVE_ID> --refresh-data"
+            ),
+        }
+    if not _RUN_ID_RE.match(rid):
+        raise HTTPException(status_code=400, detail="Invalid run id")
+
+    # Always prefer the local execution/ mirror first so a hung Yahoo pull cannot
+    # blank the chart (and so we never block on iCloud Runs/).
+    mark: dict[str, Any] | None = load_forward_mark(rid)
+    live_error: str | None = None
+    if live:
+        try:
+            from rlbot.forward_live import refresh_forward_mark_live
+
+            # When a mark already exists, refresh in the background and return the
+            # disk snapshot immediately — UI polls ~30s and picks up the new bars.
+            # Cold start (no mark yet) still waits briefly for the first payload.
+            if mark is not None and not force_refresh:
+                import threading
+
+                def _bg() -> None:
+                    try:
+                        call_with_timeout(
+                            refresh_forward_mark_live,
+                            30.0,
+                            rid,
+                            force_price_refresh=False,
+                        )
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_bg, name="forward-live-refresh", daemon=True).start()
+            else:
+                refreshed = call_with_timeout(
+                    refresh_forward_mark_live,
+                    20.0,
+                    rid,
+                    force_price_refresh=bool(force_refresh),
+                )
+                if refreshed is not None:
+                    mark = refreshed
+        except FuturesTimeout:
+            live_error = "live refresh timed out; serving last mark"
+        except Exception as exc:  # noqa: BLE001 — surface to UI, keep last mark
+            live_error = f"{type(exc).__name__}: {exc}"
+    if mark is None:
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "available": False,
+            "run_id": rid,
+            "mark": None,
+            "message": (
+                f"Run {rid} has no forward_mark.json. "
+                f"Run: python scripts/forward_mark.py --run-id {rid} --refresh-data"
+                + (f" (live refresh failed: {live_error})" if live_error else "")
+            ),
+        }
+    # Drop full daily weight history from the default payload when very long; keep latest.
+    weights = mark.get("weights")
+    if isinstance(weights, list) and len(weights) > 400:
+        mark = {**mark, "weights": weights[:: max(1, len(weights) // 200)]}
+    if live_error:
+        mark = {
+            **mark,
+            "note": (
+                f"{mark.get('note') or ''} "
+                f"[live refresh warning: {live_error}]"
+            ).strip(),
+        }
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "available": True,
+        "run_id": rid,
+        "mark": mark,
+        "message": None,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -734,13 +1082,29 @@ def main() -> None:
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
     ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["authorization", "content-type"],
+        allow_headers=["authorization", "content-type", "accept"],
     )
+
+    @app.on_event("startup")
+    def _warmup_caches() -> None:
+        # Delay background Runs/ enrichment so bind + /api/health stay instant even
+        # when iCloud is saturated by training.
+        import threading
+
+        def _later() -> None:
+            time.sleep(3.0)
+            _audit_cache._kick_background_refresh()
+            _oos_cache._kick()
+
+        threading.Thread(target=_later, name="api-cache-warmup", daemon=True).start()
 
     import uvicorn
 

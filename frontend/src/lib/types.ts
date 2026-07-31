@@ -91,6 +91,18 @@ export type ApiDashboard = {
   window_sharpes: { window: string; sharpe: number }[]
 }
 
+export type ApiPortfolioDiagnostics = {
+  n_steps?: number
+  mean_cash_frac?: number
+  mean_gross_exposure?: number
+  mean_effective_n_assets?: number
+  mean_hhi?: number
+  mean_top3_concentration?: number
+  cap_hit_fraction?: number
+  mean_turnover?: number
+  per_asset_mean_weights?: Record<string, number>
+}
+
 export type ApiRunDetail = {
   run_id: string
   audit: ApiRun | null
@@ -119,7 +131,7 @@ export type ApiRunDetail = {
     excess_return_vs_equal_weight: number | null
     hash_drift: unknown
     n_bars: number | null
-    portfolio_diagnostics: Record<string, number> | null
+    portfolio_diagnostics: ApiPortfolioDiagnostics | null
   } | null
 }
 
@@ -169,6 +181,82 @@ export type InstrumentMatch = {
   group: Asset['group']
   exchange: string | null
   currency: string | null
+}
+
+export type ApiForwardStats = {
+  total_return: number | null
+  sharpe: number | null
+  max_drawdown: number | null
+  nav: number | null
+}
+
+export type ApiForwardPosition = {
+  label: string
+  ticker: string
+  weight: number
+  value_usd: number
+  price: number | null
+}
+
+export type ApiForwardLiveMeta = {
+  prices_refreshed?: boolean
+  as_of_bar?: string
+  as_of_utc?: string
+  min_refresh_seconds?: number
+  bar_interval?: string
+  source?: string
+}
+
+export type ApiForwardCandle = {
+  t: string
+  o: number
+  h: number
+  l: number
+  c: number
+}
+
+export type ApiForwardMark = {
+  schema?: string
+  generated_at_utc?: string
+  run_id: string
+  checkpoint_label: string
+  initial_cash: number
+  holdout_start: string | null
+  holdout_end: string | null
+  n_bars: number
+  /** Bar timestamps (ISO) for intraday; may equal ``dates``. */
+  dates: string[]
+  timestamps?: string[]
+  bar_interval?: string | null
+  nav: {
+    model: number[]
+    spy: number[]
+    equal_weight: number[]
+  }
+  candles?: {
+    model: ApiForwardCandle[]
+    spy: ApiForwardCandle[]
+    equal_weight: ApiForwardCandle[]
+  } | null
+  stats: {
+    model: ApiForwardStats
+    spy: ApiForwardStats
+    equal_weight: ApiForwardStats
+  }
+  latest_weights: Record<string, number> | null
+  weights: Record<string, number>[] | null
+  asset_labels: string[]
+  positions?: ApiForwardPosition[] | null
+  live?: ApiForwardLiveMeta | null
+  note?: string
+}
+
+export type ApiForward = {
+  generated_at_utc: string
+  available: boolean
+  run_id: string | null
+  mark: ApiForwardMark | null
+  message: string | null
 }
 
 /**

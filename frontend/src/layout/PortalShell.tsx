@@ -51,9 +51,7 @@ export function PortalShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
   const location = useLocation()
 
-  useEffect(() => {
-    for (const item of nav) void item.preload()
-  }, [])
+  // Preload only on hover/focus — keep first paint to the active route.
 
   useEffect(() => {
     if (!mobileOpen) return

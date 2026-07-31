@@ -55,7 +55,12 @@ export class RequestCoordinator {
     else this.cache.clear()
   }
 
-  request<T>(url: string, init: RequestInit = {}, consumerSignal?: AbortSignal): Promise<T> {
+  request<T>(
+    url: string,
+    init: RequestInit = {},
+    consumerSignal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<T> {
     const method = (init.method ?? 'GET').toUpperCase()
     const cacheable = method === 'GET'
     const now = Date.now()
@@ -64,30 +69,31 @@ export class RequestCoordinator {
       return consumerAbort(existing.promise as Promise<T>, consumerSignal)
     }
 
+    const effectiveTimeout = timeoutMs ?? this.timeoutMs
     const controller = new AbortController()
     let timeout: ReturnType<typeof globalThis.setTimeout>
     const timeoutFailure = new Promise<never>((_, reject) => {
       timeout = globalThis.setTimeout(() => {
         controller.abort('timeout')
-        reject(new RequestFailure('timeout', `Request timed out after ${this.timeoutMs / 1000} seconds`))
-      }, this.timeoutMs)
+        reject(new RequestFailure('timeout', `Request timed out after ${effectiveTimeout / 1000} seconds`))
+      }, effectiveTimeout)
     })
     const networkRequest = fetch(url, { ...init, signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) {
-          throw new RequestFailure('http', `HTTP ${response.status} from ${new URL(url).pathname}`, response.status)
+          throw new RequestFailure('http', `HTTP ${response.status} from ${new URL(url, 'http://local.invalid').pathname}`, response.status)
         }
         try {
           return await response.json() as T
         } catch {
-          throw new RequestFailure('invalid-response', `Invalid JSON from ${new URL(url).pathname}`)
+          throw new RequestFailure('invalid-response', `Invalid JSON from ${new URL(url, 'http://local.invalid').pathname}`)
         }
       })
     const promise = Promise.race([networkRequest, timeoutFailure])
       .catch((error: unknown) => {
         if (error instanceof RequestFailure) throw error
         if (controller.signal.aborted) {
-          throw new RequestFailure('timeout', `Request timed out after ${this.timeoutMs / 1000} seconds`)
+          throw new RequestFailure('timeout', `Request timed out after ${effectiveTimeout / 1000} seconds`)
         }
         throw new RequestFailure(
           'network',

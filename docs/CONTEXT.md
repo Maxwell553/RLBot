@@ -1,8 +1,8 @@
 # CONTEXT.md — Empirical Run Analysis for Environment Improvement
 
 **Audience:** a separate agent tasked with improving MarketTrainer’s *environment / reward / observation* design (not just hyperparameter tuning).  
-**Generated:** 2026-07-19 from local `Runs/` artifacts (`backtest_summary.json`, run `config.yaml`, `manifest.json`, plus `docs/RESEARCH.md` and `Runs/cohort_vs_benchmark.json`).  
-**Scope:** 80 completed OOS backtests across cohorts `W*_612` … `W*_627` (5 walk-forward windows × 16 cohort IDs). One incomplete tree `W1_625_a` (training interrupted, no backtest) is excluded.
+**Generated:** 2026-07-19 from local `Runs/` artifacts; **updated 2026-07-27** with method-era cohorts `720`–`730` and EW/SPY Sharpe baselines.  
+**Scope:** OOS backtests across (1) historical exposure×seed tree `W*_612` … `W*_627` and (2) method-era cohorts `W*_720` … `W*_730`. Incomplete / interrupted trees without a usable backtest are excluded.
 
 This document is evidence-first. Prefer the tables and statistics below over narrative memory. Canonical protocol details live in `README.md` / `AGENTS.md`; published cohort narrative lives in `docs/RESEARCH.md`.
 
@@ -12,9 +12,10 @@ This document is evidence-first. Prefer the tables and statistics below over nar
 
 1. Treat **OOS holdout metrics** (`total_return`, `sharpe`, `max_drawdown`, `deflated_sharpe`) as the only generalization signal.
 2. Treat in-training eval NAV / robust score as **model-selection** diagnostics only (they do not validate OOS).
-3. **Do not** optimize on contaminated cohorts (`622`–`625`; see §3).
+3. **Do not** optimize on contaminated cohorts (`622`–`625`; see §3). Treat **`612` as exploratory** (mixed-era code), not as a clean replication cell.
 4. When proposing env/reward changes, keep the OOS firewall: do not patch universe, costs, holdout dates, or split geometry via research specs (`rlbot/research/spec.py` rejects those).
 5. Success criteria for an “improved environment” should be stated as **distributional** wins (median Sharpe / chained return / drawdown across W1–W5 and ≥2 seeds), not a single-window spike.
+6. **Cash-park Sharpe inflation:** if mean OOS cash ≳ 60% (esp. W5), treat headline Sharpe as suspect — compare excess vs equal-weight and absolute return, not Sharpe alone (`729` / `730` best on W5).
 
 ---
 
@@ -24,32 +25,36 @@ This document is evidence-first. Prefer the tables and statistics below over nar
 | --- | --- |
 | Model | RecurrentPPO `MlpLstmPolicy`, LSTM 64×2, MLP `[128,128]` |
 | Universe | N=10 (SP500, GOLD, OIL, EURUSD, USDJPY, NIKKEI, FTSE, BOND10Y, COPPER, EM) |
-| Timesteps | 50M |
+| Timesteps | 50M (method-era; same for most historical cells) |
 | `feature_split_mode` | `independent` |
 | `obs_lag` (OOS) | 1 |
 | Action | cash + N logits → softmax → live-mask → per-asset cap → long-only simplex |
 | Default `max_single_asset_weight` | **0.20** (cohorts 626/627 use **0.60**) |
 | Reward benchmark | equal feasible weights `1/N` |
-| Best-checkpoint selection | robust score vs `equal_weight_daily` after `fee_ramp_end` |
+| Best-checkpoint selection | robust score vs `equal_weight_daily` after `fee_ramp_end` (mode evolved: `excess_nav` → `excess_sharpe` → `defensive_sharpe`) |
 | Turnover penalty | `0.007` |
 | `reward_scale` | 2000 |
-| `benchmark_excess_scale` | 600 |
-| `sortino_downside_floor` | 0.001 |
-| Early-stop patience | 8 (rarely triggered; 77/80 runs finished without early stop) |
 
-Walk-forward windows:
+Walk-forward windows and **passive baselines** (from `Runs/cohort_vs_benchmark.json`; medians across historical cells — use these when reading cohort tables):
 
-| Window | OOS | Passive EW (median) | SPY sleeve (median) |
-| --- | --- | ---: | ---: |
-| W1 | 2016–2017 | +28.4% | +46.4% |
-| W2 | 2018–2019 | +2.7% | +18.0% |
-| W3 | 2020–2021 | +17.3% | +52.5% |
-| W4 | 2022–2023 | +5.3% | +7.3% |
-| W5 | 2024–2025 | +33.2% | +45.7% |
+| Window | OOS | EW return | EW Sharpe | SPY sleeve return | SPY Sharpe |
+| --- | --- | ---: | ---: | ---: | ---: |
+| W1 | 2016–2017 | +28.4% | **1.84** | +46.4% | **2.09** |
+| W2 | 2018–2019 | +2.7% | **0.19** | +18.0% | **0.56** |
+| W3 | 2020–2021 | +17.3% | **0.63** | +52.5% | **0.84** |
+| W4 | 2022–2023 | +5.3% | **0.29** | +7.3% | **0.19** |
+| W5 | 2024–2025 | +33.2% | **1.71** | +45.7% | **1.18** |
 
-Chained W1–W5 passive reference (compounding the median window returns): **EW ≈ +117%**, **SPY ≈ +312%**.
+Passive summary over the five windows:
 
-OOS burn: `oos_trials_for_window` in recent summaries is ~**46–49** distinct model reads per window. Deflated Sharpe is almost always low (see §5).
+| Book | Chained return (compound window medians) | Mean of window Sharpes |
+| --- | ---: | ---: |
+| Equal-weight daily | **≈ +117%** | **≈ 0.93** |
+| SPY sleeve | **≈ +312%** | **≈ 0.97** |
+
+So a cohort with mean Sharpe **1.05–1.12** (612/613) is **above** both passive mean Sharpes, but still far behind SPY on **chained return** (agent ~+140–186% vs SPY ~+312%). Absolute Sharpe leadership ≠ beating SPY wealth.
+
+OOS burn: recent summaries show ~**46–50+** distinct model reads per window. Deflated Sharpe is almost always low (see §5).
 
 ---
 
@@ -64,35 +69,48 @@ OOS burn: `oos_trials_for_window` in recent summaries is ~**46–49** distinct m
 | `623`–`625` | 300.0 | **Invalid** — exclude from method comparisons |
 | `622` | 300.0 | **Separate flag** (`vol_penalty_bug_present`) — do not bundle with 623–625 |
 | `626`–`627` | 0.15 (fixed) | Usable, but also changed **cap to 0.60** (confounded) |
-| `612`–`621` | absent / pre-term | Usable as pre-vol-penalty grid (see caveats) |
+| `612`–`621` | absent / pre-term | Usable as pre-vol-penalty grid (**612 mixed-era caveat**) |
 
 Also label **`W3_619`–`W5_619`** as `resumed_long_budget` (~82–84M cumulative); not comparable to single-pass 50M cells. Use `python scripts/audit_runs.py` for automatic labels.
 
 Raw contaminated chained returns still look “fine” (`622` +83%, `623` +149%, `624` +120%, `625` +176%) — **that is not evidence the penalty worked**; the reward signal was broken.
 
-### Caveats on older “clean” cohorts
+### Caveats on older “clean” cohorts — were 612 / 613 contaminated?
 
-- `docs/RESEARCH.md` flags **`W*_612` as mixed-era** (W1–W2 pre-rebalance code / different best-checkpoint rule; W3–W5 post-rebalance). Treat 612 as exploratory.
-- `W*_615` was split mid-cohort on commit metadata historically; current backtest summaries stamp a uniform commit hash — still treat seed/exposure cells as thin samples.
-- Backtest `git_commit` on disk is often the *backtest-time* tree, not a perfect training-time pin. Prefer run-local `config.yaml` + `manifest.json` for settings.
+**Short answer:** `613` is a real (seed-lucky) clean cell. `612` is **not fully clean** for replication — it is **mixed-era**, not vol-penalty-contaminated.
 
-### Usable analysis sets used below
+| Cohort | Contaminated? | Why the high mean Sharpe? |
+| --- | --- | --- |
+| **612** (mean Sh **1.12**, chained +140.7%) | **Partially.** W1–W2 trained on pre-rebalance code (`fe6d923`, NAV-based best checkpoint, different reward-benchmark wiring); W3–W5 on post-rebalance (`076137e`). | Strong W5 Sharpe (**2.30**) and solid W1/W2 lift the average. Treat as **exploratory** — do not use as the sole target recipe. |
+| **613** (mean Sh **1.05**, chained +186.2%) | **No** vol-bug / mixed-era flag. Same seed-0 exposure-100 cell in the published grid. | Actually strong: beat EW **4/5**, mean excess vs EW **+7.5%**, huge W3 return (**+54%**, Sh 1.93). But **seed-fragile**: same exposure at seed 42 (`617`) drops to mean Sh **0.86** / chained +135.5%. Also still loses badly to SPY on wealth (+186% vs ~+312% chained). |
+
+Neither 612 nor 613 is in the `vol_penalty_scale=300` invalid set. The high averages are **not** fake like 729’s W5 cash-park Sharpe — those policies were mostly **invested** (mean cash 3–8%). They are **good single-seed outcomes** from a simple exposure×seed era, not a proof that “exp=80/100 at seed 0” is a stable global optimum.
+
+### Method-era caveats (`720`+)
+
+- Environment / selection / reward changed repeatedly; **do not grid-compare raw Sharpes against `612`–`627` without reading fingerprints** (§4.2).
+- `729` / `730` **best** checkpoints on W5 can show Sharpe ≫ 2 with ~90%+ cash — that is **T-bill / vol-collapse Sharpe**, not skill (excess vs EW deeply negative). Prefer final weights or require mean cash ≲ 55% when ranking.
+
+### Usable analysis sets
 
 - **Set A — Published exposure×seed grid:** cohorts `612`–`617` (n=30). Matches `docs/RESEARCH.md`.
 - **Set B — Extended cap=0.20 grid:** `612`–`621` (n=50). Adds exposure 60/120 and seed 101.
 - **Set C — Post-fix cap experiment:** `626`–`627` (n=10). `vol_penalty_scale=0.15`, `max_single_asset_weight=0.60`.
-- **Excluded:** `622`–`625`, `W1_625_a`.
+- **Set D — Method era:** `720`–`730` (see §4.2). Compare within-era; flag cash-inflated cells.
+- **Excluded:** `622`–`625`, incomplete trees.
 
 ---
 
 ## 4. Cohort fingerprints (what actually varied)
 
-Primary intentional axes across the tree:
+### 4.1 Historical tree (`612`–`627`) — primary intentional axes
+
+Passive reference while reading this table: **EW mean Sh ≈ 0.93 / chained ≈ +117%**; **SPY mean Sh ≈ 0.97 / chained ≈ +312%**.
 
 | Cohort | Seed | `exposure_risk_penalty_scale` | `vol_penalty_scale` | Cap | Config recipe | Chained OOS | Mean Sharpe | Mean max DD | Mean cash |
 | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 612 | 0 | 80 | — | 0.20 | `config.yaml` | **+140.7%** | 1.12 | −10.7% | 8% |
-| 613 | 0 | 100 | — | 0.20 | `config.yaml` | **+186.2%** | 1.05 | −11.2% | 3% |
+| 612 | 0 | 80 | — | 0.20 | `config.yaml` | **+140.7%** | **1.12** | −10.7% | 8% |
+| 613 | 0 | 100 | — | 0.20 | `config.yaml` | **+186.2%** | **1.05** | −11.2% | 3% |
 | 614 | 0 | 90 | — | 0.20 | `config.yaml` | +110.7% | 0.66 | −16.0% | 1% |
 | 615 | 42 | 90 | — | 0.20 | `config.yaml` | +135.2% | 0.84 | −15.0% | 4% |
 | 616 | 42 | 80 | — | 0.20 | `config.yaml` | +82.1% | 0.81 | −11.1% | 17% |
@@ -108,9 +126,49 @@ Primary intentional axes across the tree:
 | 626 | 0 | 80 | 0.15 | **0.60** | `exp80_cap60_s0.yaml` | +174.7% | 0.82 | −16.5% | **0%** |
 | 627 | 42 | 80 | 0.15 | **0.60** | `exp80_cap60_s0.yaml` | +125.4% | 0.55 | −18.5% | 1% |
 
-† Contaminated — listed only for inventory.
+† Contaminated (`vol_penalty_scale=300`) — listed only for inventory.
 
-Almost everything else (costs, curriculum fractions, entropy schedule, network size, LR, turnover penalty, concentration target, inactivity/participation terms) was held constant. So historical “search” has mostly been **exposure scale × seed**, then a broken vol-penalty attempt, then a **cap relaxation**.
+Almost everything else in this era (costs, curriculum, entropy, network, LR, turnover, concentration target, inactivity/participation) was held constant. Historical “search” was mostly **exposure scale × seed**, then a broken vol-penalty attempt, then a **cap relaxation**.
+
+### 4.2 Method-era cohorts (`720`–`730`) — added 2026-07-27
+
+These change reward / selection / action head / eval alignment. Metrics prefer `backtest_summary_best.json` when present (else canonical summary). **‡** = Sharpe inflated by cash-park (mean cash ≳ 60% on that checkpoint’s W5).
+
+| Cohort | Seed | Key recipe delta (short) | Chained OOS | Mean Sharpe | Mean max DD | Mean cash | Notes |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 720 | 0 | Clean Jul-2026 baseline: `vol=0.15`, `exp=100` realized_vol, `excess_sharpe` | **+168.9%** | **0.98** | −13.4% | 6% | Closest clean mean-Sh≈1.0 target |
+| 721 | 0 | Higher Sortino + weak DD-level raise | +146.1% | 0.92 | −13.8% | 18% | Below 720; W3 DD worsened |
+| 722 | 0 | Same as 721 @ **20M** budget | +102.3% | 0.72 | −15.2% | 8% | Budget datapoint only |
+| 723 | 0 | Curriculum / selection hardening era | +166.1% | 0.95 | −15.2% | 2% | Near 720 chained |
+| 724 | 0 | Same family | +111.0% | 0.82 | −14.9% | 14% | Weaker |
+| 725 | 0 | Same family | +143.1% | 0.91 | −15.1% | 7% | Mid |
+| 726 | 0 | OOS-aligned eval | +114.0% | 0.70 | −16.3% | 2% | Alignment ≠ Sharpe win |
+| 727 | 0 | Two-head actions ON; multi-regime | +167.4% | 0.85 | −15.0% | 9% | Strong W3 return |
+| 728 | 0 | `defensive_sharpe` + VIX+ exposure + DD taper | +97.5% | 0.86 | **−10.1%** | 26% | Best mean DD; lower chained |
+| 729 | 0 | Abs vol; crash-cash selection; inactivity off | +116.0% | **2.14‡** | −7.4% | **51%** | W5 best Sh 6.63 @ ~94% cash — **do not trust mean Sh** |
+| 730 | 0 | Lower cash yield + mean-cash cap | +53.0% | **0.98‡** | −8.7% | **49%** | W4 negative; W5 best still cash-heavy |
+
+Per-window Sharpe (`720`–`730`, preferred checkpoint):
+
+| Win | EW | SPY | 720 | 721 | 722 | 723 | 724 | 725 | 726 | 727 | 728 | 729 | 730 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | 1.84 | 2.09 | 1.46 | 1.80 | 1.56 | 1.82 | 1.47 | 1.88 | 0.95 | 1.31 | 1.82 | 1.90 | 1.47 |
+| W2 | 0.19 | 0.56 | 0.30 | 0.27 | 0.16 | 0.18 | 0.34 | 0.05 | 0.20 | 0.38 | 0.30 | 0.19 | 0.35 |
+| W3 | 0.63 | 0.84 | 0.73 | 0.78 | 0.59 | 0.71 | 0.70 | 0.33 | 0.67 | 1.18 | 0.50 | 0.94 | 0.83 |
+| W4 | 0.29 | 0.19 | **0.55** | 0.41 | 0.39 | 0.24 | 0.11 | 0.49 | 0.23 | 0.30 | 0.52 | 1.05‡ | **−0.29** |
+| W5 | 1.71 | 1.18 | 1.85 | 1.34 | 0.91 | 1.80 | 1.46 | 1.78 | 1.44 | 1.10 | 1.15 | **6.63‡** | **2.54‡** |
+
+‡ Cash-inflated or otherwise non-comparable (see notes). Honest reading: method-era mean Sharpes that clear **~1.0 without parks** are rare; **720 (0.98)** remains the clean reference. W2/W4 stay the bottleneck vs EW/SPY.
+
+Per-window return (%):
+
+| Win | EW | SPY | 720 | 721 | 726 | 727 | 728 | 729 | 730 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | +28.4 | +46.4 | +26.7 | +37.1 | +16.2 | +25.7 | +32.5 | +37.5 | +22.8 |
+| W2 | +2.7 | +18.0 | +5.6 | +4.4 | +4.5 | +7.0 | +5.1 | +2.6 | +4.9 |
+| W3 | +17.3 | +52.5 | +25.8 | +31.9 | +21.5 | +48.0 | +9.9 | +19.9 | +15.7 |
+| W4 | +5.3 | +7.3 | +11.9 | +9.5 | +6.0 | +7.6 | +9.2 | +11.6 | −4.2 |
+| W5 | +33.2 | +45.7 | +42.8 | +19.0 | +37.0 | +24.9 | +18.2 | +14.3 | +7.2 |
 
 ---
 
@@ -348,10 +406,9 @@ Baseline numbers to beat (Set A medians / strong cells):
 | `Runs/<id>/config.yaml` | Frozen reward/env settings |
 | `Runs/<id>/manifest.json` | Seeds, dates, training status, best-eval score |
 | `Runs/<id>/plots/training.png` | Curriculum / eval / allocation diagnostics |
-| `Runs/cohort_vs_benchmark.json` | EW/SPY comparisons for cohorts ≤621 |
-| `Runs/oos_ledger.jsonl` | Multiple-testing / burn history |
+| `Runs/cohort_vs_benchmark.json` | EW/SPY return+Sharpe for cohorts ≤621 (source for §2 baselines) |
 | `docs/RESEARCH.md` | Published narrative + contamination warning |
-| `config/config.yaml` | Current default recipe (`vol_penalty_scale: 0.15`, cap 0.20, exp 100 as of Jul 2026) |
+| `config/config.yaml` | Current default recipe (evolves; see run snapshots for historical truth) |
 | `config/cohorts/*.yaml` | Frozen cohort recipes |
 | `.cache/runs_analysis.json` | Machine-readable extract used to build this doc (regenerate via `.cache/analyze_runs.py`) |
 
@@ -359,15 +416,17 @@ Baseline numbers to beat (Set A medians / strong cells):
 
 ## 12. Bottom line for the improving agent
 
-Historical search mostly swept **exposure penalty × seed** under a fixed env. That produced occasionally strong chained returns (best clean: **618 +205%**, **613 +186%**) but:
+Historical search mostly swept **exposure penalty × seed** under a fixed env. That produced occasionally strong chained returns (best clean: **618 +205%**, **613 +186%**) and mean Sharpes that beat EW/SPY averages (**612 1.12**, **613 1.05** vs EW ≈0.93 / SPY ≈0.97) but:
 
+- **612 is mixed-era** (not a clean replication cell); **613 is real but seed-fragile** (617 at same exposure is weaker),
 - **seed instability is first-order**,
-- **W2/W4 risk-adjusted performance is weak**,
+- **W2/W4 risk-adjusted performance is weak** (still true in method-era `720`–`730`),
 - **drawdowns in W3 remain large**,
 - **eval selection does not predict OOS**,
-- **policies concentrate and stay invested**,
+- **policies concentrate and stay invested** (or, later, over-correct into cash parks),
 - **deflated Sharpes never clear a high bar** given ~50 burns/window,
-- the only major reward-term innovation attempted (`vol_penalty_scale=300`) **corrupted training** and must not be repeated without unit checks,
-- relaxing the asset cap to 0.60 bought return with **worse Sharpe/DD**.
+- the only major reward-term bug (`vol_penalty_scale=300`) **corrupted training**,
+- relaxing the asset cap to 0.60 bought return with **worse Sharpe/DD**,
+- method-era defensive stacks (`728`–`730`) improved DD but have **not** cleanly beaten **720’s mean Sh ≈ 0.98** without cash-inflated W5.
 
-Highest-leverage env work is therefore: (1) healthier risk-off / cash optionality, (2) real diversification constraints, (3) eval–OOS alignment, (4) regime-aware risk penalties with safe magnitudes — validated multi-seed on W1–W5, with W4/W2 as gate metrics.
+Highest-leverage env work is therefore: (1) healthier risk-off / cash optionality **without parks**, (2) real diversification constraints, (3) eval–OOS alignment, (4) regime-aware risk penalties with safe magnitudes — validated multi-seed on W1–W5, with W4/W2 as gate metrics, always scored against the **EW/SPY Sharpe+return table in §2**.

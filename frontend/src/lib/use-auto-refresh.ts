@@ -1,7 +1,10 @@
 import { useEffect, useRef } from 'react'
 
-/** Default ops dashboard poll interval (ms). Keeps OOS / training rows current. */
-export const DEFAULT_AUTO_REFRESH_MS = 15_000
+/**
+ * Ops poll interval. Static snapshots are local files — polling is cheap, but
+ * there is no need to hammer every 15s when data only changes after publish.
+ */
+export const DEFAULT_AUTO_REFRESH_MS = 60_000
 
 /**
  * Periodically invoke ``reload`` while the tab is visible.
