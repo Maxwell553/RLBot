@@ -307,8 +307,8 @@ def resolve_active_forward_run_id(root: Path | None = None) -> str | None:
     candidates: list[tuple[float, str]] = []
     for path in exec_dir.glob("forward_mark_*.json"):
         name = path.name.removeprefix("forward_mark_").removesuffix(".json")
-        # LIVE_* RL deploy marks, or FINALMODEL (locked PIT momentum paper book).
-        if name.startswith("LIVE_") or name == "FINALMODEL":
+        # LIVE_* RL deploy marks, or locked algo paper book (1360pctAlgo).
+        if name.startswith("LIVE_") or name in {"PROD_RETURN_ALPHA", "FINALMODEL"}:
             try:
                 candidates.append((path.stat().st_mtime, name))
             except OSError:

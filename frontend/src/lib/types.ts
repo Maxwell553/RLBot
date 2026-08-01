@@ -232,7 +232,7 @@ export type ApiForwardMark = {
     model: number[]
     spy: number[]
     equal_weight: number[]
-    /** Optional companion RL deploy (LIVE_MODEL) alongside FINALMODEL. */
+    /** Optional companion RL deploy (LIVE_MODEL) alongside PROD_RETURN_ALPHA. */
     live_model?: number[]
   }
   candles?: {

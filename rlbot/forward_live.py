@@ -26,8 +26,10 @@ from rlbot.rl_config import get_config, load_config, set_config
 from rlbot.run_artifacts import PROJECT_ROOT
 
 LIVE_STAMP_NAME = "forward_live_stamp.json"
-# Companion RL deploy shown alongside FINALMODEL on /ops/forward.
+# Companion RL deploy shown alongside PROD_RETURN_ALPHA on /ops/forward.
 RL_LIVE_RUN_ID = "LIVE_MODEL"
+# Locked 1360pctAlgo paper book (TQQQ weekly + GLD/TLT dual).
+ALGO_LIVE_RUN_ID = "PROD_RETURN_ALPHA"
 # Candle grid is 5m; refresh Yahoo about once per new bar.
 DEFAULT_MIN_REFRESH_SECONDS = 300
 BAR_INTERVAL = "5m"
@@ -40,6 +42,117 @@ INTRADAY_LOOKBACK_DAYS = 59
 def _session_date_today() -> str:
     """US/Eastern trading calendar date (naive YYYY-MM-DD)."""
     return str(pd.Timestamp.now(tz="America/New_York").date())
+
+
+def _resolve_book_start(
+    existing: dict[str, Any] | None,
+    stamp: dict[str, Any] | None,
+    *,
+    reset_book: bool = False,
+) -> str:
+    """Stable live-book start date (YYYY-MM-DD).
+
+    Persists across refreshes so 1W/1M toggles keep prior days. Only resets to
+    today's US session when ``reset_book`` is set or no prior start exists.
+    """
+    if reset_book:
+        return _session_date_today()
+    for src in (existing, stamp):
+        if not isinstance(src, dict):
+            continue
+        for key in ("book_start", "holdout_start"):
+            raw = src.get(key)
+            if raw:
+                try:
+                    return str(pd.Timestamp(raw).date())
+                except (TypeError, ValueError):
+                    continue
+    return _session_date_today()
+
+
+def _merge_price_history(
+    *,
+    cached_times: pd.DatetimeIndex | None,
+    cached_o: np.ndarray | None,
+    cached_h: np.ndarray | None,
+    cached_l: np.ndarray | None,
+    cached_c: np.ndarray | None,
+    cached_so: np.ndarray | None,
+    cached_sh: np.ndarray | None,
+    cached_sl: np.ndarray | None,
+    cached_sc: np.ndarray | None,
+    times: pd.DatetimeIndex,
+    o: np.ndarray,
+    h: np.ndarray,
+    l: np.ndarray,
+    c: np.ndarray,
+    so: np.ndarray,
+    sh: np.ndarray,
+    sl: np.ndarray,
+    sc: np.ndarray,
+) -> tuple[
+    pd.DatetimeIndex,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Union cached + fresh bars; fresh wins on timestamp collisions."""
+    if cached_times is None or len(cached_times) < 1 or cached_o is None:
+        return times, o, h, l, c, so, sh, sl, sc
+    if cached_o.shape[1] != o.shape[1]:
+        # Label / universe change — drop incompatible cache.
+        return times, o, h, l, c, so, sh, sl, sc
+
+    old_idx = pd.DatetimeIndex(cached_times)
+    new_idx = pd.DatetimeIndex(times)
+    union = old_idx.union(new_idx).sort_values()
+    n_assets = int(o.shape[1])
+
+    def _reindex_2d(idx: pd.DatetimeIndex, arr: np.ndarray) -> pd.DataFrame:
+        return pd.DataFrame(arr, index=idx)
+
+    def _combine_2d(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+        old_df = _reindex_2d(old_idx, old)
+        new_df = _reindex_2d(new_idx, new)
+        # Align columns by position (0..N-1).
+        old_df.columns = list(range(n_assets))
+        new_df.columns = list(range(n_assets))
+        merged = new_df.combine_first(old_df).reindex(union)
+        return merged.to_numpy(dtype=np.float64)
+
+    def _combine_1d(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+        s_old = pd.Series(np.asarray(old, dtype=np.float64), index=old_idx)
+        s_new = pd.Series(np.asarray(new, dtype=np.float64), index=new_idx)
+        return s_new.combine_first(s_old).reindex(union).to_numpy(dtype=np.float64)
+
+    return (
+        pd.DatetimeIndex(union),
+        _combine_2d(cached_o, o),
+        _combine_2d(cached_h, h),
+        _combine_2d(cached_l, l),
+        _combine_2d(cached_c, c),
+        _combine_1d(np.asarray(cached_so), so),
+        _combine_1d(np.asarray(cached_sh), sh),
+        _combine_1d(np.asarray(cached_sl), sl),
+        _combine_1d(np.asarray(cached_sc), sc),
+    )
+
+
+def _nav_series_from_ohlc(ohlc: np.ndarray, *, initial_cash: float) -> np.ndarray:
+    """Close-marked NAV path that starts at ``initial_cash`` (first open)."""
+    arr = np.asarray(ohlc, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] < 1:
+        return np.asarray([], dtype=np.float64)
+    nav = arr[:, 3].copy()
+    # First plotted point = book cash (candle open), not the first bar's close —
+    # otherwise a hot open makes 1360pctAlgo/SPY appear to start ≠ 100k.
+    nav[0] = float(arr[0, 0]) if np.isfinite(arr[0, 0]) else float(initial_cash)
+    return nav
 
 
 def _stamp_path(root: Path | None = None) -> Path:
@@ -106,14 +219,15 @@ def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
     return last
 
 
-def _is_equity_stock_book(
+def _is_external_weight_book(
     weights: dict[str, float] | None,
     *,
     run_id: str,
     cfg_asset_keys: list[str],
 ) -> bool:
-    """True when the live book is individual equities (PIT momentum), not the RL sleeve."""
-    if str(run_id).upper() == "FINALMODEL":
+    """True when the live book is not the RL research sleeve (algo ETF / stock picks)."""
+    rid = str(run_id).upper()
+    if rid in {ALGO_LIVE_RUN_ID, "FINALMODEL"}:  # FINALMODEL kept for old marks
         return True
     if not weights:
         return False
@@ -128,8 +242,8 @@ def _is_equity_stock_book(
 
 
 def _stock_symbols_from_weights(weights: dict[str, float]) -> dict[str, str]:
-    """Map display label → Yahoo symbol for equity books (BRK.B → BRK-B)."""
-    from rlbot.pit_momentum import to_yahoo_symbol
+    """Map display label → Yahoo symbol for external books (BRK.B → BRK-B)."""
+    from rlbot.prod_return_alpha import to_yahoo_symbol
 
     out: dict[str, str] = {}
     for k, v in weights.items():
@@ -526,6 +640,7 @@ def refresh_forward_mark_live(
     *,
     min_refresh_seconds: int = DEFAULT_MIN_REFRESH_SECONDS,
     force_price_refresh: bool = False,
+    reset_book: bool = False,
     root: Path | None = None,
 ) -> dict[str, Any] | None:
     """Refresh 5m NAV candles/positions for the active (or given) LIVE run.
@@ -533,6 +648,9 @@ def refresh_forward_mark_live(
     - Throttled Yahoo pull for 5-minute OHLC (universe + SPY).
     - Model book: last shadow / mark weights, MTM'd into OHLC candles.
     - Benchmarks: equal-weight and SPY buy-and-hold on the same 5m grid.
+    - History accumulates from a persistent ``book_start`` (not reset each day).
+    - ``reset_book=True`` wipes the price cache and restarts all sleeves at
+      ``initial_cash`` from today's US session.
     """
     rid = (run_id or "").strip() or (resolve_active_forward_run_id(root) or "")
     if not rid:
@@ -543,13 +661,26 @@ def refresh_forward_mark_live(
     now = time.time()
     last = float(stamp.get("prices_fetched_at_unix") or 0.0)
     last_attempt = float(stamp.get("prices_attempt_at_unix") or 0.0)
-    need_fetch = force_price_refresh or (now - last >= float(min_refresh_seconds))
+    need_fetch = force_price_refresh or reset_book or (now - last >= float(min_refresh_seconds))
     # After a failed/slow Yahoo pull, cool down briefly so /api/forward polls
     # (every ~30s from the UI) do not each block on a fresh download.
-    price_cache = PROJECT_ROOT / "execution" / f"forward_prices_5m_{rid}.npz"
+    exec_root = (root or PROJECT_ROOT) / "execution"
+    price_cache = exec_root / f"forward_prices_5m_{rid}.npz"
+    if reset_book:
+        for path in (
+            price_cache,
+            exec_root / f"forward_mark_{rid}.json",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        existing = None
+        stamp = {k: v for k, v in stamp.items() if k not in ("holdout_start", "book_start", "n_bars", "last_bar")}
     if (
         need_fetch
         and not force_price_refresh
+        and not reset_book
         and price_cache.is_file()
         and (now - last_attempt) < 60.0
     ):
@@ -559,11 +690,12 @@ def refresh_forward_mark_live(
     cfg_path = PROJECT_ROOT / "config" / "config.yaml"
     set_config(load_config(cfg_path))
     cfg = get_config()
-    initial_cash = float(
+    initial_cash = float(cfg.environment.initial_cash) if reset_book else float(
         (existing or {}).get("initial_cash") or cfg.environment.initial_cash
     )
-    # Both FINALMODEL and LIVE_MODEL charts start at today's US session.
-    holdout_start = _session_date_today()
+    # Persistent book start — do NOT snap to today on every refresh.
+    holdout_start = _resolve_book_start(existing, stamp, reset_book=reset_book)
+    book_start = holdout_start
     holdout_end = (existing or {}).get("holdout_end") or stamp.get("holdout_end")
     cash_yield_bar = _cash_yield_per_bar(
         float(getattr(cfg.reward, "cash_daily_yield", 0.0) or 0.0)
@@ -576,7 +708,7 @@ def refresh_forward_mark_live(
 
     rl_symbols = dict(cfg.universe.assets)
     rl_labels = list(rl_symbols.keys())
-    stock_book = _is_equity_stock_book(
+    stock_book = _is_external_weight_book(
         latest_w, run_id=rid, cfg_asset_keys=rl_labels
     )
     stock_symbols: dict[str, str] = {}
@@ -592,7 +724,7 @@ def refresh_forward_mark_live(
         tickers = list(cfg.universe.tickers)
         labels = ["Cash"] + rl_labels
 
-    # Fetch RL sleeve always (EW-10 + LIVE_MODEL); add stock picks when needed.
+    # Fetch RL sleeve always (EW-10 + LIVE_MODEL); add external book symbols when needed.
     symbols: dict[str, str] = dict(rl_symbols)
     symbols.update(stock_symbols)
     live_vec = _weight_vector(latest_w, labels)
@@ -614,6 +746,40 @@ def refresh_forward_mark_live(
     o = h = l = c = None  # type: ignore[assignment]
     so = sh = sl = sc = None  # type: ignore[assignment]
     fetch_labels = list(symbols.keys())
+
+    def _load_price_cache() -> tuple[
+        pd.DatetimeIndex | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        list[str],
+    ]:
+        if not price_cache.is_file():
+            return None, None, None, None, None, None, None, None, None, []
+        try:
+            blob = np.load(price_cache, allow_pickle=False)
+        except OSError:
+            return None, None, None, None, None, None, None, None, None, []
+        cached_labels = [str(x) for x in blob["labels"].tolist()] if "labels" in blob.files else []
+        if cached_labels != fetch_labels:
+            return None, None, None, None, None, None, None, None, None, cached_labels
+        return (
+            pd.DatetimeIndex(blob["times"]),
+            np.asarray(blob["open"], dtype=np.float64),
+            np.asarray(blob["high"], dtype=np.float64),
+            np.asarray(blob["low"], dtype=np.float64),
+            np.asarray(blob["close"], dtype=np.float64),
+            np.asarray(blob["spy_open"], dtype=np.float64),
+            np.asarray(blob["spy_high"], dtype=np.float64),
+            np.asarray(blob["spy_low"], dtype=np.float64),
+            np.asarray(blob["spy_close"], dtype=np.float64),
+            cached_labels,
+        )
 
     def _apply_holdout(
         t: pd.DatetimeIndex,
@@ -673,12 +839,20 @@ def refresh_forward_mark_live(
             },
             root,
         )
-        since = str(holdout_start or (pd.Timestamp.utcnow() - pd.Timedelta(days=INTRADAY_LOOKBACK_DAYS)).date())
+        # Yahoo 5m tops out near 5 trading days per request; local NPZ keeps
+        # older bars so the book can grow past a single session. On reset, pull
+        # only from book_start (today). Otherwise pull the trailing ~5d and merge.
+        book_ts = pd.Timestamp(book_start).date()
+        yahoo_floor = (
+            pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=5)
+        ).date()
+        since = str(book_ts if reset_book or book_ts >= yahoo_floor else yahoo_floor)
         from rlbot.forward_mark import call_with_timeout
 
+        cached_pack = _load_price_cache()
         try:
             # Stock book + RL sleeve can be ~40 symbols; allow a longer pull.
-            fetch_timeout = 45.0 if (force_price_refresh or stock_book) else 15.0
+            fetch_timeout = 45.0 if (force_price_refresh or stock_book or reset_book) else 15.0
             times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
                 _fetch_intraday_ohlc,
                 fetch_timeout,
@@ -687,17 +861,50 @@ def refresh_forward_mark_live(
             )
         except Exception:
             # Fall through to cache / empty handling below.
-            if price_cache.is_file():
+            if price_cache.is_file() and not reset_book:
                 need_fetch = False
             else:
                 raise
         else:
+            (
+                c_times,
+                c_o,
+                c_h,
+                c_l,
+                c_c,
+                c_so,
+                c_sh,
+                c_sl,
+                c_sc,
+                _c_labs,
+            ) = cached_pack
+            if not reset_book:
+                times, o, h, l, c, so, sh, sl, sc = _merge_price_history(
+                    cached_times=c_times,
+                    cached_o=c_o,
+                    cached_h=c_h,
+                    cached_l=c_l,
+                    cached_c=c_c,
+                    cached_so=c_so,
+                    cached_sh=c_sh,
+                    cached_sl=c_sl,
+                    cached_sc=c_sc,
+                    times=times,
+                    o=o,
+                    h=h,
+                    l=l,
+                    c=c,
+                    so=so,
+                    sh=sh,
+                    sl=sl,
+                    sc=sc,
+                )
             times, o, h, l, c, so, sh, sl, sc, holdout_start = _apply_holdout(
-                times, o, h, l, c, so, sh, sl, sc, start=holdout_start
+                times, o, h, l, c, so, sh, sl, sc, start=book_start
             )
             if len(times) < 1:
                 raise RuntimeError(
-                    f"no {BAR_INTERVAL} bars on/after holdout_start={holdout_start} for live forward"
+                    f"no {BAR_INTERVAL} bars on/after book_start={book_start} for live forward"
                 )
             price_cache.parent.mkdir(parents=True, exist_ok=True)
             np.savez(
@@ -718,7 +925,8 @@ def refresh_forward_mark_live(
                 {
                     "run_id": rid,
                     "bar_interval": BAR_INTERVAL,
-                    "holdout_start": holdout_start,
+                    "book_start": book_start,
+                    "holdout_start": book_start,
                     "prices_fetched_at_unix": now,
                     "prices_fetched_at_utc": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
@@ -731,36 +939,85 @@ def refresh_forward_mark_live(
             )
 
     if not fetched and price_cache.is_file():
-        blob = np.load(price_cache, allow_pickle=False)
-        cached_labels = [str(x) for x in blob["labels"].tolist()] if "labels" in blob.files else []
-        if cached_labels != fetch_labels:
+        (
+            c_times,
+            c_o,
+            c_h,
+            c_l,
+            c_c,
+            c_so,
+            c_sh,
+            c_sl,
+            c_sc,
+            cached_labels,
+        ) = _load_price_cache()
+        if cached_labels != fetch_labels or c_times is None or c_o is None:
             need_fetch = True
         else:
-            times = pd.DatetimeIndex(blob["times"])
-            o = np.asarray(blob["open"], dtype=np.float64)
-            h = np.asarray(blob["high"], dtype=np.float64)
-            l = np.asarray(blob["low"], dtype=np.float64)
-            c = np.asarray(blob["close"], dtype=np.float64)
-            so = np.asarray(blob["spy_open"], dtype=np.float64)
-            sh = np.asarray(blob["spy_high"], dtype=np.float64)
-            sl = np.asarray(blob["spy_low"], dtype=np.float64)
-            sc = np.asarray(blob["spy_close"], dtype=np.float64)
+            times, o, h, l, c, so, sh, sl, sc = (
+                c_times,
+                c_o,
+                c_h,
+                c_l,
+                c_c,
+                c_so,
+                c_sh,
+                c_sl,
+                c_sc,
+            )
             times, o, h, l, c, so, sh, sl, sc, holdout_start = _apply_holdout(
-                times, o, h, l, c, so, sh, sl, sc, start=holdout_start
+                times, o, h, l, c, so, sh, sl, sc, start=book_start
             )
     if (not fetched) and (need_fetch or not price_cache.is_file() or o is None):
         # Cold start / stale label set — fetch once.
-        since = str(holdout_start)
+        book_ts = pd.Timestamp(book_start).date()
+        yahoo_floor = (
+            pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=5)
+        ).date()
+        since = str(book_ts if reset_book or book_ts >= yahoo_floor else yahoo_floor)
         from rlbot.forward_mark import call_with_timeout
 
         times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
             _fetch_intraday_ohlc,
-            45.0 if (force_price_refresh or stock_book) else 20.0,
+            45.0 if (force_price_refresh or stock_book or reset_book) else 20.0,
             symbols,
             since=since,
         )
+        if not reset_book:
+            (
+                c_times,
+                c_o,
+                c_h,
+                c_l,
+                c_c,
+                c_so,
+                c_sh,
+                c_sl,
+                c_sc,
+                _c_labs,
+            ) = _load_price_cache()
+            times, o, h, l, c, so, sh, sl, sc = _merge_price_history(
+                cached_times=c_times,
+                cached_o=c_o,
+                cached_h=c_h,
+                cached_l=c_l,
+                cached_c=c_c,
+                cached_so=c_so,
+                cached_sh=c_sh,
+                cached_sl=c_sl,
+                cached_sc=c_sc,
+                times=times,
+                o=o,
+                h=h,
+                l=l,
+                c=c,
+                so=so,
+                sh=sh,
+                sl=sl,
+                sc=sc,
+            )
         times, o, h, l, c, so, sh, sl, sc, holdout_start = _apply_holdout(
-            times, o, h, l, c, so, sh, sl, sc, start=holdout_start
+            times, o, h, l, c, so, sh, sl, sc, start=book_start
         )
         if len(times) < 1:
             return existing
@@ -783,7 +1040,8 @@ def refresh_forward_mark_live(
             {
                 "run_id": rid,
                 "bar_interval": BAR_INTERVAL,
-                "holdout_start": holdout_start,
+                "book_start": book_start,
+                "holdout_start": book_start,
                 "prices_fetched_at_unix": now,
                 "prices_fetched_at_utc": datetime.now(timezone.utc).isoformat(
                     timespec="seconds"
@@ -843,10 +1101,14 @@ def refresh_forward_mark_live(
             cash_yield_per_bar=rl_cash_yield_bar,
         )
 
-    nav_model = model_ohlc[:, 3]
-    nav_ew = ew_ohlc[:, 3]
-    nav_spy = spy_ohlc[:, 3]
-    nav_live = live_model_ohlc[:, 3] if live_model_ohlc is not None else None
+    nav_model = _nav_series_from_ohlc(model_ohlc, initial_cash=initial_cash)
+    nav_ew = _nav_series_from_ohlc(ew_ohlc, initial_cash=initial_cash)
+    nav_spy = _nav_series_from_ohlc(spy_ohlc, initial_cash=initial_cash)
+    nav_live = (
+        _nav_series_from_ohlc(live_model_ohlc, initial_cash=initial_cash)
+        if live_model_ohlc is not None
+        else None
+    )
 
     w_mat = np.tile(live_vec, (len(times), 1))
     candles_payload: dict[str, Any] = {
@@ -858,13 +1120,16 @@ def refresh_forward_mark_live(
         candles_payload["live_model"] = _candles_to_payload(times, live_model_ohlc)
 
     note = (
-        "FINALMODEL PIT momentum + LIVE_MODEL RL sleeve on today's session. "
-        "Equal-weight is the original 10-asset research universe (not stock picks). "
+        f"PROD_RETURN_ALPHA (1360pctAlgo) + LIVE_MODEL RL sleeve since {book_start}. "
+        "Equal-weight is the original 10-asset research universe (not algo ETF weights). "
         if stock_book
-        else "Live 5-minute NAV candles on the SPY session clock from latest target "
-        "weights + Yahoo OHLC (model / EW / SPY). Foreign-session assets carry "
-        "the last print forward. "
-    ) + f"Prices refresh about every {max(min_refresh_seconds, 60) // 60} min."
+        else f"Live 5-minute NAV candles on the SPY session clock since {book_start} "
+        "from latest target weights + Yahoo OHLC (model / EW / SPY). "
+        "Foreign-session assets carry the last print forward. "
+    ) + (
+        f"History accumulates in execution/ (Yahoo 5m lookback ~5d per pull). "
+        f"Prices refresh about every {max(min_refresh_seconds, 60) // 60} min."
+    )
 
     payload = build_forward_mark_payload(
         run_id=rid,
@@ -879,7 +1144,7 @@ def refresh_forward_mark_live(
         weights=w_mat,
         asset_labels=labels,
         initial_cash=initial_cash,
-        holdout_start=str(holdout_start) if holdout_start else None,
+        holdout_start=str(book_start),
         holdout_end=str(holdout_end) if holdout_end else None,
         note=note,
         bar_interval=BAR_INTERVAL,
@@ -888,6 +1153,7 @@ def refresh_forward_mark_live(
         bars_per_year=BARS_PER_TRADING_DAY * 252,
         nav_live_model=nav_live,
     )
+    payload["book_start"] = str(book_start)
     positions = _positions_snapshot(
         latest_w,
         nav=float(nav_model[-1]),
@@ -904,7 +1170,9 @@ def refresh_forward_mark_live(
         "min_refresh_seconds": int(min_refresh_seconds),
         "bar_interval": BAR_INTERVAL,
         "source": "yfinance_5m",
-        "session_start": str(holdout_start),
+        "book_start": str(book_start),
+        "session_start": str(book_start),
+        "reset_book": bool(reset_book),
     }
     payload["latest_weights"] = {
         labels[i]: float(live_vec[i]) for i in range(len(labels))
