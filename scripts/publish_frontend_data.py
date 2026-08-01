@@ -208,7 +208,32 @@ def _load_forward() -> dict[str, Any]:
     }
 
 
-def _timed_read_json(path: Path, timeout_s: float = 0.5) -> Any | None:
+def _timed_read_json(path: Path, timeout_s: float = 2.5) -> Any | None:
+    """Read small JSON with a hard timeout (iCloud Desktop can take >1s)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+
+    if size <= 1_000_000:
+        import threading
+
+        box: dict[str, Any] = {"data": None}
+
+        def _worker() -> None:
+            try:
+                box["data"] = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                box["data"] = None
+
+        thread = threading.Thread(target=_worker, name="publish-read", daemon=True)
+        thread.start()
+        thread.join(timeout=float(timeout_s))
+        if thread.is_alive():
+            return None
+        data = box.get("data")
+        return data if isinstance(data, dict) or isinstance(data, list) else data
+
     try:
         proc = subprocess.run(
             ["/bin/cat", str(path)],
@@ -226,7 +251,7 @@ def _timed_read_json(path: Path, timeout_s: float = 0.5) -> Any | None:
         return None
 
 
-def _pick_backtest(run_id: str) -> dict[str, Any] | None:
+def _pick_backtest(run_id: str, *, timeout_s: float = 2.5) -> dict[str, Any] | None:
     base = RUNS / run_id
     for name in (
         "backtest_summary.json",
@@ -234,7 +259,7 @@ def _pick_backtest(run_id: str) -> dict[str, Any] | None:
         "backtest_summary_final.json",
         "backtest_summary_latest.json",
     ):
-        data = _timed_read_json(base / name, timeout_s=0.4)
+        data = _timed_read_json(base / name, timeout_s=timeout_s)
         if isinstance(data, dict) and (
             data.get("sharpe") is not None or data.get("total_return") is not None
         ):
@@ -243,8 +268,45 @@ def _pick_backtest(run_id: str) -> dict[str, Any] | None:
 
 
 def _pick_manifest(run_id: str) -> dict[str, Any]:
-    data = _timed_read_json(RUNS / run_id / "manifest.json", timeout_s=0.35)
+    data = _timed_read_json(RUNS / run_id / "manifest.json", timeout_s=2.0)
     return data if isinstance(data, dict) else {}
+
+
+def _patch_missing_oos(rows: list[dict[str, Any]], *, budget_s: float = 60.0) -> int:
+    """Fill completed rows that still lack OOS from Runs/*/backtest_summary*.json."""
+    t0 = time.time()
+    patched = 0
+    for row in rows:
+        if time.time() - t0 > budget_s:
+            break
+        if row.get("oos_sharpe") is not None:
+            continue
+        rid = str(row.get("run_id") or "")
+        if not rid or not _RUN_ID_RE.match(rid):
+            continue
+        bt = _pick_backtest(rid, timeout_s=3.0)
+        if bt is None:
+            continue
+        row["oos_sharpe"] = bt.get("sharpe")
+        row["oos_deflated_sharpe"] = bt.get("deflated_sharpe")
+        row["oos_return"] = bt.get("total_return")
+        row["oos_max_drawdown"] = bt.get("max_drawdown")
+        row["ew_excess_return"] = bt.get("excess_return_vs_equal_weight")
+        row["has_backtest"] = True
+        row["training_status"] = "completed"
+        row["progress_pct"] = 100.0
+        if row.get("nominal_timesteps") is not None:
+            try:
+                row["elapsed_timesteps"] = int(row["nominal_timesteps"])
+            except (TypeError, ValueError):
+                pass
+        ckpt = bt.get("checkpoint_label")
+        if ckpt:
+            labels = row.get("labels") if isinstance(row.get("labels"), list) else []
+            if str(ckpt) not in labels:
+                row["labels"] = [str(ckpt), *labels]
+        patched += 1
+    return patched
 
 
 def _detail_from_caches(
@@ -316,7 +378,57 @@ def publish(
 ) -> dict[str, Any]:
     t0 = time.time()
     rows = _load_runs()
+    # Boot/publish path: heal cache holes where backtest files exist but the
+    # lite enrich timed out (common on iCloud Desktop).
+    patched = _patch_missing_oos(rows, budget_s=max(15.0, details_budget_s))
+    if patched:
+        try:
+            _atomic_write_json(
+                RUNS_CACHE,
+                {
+                    "generated_at_utc": _now(),
+                    "n": len(rows),
+                    "records": rows,
+                    "note": f"publish patched {patched} missing OOS from backtest_summary",
+                },
+            )
+        except OSError:
+            pass
     oos_rows = _load_oos()
+    # Also merge freshly patched sharpes into the OOS results list when absent.
+    if patched:
+        oos_by = {
+            str(r.get("run_id")): r
+            for r in oos_rows
+            if isinstance(r, dict) and r.get("run_id")
+        }
+        for row in rows:
+            rid = str(row.get("run_id") or "")
+            if not rid or row.get("oos_sharpe") is None or rid in oos_by:
+                continue
+            m = _WINDOW_COHORT_RE.match(rid)
+            if m is None:
+                continue
+            oos_by[rid] = {
+                "run_id": rid,
+                "window": f"W{m.group(1)}",
+                "cohort": m.group(2),
+                "model_ret": row.get("oos_return"),
+                "model_sh": row.get("oos_sharpe"),
+                "ew_ret": None,
+                "ew_sh": None,
+                "spy_ret": None,
+                "spy_sh": None,
+                "has_benchmarks": False,
+            }
+        oos_rows = list(oos_by.values())
+        try:
+            _atomic_write_json(
+                OOS_CACHE,
+                {"generated_at_utc": _now(), "n": len(oos_rows), "rows": oos_rows},
+            )
+        except OSError:
+            pass
     summary = _summary(rows)
     dashboard = {
         "generated_at_utc": _now(),

@@ -137,10 +137,15 @@ def _infer_run_status(
     finished_at: Any,
 ) -> str:
     status = (explicit or "").strip()
-    if status in ("completed", "interrupted", "active"):
-        return status
-    if has_backtest or has_final or finished_at:
+    # A scored backtest / final weights / finished stamp means training is done
+    # for the UI — even if the manifest briefly still says ``active`` during the
+    # post-train backtest race (otherwise Runs shows "active" + OOS Sharpe).
+    if status == "interrupted" and not (has_backtest or has_final):
+        return "interrupted"
+    if has_backtest or has_final or finished_at or status == "completed":
         return "completed"
+    if status == "active":
+        return "active"
     if checkpoint_steps is None and not has_final:
         # Bare run dir / abandoned early — not actively training.
         if checkpoint_mtime is None:
@@ -159,13 +164,35 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
-def _timed_read_text(path: Path, timeout_s: float = 1.0) -> str | None:
-    """Read a file via ``/bin/cat`` with a hard timeout (survives iCloud stalls)."""
+def _timed_read_text(path: Path, timeout_s: float = 2.5) -> str | None:
+    """Read a file with a hard timeout (survives iCloud stalls).
+
+    Prefer a direct ``read_text`` in a worker thread — ``/bin/cat`` at ≤1s was
+    falsely missing ~2KB ``backtest_summary.json`` files that take ~1–1.3s to
+    hydrate from iCloud Desktop.
+    """
     try:
-        if not path.exists():
-            return None
+        size = path.stat().st_size
     except OSError:
         return None
+
+    if size <= 1_000_000:
+        box: dict[str, Any] = {"text": None}
+
+        def _worker() -> None:
+            try:
+                box["text"] = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                box["text"] = None
+
+        thread = threading.Thread(target=_worker, name="lite-read", daemon=True)
+        thread.start()
+        thread.join(timeout=float(timeout_s))
+        if thread.is_alive():
+            return None
+        text = box.get("text")
+        return text if isinstance(text, str) else None
+
     try:
         proc = subprocess.run(
             ["/bin/cat", str(path)],
@@ -183,7 +210,7 @@ def _timed_read_text(path: Path, timeout_s: float = 1.0) -> str | None:
         return None
 
 
-def _timed_read_json(path: Path, timeout_s: float = 1.0) -> Any | None:
+def _timed_read_json(path: Path, timeout_s: float = 2.5) -> Any | None:
     text = _timed_read_text(path, timeout_s=timeout_s)
     if text is None:
         return None
@@ -255,7 +282,7 @@ def _list_run_ids() -> list[str]:
     return out
 
 
-def _pick_backtest(run_id: str) -> dict[str, Any] | None:
+def _pick_backtest(run_id: str, *, timeout_s: float = 2.5) -> dict[str, Any] | None:
     base = RUNS / run_id
     for name in (
         "backtest_summary.json",
@@ -263,7 +290,7 @@ def _pick_backtest(run_id: str) -> dict[str, Any] | None:
         "backtest_summary_final.json",
         "backtest_summary_latest.json",
     ):
-        data = _timed_read_json(base / name, timeout_s=0.8)
+        data = _timed_read_json(base / name, timeout_s=timeout_s)
         if isinstance(data, dict) and (
             data.get("sharpe") is not None or data.get("total_return") is not None
         ):
@@ -271,9 +298,47 @@ def _pick_backtest(run_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _pick_manifest(run_id: str) -> dict[str, Any]:
-    data = _timed_read_json(RUNS / run_id / "manifest.json", timeout_s=0.6)
+def _pick_manifest(run_id: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
+    data = _timed_read_json(RUNS / run_id / "manifest.json", timeout_s=timeout_s)
     return data if isinstance(data, dict) else {}
+
+
+def _merge_run_row(prev: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any]:
+    """Keep prior OOS if a timed disk read failed mid-enrich (iCloud false negative)."""
+    if not prev:
+        out = dict(new)
+    else:
+        out = dict(new)
+        if out.get("oos_sharpe") is None and prev.get("oos_sharpe") is not None:
+            for key in (
+                "oos_sharpe",
+                "oos_deflated_sharpe",
+                "oos_return",
+                "oos_max_drawdown",
+                "ew_excess_return",
+                "has_backtest",
+                "labels",
+            ):
+                if prev.get(key) is not None:
+                    out[key] = prev[key]
+            if prev.get("has_backtest"):
+                out["has_backtest"] = True
+        # Prefer a more specific completed/interrupted status over a degraded active.
+        if prev.get("training_status") in ("completed", "interrupted") and out.get(
+            "training_status"
+        ) not in ("completed", "interrupted"):
+            out["training_status"] = prev["training_status"]
+            if out.get("progress_pct") is None and prev.get("progress_pct") is not None:
+                out["progress_pct"] = prev["progress_pct"]
+    if out.get("has_backtest") or out.get("oos_sharpe") is not None:
+        out["training_status"] = "completed"
+        out["progress_pct"] = 100.0
+        if out.get("nominal_timesteps") is not None:
+            try:
+                out["elapsed_timesteps"] = int(out["nominal_timesteps"])
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
 def _progress_pct(elapsed: Any, nominal: Any) -> float | None:
@@ -353,13 +418,15 @@ def _row_from_disk(run_id: str) -> dict[str, Any]:
         row["oos_max_drawdown"] = bt.get("max_drawdown")
         row["ew_excess_return"] = bt.get("excess_return_vs_equal_weight")
         row["has_backtest"] = True
+        row["training_status"] = "completed"
         if not row["best_eval_step"]:
             row["best_eval_step"] = bt.get("best_eval_step")
         ckpt = bt.get("checkpoint_label")
         if ckpt:
             row["labels"] = [str(ckpt)]
-    if status == "completed" and row["elapsed_timesteps"] is None and row["nominal_timesteps"] is not None:
-        row["elapsed_timesteps"] = row["nominal_timesteps"]
+    if row["training_status"] == "completed":
+        if row["nominal_timesteps"] is not None:
+            row["elapsed_timesteps"] = int(row["nominal_timesteps"])
         row["progress_pct"] = 100.0
     return row
 
@@ -389,14 +456,6 @@ def _oos_row_from_backtest(run_id: str, bt: dict[str, Any]) -> dict[str, Any] | 
 def _build_enriched_rows(budget_s: float = 25.0) -> list[dict[str, Any]]:
     t0 = time.time()
     ids = _list_run_ids()
-    # Prefer cohorts that already have OOS artifacts before in-progress training dirs.
-    def rank(rid: str) -> tuple[int, str]:
-        for i, suf in enumerate(("_803", "_802", "_801", "_730", "_804", "LIVE_")):
-            if rid.endswith(suf) or rid.startswith(suf):
-                return (i, rid)
-        return (50, rid)
-
-    ids = sorted(ids, key=rank)
     # Seed with previous cache so we don't blank out known OOS while refreshing.
     prev = _read_json(RUNS_CACHE)
     prev_by_id: dict[str, dict[str, Any]] = {}
@@ -405,33 +464,83 @@ def _build_enriched_rows(budget_s: float = 25.0) -> list[dict[str, Any]]:
             if isinstance(rec, dict) and rec.get("run_id"):
                 prev_by_id[str(rec["run_id"])] = rec
 
+    def rank(rid: str) -> tuple[Any, ...]:
+        """Newest cohorts + missing-OOS completed runs first (budget truncates)."""
+        prev_row = prev_by_id.get(rid) or {}
+        missing_oos = 0 if prev_row.get("oos_sharpe") is None else 1
+        activeish = 0 if prev_row.get("training_status") in (None, "", "active", "running") else 1
+        m = re.match(r"^W(\d+)_(.+)$", rid, re.IGNORECASE)
+        if m is not None:
+            window = int(m.group(1))
+            cohort = m.group(2)
+            try:
+                cohort_key = -int(cohort)  # 804 before 803
+            except ValueError:
+                cohort_key = 0
+            return (missing_oos, activeish, cohort_key, window, rid)
+        if rid.startswith("LIVE_"):
+            return (missing_oos, 0, 1, 0, rid)
+        return (missing_oos, 2, 0, 0, rid)
+
+    ids = sorted(ids, key=rank)
+
     rows_by_id: dict[str, dict[str, Any]] = dict(prev_by_id)
     oos_rows: list[dict[str, Any]] = []
     for rid in ids:
         if time.time() - t0 > budget_s:
             break
-        row = _row_from_disk(rid)
+        row = _merge_run_row(prev_by_id.get(rid), _row_from_disk(rid))
         rows_by_id[rid] = row
         if row["has_backtest"] and row.get("oos_sharpe") is not None:
             bt = {
                 "sharpe": row["oos_sharpe"],
                 "total_return": row["oos_return"],
+                "deflated_sharpe": row.get("oos_deflated_sharpe"),
+                "max_drawdown": row.get("oos_max_drawdown"),
                 "equal_weight_daily_return": None,
                 "equal_weight_daily_sharpe": None,
                 "spy_return": None,
                 "spy_sharpe": None,
                 "excess_return_vs_equal_weight": row.get("ew_excess_return"),
             }
-            # Re-read once for benchmark fields when we have budget.
-            full = _pick_backtest(rid)
-            if isinstance(full, dict):
-                oos = _oos_row_from_backtest(rid, full)
-                if oos is not None:
-                    oos_rows.append(oos)
-            else:
-                oos = _oos_row_from_backtest(rid, bt)
-                if oos is not None:
-                    oos_rows.append(oos)
+            # Reuse fields already loaded — avoid a second iCloud hit per run.
+            oos = _oos_row_from_backtest(rid, bt)
+            if oos is not None:
+                oos_rows.append(oos)
+
+    # Second pass: rows still missing OOS — longer timeout, patch in place (no
+    # second full _row_from_disk which would double iCloud I/O).
+    still_missing = [
+        rid
+        for rid, row in rows_by_id.items()
+        if row.get("oos_sharpe") is None
+    ]
+    still_missing.sort(key=rank)
+    for rid in still_missing:
+        if time.time() - t0 > budget_s + 45.0:
+            break
+        bt = _pick_backtest(rid, timeout_s=3.5)
+        if bt is None:
+            continue
+        filled = dict(rows_by_id.get(rid) or {"run_id": rid})
+        filled["oos_sharpe"] = bt.get("sharpe")
+        filled["oos_deflated_sharpe"] = bt.get("deflated_sharpe")
+        filled["oos_return"] = bt.get("total_return")
+        filled["oos_max_drawdown"] = bt.get("max_drawdown")
+        filled["ew_excess_return"] = bt.get("excess_return_vs_equal_weight")
+        filled["has_backtest"] = True
+        filled["training_status"] = "completed"
+        filled["progress_pct"] = 100.0
+        if filled.get("nominal_timesteps") is not None:
+            filled["elapsed_timesteps"] = int(filled["nominal_timesteps"])
+        ckpt = bt.get("checkpoint_label")
+        if ckpt and not filled.get("labels"):
+            filled["labels"] = [str(ckpt)]
+        rows_by_id[rid] = filled
+        oos = _oos_row_from_backtest(rid, bt)
+        if oos is not None:
+            oos_rows.append(oos)
+
     rows = [_normalize_run_row(r) for r in _sort_run_rows(list(rows_by_id.values()))]
     try:
         _atomic_write_json(
@@ -608,13 +717,20 @@ def _venv_python() -> str:
     return sys.executable
 
 
-def _sync_live_refresh(run_id: str, *, force: bool, timeout_s: float = 90.0) -> dict[str, Any] | None:
+def _sync_live_refresh(
+    run_id: str,
+    *,
+    force: bool,
+    reset_book: bool = False,
+    timeout_s: float = 90.0,
+) -> dict[str, Any] | None:
     """Block until Yahoo refresh writes execution/forward_mark_*.json (or timeout)."""
     py = _venv_python()
     # Chart-API fetch is fast; the cost is importing rlbot under iCloud load.
     code = (
         "from rlbot.forward_live import refresh_forward_mark_live;"
-        f"p=refresh_forward_mark_live({run_id!r}, force_price_refresh={bool(force)});"
+        f"p=refresh_forward_mark_live({run_id!r}, force_price_refresh={bool(force)}, "
+        f"reset_book={bool(reset_book)});"
         "print('ok' if p else 'none')"
     )
     try:
@@ -859,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
             rid = (qs.get("run_id") or [""])[0].strip() or (_active_run_id() or "")
             live = (qs.get("live") or ["1"])[0] not in ("0", "false", "False")
             force = (qs.get("force_refresh") or ["0"])[0] in ("1", "true", "True")
+            reset_book = (qs.get("reset_book") or ["0"])[0] in ("1", "true", "True")
             if not rid or not _RUN_ID_RE.match(rid):
                 self._json(
                     200,
@@ -874,9 +991,11 @@ class Handler(BaseHTTPRequestHandler):
             mark = _load_mark(rid)
             age = _mark_age_s(rid)
             stale = age is None or age > 180.0  # Yahoo 5m marks go stale after ~3 minutes
-            if live and force:
-                # Only force_refresh blocks; soft polls never wait on Yahoo.
-                mark = _sync_live_refresh(rid, force=True, timeout_s=90.0) or mark
+            if live and (force or reset_book):
+                # Only force_refresh / reset_book blocks; soft polls never wait on Yahoo.
+                mark = _sync_live_refresh(
+                    rid, force=True, reset_book=reset_book, timeout_s=120.0
+                ) or mark
             elif live and (mark is None or stale):
                 _kick_live_refresh(rid)
                 mark = _load_mark(rid) or mark

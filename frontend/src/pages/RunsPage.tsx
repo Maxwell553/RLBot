@@ -299,8 +299,18 @@ export function RunsPage() {
   }, [load])
 
   const reload = useCallback(() => load(), [load])
+  // Poll faster while any visible run is still missing OOS or actively training.
+  const needsFastPoll = useMemo(() => {
+    if (runsState.kind !== 'live') return runsState.kind === 'error'
+    return runsState.data.runs.some(
+      (run) =>
+        (run.training_status !== 'completed' && run.training_status !== 'interrupted')
+        || (run.training_status === 'completed' && run.oos_sharpe == null),
+    )
+  }, [runsState])
   useAutoRefresh(reload, {
     enabled: runsState.kind === 'live' || runsState.kind === 'error',
+    intervalMs: needsFastPoll ? 12_000 : 60_000,
     refreshing,
   })
 

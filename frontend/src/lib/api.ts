@@ -13,6 +13,7 @@ import type {
 import type { EligibilityResult, MandateSubmission, WorkflowMandate } from './mandate-requests'
 import { RequestCoordinator } from './http'
 import {
+  clearStaticDataCache,
   loadStaticDashboard,
   loadStaticForward,
   loadStaticResults,
@@ -137,7 +138,11 @@ function headersInit(init?: RequestInit): Headers {
  * Fetch wrapper producing an explicit DataState. A configured API that fails
  * yields `error` (with retry available to callers) — never silent cached data.
  */
-async function toState<T>(loader: () => Promise<T>, offline = OFFLINE_MODE): Promise<DataState<T>> {
+async function toState<T>(
+  loader: () => Promise<T>,
+  offline = OFFLINE_MODE,
+  hint: 'research' | 'workflow' = 'research',
+): Promise<DataState<T>> {
   if (offline) return { kind: 'offline' }
   try {
     return { kind: 'live', data: await loader() }
@@ -155,11 +160,22 @@ async function toState<T>(loader: () => Promise<T>, offline = OFFLINE_MODE): Pro
       || message.includes('HTTP 502')
       || message.includes('HTTP 504')
       || message.includes('Static data HTTP')
+      || message.includes('timed out')
     ) {
+      if (hint === 'workflow') {
+        return {
+          kind: 'error',
+          message:
+            `${message} Workflow API on :8790 is down or restarting. ` +
+            `From the repo root: python scripts/workflow_api.py --port 8790 ` +
+            `(or restart with bash scripts/start_ui.sh). Confirm VITE_WORKFLOW_API_URL and ` +
+            `VITE_OPS_WORKFLOW_TOKEN in frontend/.env.local.`,
+        }
+      }
       return {
         kind: 'error',
         message: STATIC_DATA_MODE
-          ? `${message} Missing snapshots under public/data/. From the repo root run: python3 scripts/publish_frontend_data.py --with-details`
+          ? `${message} Missing or stale snapshots under public/data/. From the repo root run: python3 scripts/publish_frontend_data.py --with-details`
           : `${message} The research API on :8787 is down or restarting. ` +
             `From the repo root run: python scripts/frontend_api_lite.py --port 8787 ` +
             `(or restart with cd frontend && npm run dev).`,
@@ -193,6 +209,8 @@ export type RunQuery = {
 export function fetchRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<DataState<ApiRunsPage>> {
   return toState(async () => {
     if (STATIC_DATA_MODE) {
+      // Drop memoized snapshot so auto-refresh / Retry sees republished OOS.
+      clearStaticDataCache('runs.json')
       const data = await loadStaticRuns(query, signal)
       assertShape(Array.isArray(data.runs), 'runs is not an array')
       assertShape(typeof data.total === 'number' && typeof data.counts?.all === 'number', 'runs pagination missing')
@@ -214,6 +232,8 @@ export function fetchRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<D
 export function fetchDashboard(signal?: AbortSignal): Promise<DataState<ApiDashboard>> {
   return toState(async () => {
     if (STATIC_DATA_MODE) {
+      clearStaticDataCache('dashboard.json')
+      clearStaticDataCache('summary.json')
       const data = await loadStaticDashboard(signal)
       assertShape(typeof data.summary?.total_runs === 'number', 'dashboard.summary missing')
       assertShape(Array.isArray(data.recent_runs), 'dashboard.recent_runs is not an array')
@@ -351,10 +371,12 @@ export function fetchMandates(
 ): Promise<DataState<WorkflowMandate[]>> {
   const offline = !WORKFLOW_API_URL || (audience === 'operator' ? !OPS_WORKFLOW_TOKEN : !INVESTOR_WORKFLOW_TOKEN)
   return toState(async () => {
+    // Avoid serving a failed/empty in-flight cache while the API was still booting.
+    workflowCoordinator.clear()
     const data = await workflowRequest<{ mandates: WorkflowMandate[] }>('/api/mandates', { signal }, audience)
     assertShape(Array.isArray(data.mandates), 'mandates missing')
     return data.mandates.map(normalizeMandate)
-  }, offline)
+  }, offline, 'workflow')
 }
 
 export async function fetchMandateDetail(

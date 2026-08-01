@@ -5,6 +5,7 @@ import { fetchMandates, performMandateAction } from '../lib/api'
 import { fmtDate } from '../lib/format'
 import { formatTradingCapital, type WorkflowMandate } from '../lib/mandate-requests'
 import type { DataState } from '../lib/types'
+import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 const actionLabels: Record<string, string> = {
   run_preflight: 'Run data preflight',
@@ -41,6 +42,13 @@ export function DeveloperRequestsPage() {
     load(controller.signal)
     return () => controller.abort()
   }, [load])
+
+  // Workflow often comes up a few seconds after Vite — keep retrying until live.
+  useAutoRefresh(() => load(), {
+    enabled: state.kind === 'error' || state.kind === 'loading',
+    intervalMs: 4_000,
+    refreshing,
+  })
 
   const requests = state.kind === 'live'
     ? state.data.filter((mandate) => mandate.state !== 'cancelled')

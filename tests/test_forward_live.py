@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 
+import pandas as pd
+
 from rlbot.forward_live import (
     _ew_nav,
+    _merge_price_history,
     _nav_from_weights,
+    _nav_series_from_ohlc,
+    _resolve_book_start,
     _spy_nav,
     _weight_vector,
     equal_weight_ohlc_candles,
@@ -95,3 +100,52 @@ def test_spy_and_ew_candle_helpers() -> None:
     ew = equal_weight_ohlc_candles(open_, high, low, close, initial_cash=100_000.0)
     assert ew.shape == (2, 4)
     assert abs(ew[0, 0] - 100_000.0) < 1e-6
+
+
+def test_resolve_book_start_persists_unless_reset() -> None:
+    existing = {"holdout_start": "2026-07-28", "book_start": "2026-07-28"}
+    stamp = {"holdout_start": "2026-07-31"}
+    assert _resolve_book_start(existing, stamp) == "2026-07-28"
+    assert _resolve_book_start(existing, stamp, reset_book=True) == str(
+        pd.Timestamp.now(tz="America/New_York").date()
+    )
+
+
+def test_nav_series_starts_at_initial_cash() -> None:
+    ohlc = np.array([[100_000.0, 101_000.0, 99_000.0, 100_500.0]], dtype=np.float64)
+    nav = _nav_series_from_ohlc(ohlc, initial_cash=100_000.0)
+    assert abs(nav[0] - 100_000.0) < 1e-6
+
+
+def test_merge_price_history_unions_and_prefers_fresh() -> None:
+    old_t = pd.DatetimeIndex(["2026-07-30 09:30", "2026-07-30 09:35"])
+    new_t = pd.DatetimeIndex(["2026-07-30 09:35", "2026-07-31 09:30"])
+    old_o = np.array([[1.0], [2.0]])
+    new_o = np.array([[9.0], [3.0]])  # overlapping 09:35 → fresh wins
+    old_s = np.array([10.0, 20.0])
+    new_s = np.array([29.0, 30.0])
+    times, o, _h, _l, _c, so, _sh, _sl, _sc = _merge_price_history(
+        cached_times=old_t,
+        cached_o=old_o,
+        cached_h=old_o,
+        cached_l=old_o,
+        cached_c=old_o,
+        cached_so=old_s,
+        cached_sh=old_s,
+        cached_sl=old_s,
+        cached_sc=old_s,
+        times=new_t,
+        o=new_o,
+        h=new_o,
+        l=new_o,
+        c=new_o,
+        so=new_s,
+        sh=new_s,
+        sl=new_s,
+        sc=new_s,
+    )
+    assert len(times) == 3
+    assert abs(float(o[0, 0]) - 1.0) < 1e-9
+    assert abs(float(o[1, 0]) - 9.0) < 1e-9  # fresh overlap
+    assert abs(float(o[2, 0]) - 3.0) < 1e-9
+    assert abs(float(so[1]) - 29.0) < 1e-9

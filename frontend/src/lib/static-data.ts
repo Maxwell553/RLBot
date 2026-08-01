@@ -21,8 +21,12 @@ const DATA_BASE = (import.meta.env.VITE_STATIC_DATA_URL as string | undefined)?.
 type CacheEntry<T> = { at: number; data: T; promise?: Promise<T> }
 
 const memory = new Map<string, CacheEntry<unknown>>()
-/** Keep warm across soft navigations; publisher regenerates files on boot. */
-const MEMORY_TTL_MS = 60_000
+/**
+ * Short TTL so auto-refresh / hard reload picks up republished snapshots
+ * (lite API rewrites public/data after enrich). Soft navigations still share
+ * one in-flight fetch via ``promise``.
+ */
+const MEMORY_TTL_MS = 5_000
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String) : []
