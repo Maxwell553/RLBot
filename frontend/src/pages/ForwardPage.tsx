@@ -13,8 +13,9 @@ import type {
 import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 const SERIES = [
-  { key: 'model' as const, label: '1360pctAlgo', color: '#0b6e4f' },
+  { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
+  { key: 'crypto' as const, label: 'CrestDay', color: '#6b4f9a' },
   { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#b0892e' },
   { key: 'spy' as const, label: 'S&P (SPY)', color: '#c45c3e' },
 ]
@@ -190,11 +191,12 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
 
   const modelCandles = sliceCandleSeries(mark.candles?.model)
   const liveCandles = sliceCandleSeries(mark.candles?.live_model)
+  const cryptoCandles = sliceCandleSeries(mark.candles?.crypto)
   const spyCandles = sliceCandleSeries(mark.candles?.spy)
   const ewCandles = sliceCandleSeries(mark.candles?.equal_weight)
 
   // Prefer server ``nav`` (first point = initial_cash / book open). Candle
-  // closes mark end-of-bar and make 1360pctAlgo/SPY appear to start ≠ 100k.
+  // closes mark end-of-bar and make GeneralEquity1/SPY appear to start ≠ 100k.
   const navOrCloses = (navVals: number[] | undefined, candles: ApiForwardCandle[]) => {
     const fromNav = sliceNav(navVals)
     if (fromNav.length > 0) return fromNav
@@ -202,6 +204,7 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
   }
   const model = navOrCloses(mark.nav?.model, modelCandles)
   const live_model = navOrCloses(mark.nav?.live_model, liveCandles)
+  const crypto = navOrCloses(mark.nav?.crypto, cryptoCandles)
   const spy = navOrCloses(mark.nav?.spy, spyCandles)
   const equal_weight = navOrCloses(mark.nav?.equal_weight, ewCandles)
 
@@ -211,14 +214,21 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
     n_bars: n,
     dates: windowStamps,
     timestamps: windowStamps,
-    nav: { model, spy, equal_weight, ...(live_model.length ? { live_model } : {}) },
+    nav: {
+      model,
+      spy,
+      equal_weight,
+      ...(live_model.length ? { live_model } : {}),
+      ...(crypto.length ? { crypto } : {}),
+    },
     candles:
-      modelCandles.length || spyCandles.length || ewCandles.length || liveCandles.length
+      modelCandles.length || spyCandles.length || ewCandles.length || liveCandles.length || cryptoCandles.length
         ? {
             model: modelCandles,
             spy: spyCandles,
             equal_weight: ewCandles,
             ...(liveCandles.length ? { live_model: liveCandles } : {}),
+            ...(cryptoCandles.length ? { crypto: cryptoCandles } : {}),
           }
         : mark.candles,
     stats: {
@@ -228,6 +238,7 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
       ...(live_model.length
         ? { live_model: windowStats(live_model, barsPerYear, windowStamps) }
         : {}),
+      ...(crypto.length ? { crypto: windowStats(crypto, barsPerYear, windowStamps) } : {}),
     },
     weights: mark.weights ? mark.weights.slice(i0) : mark.weights,
   }
@@ -334,6 +345,7 @@ type HoverPoint = {
   date: string
   model: number | null
   live_model: number | null
+  crypto: number | null
   equal_weight: number | null
   spy: number | null
 }
@@ -415,6 +427,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       date: plot.stamps[idx] ?? `bar ${idx + 1}`,
       model: at('model'),
       live_model: at('live_model'),
+      crypto: at('crypto'),
       equal_weight: at('equal_weight'),
       spy: at('spy'),
     })
@@ -801,9 +814,10 @@ export function ForwardPage() {
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [range, setRange] = useState<RangeId>('1d')
 
-  const reload = useCallback(async (mode: 'hard' | 'poll' | 'force' = 'hard') => {
-    const force = mode === 'hard' || mode === 'force'
-    if (mode === 'hard') {
+  const reload = useCallback(async (mode: 'soft' | 'poll' | 'force' = 'soft') => {
+    // Only explicit user refresh hits Yahoo via force_refresh; soft/poll use /data.
+    const force = mode === 'force'
+    if (mode === 'soft') {
       setState((current) => (current.kind === 'live' ? current : { kind: 'loading' }))
       setRefreshing(true)
     } else {
@@ -815,8 +829,8 @@ export function ForwardPage() {
       setRefreshError(null)
     } else if (next.kind === 'error') {
       setRefreshError(next.message)
-      // Keep prior chart on soft poll errors; hard/force surfaces the failure.
-      if (mode === 'hard' || mode === 'force') {
+      // Keep prior chart on soft poll errors; force surfaces the failure.
+      if (mode === 'force' || mode === 'soft') {
         setState((current) => (current.kind === 'live' ? current : next))
       }
     } else {
@@ -826,7 +840,7 @@ export function ForwardPage() {
   }, [])
 
   useEffect(() => {
-    void reload('hard')
+    void reload('soft')
   }, [reload])
 
   useAutoRefresh(() => void reload('poll'), {
@@ -855,8 +869,9 @@ export function ForwardPage() {
           <p className="font-mono text-[11px] uppercase tracking-[.2em] text-ink/55">Forward test</p>
           <h1 className="mt-2 font-display text-3xl text-ink">Live book vs benchmarks</h1>
           <p className="mt-2 max-w-2xl text-sm text-ink/60">
-            Five-minute NAV marks from the live paper book (PROD_RETURN_ALPHA / 1360pctAlgo or a
-            LIVE_* RL deploy) vs equal-weight and SPY. Prices refresh about every 5 minutes.
+            Five-minute NAV marks from the live paper book (GENERAL_EQUITY1 / GeneralEquity1,
+            CrestDay, or a LIVE_* RL deploy) vs equal-weight and SPY. Soft loads use
+            snapshots; Refresh pulls live Yahoo marks.
           </p>
           {state.kind === 'live' && refreshing && (
             <p className="mt-2 text-[11px] text-ink/55">Refreshing forward mark…</p>
@@ -878,7 +893,7 @@ export function ForwardPage() {
       )}
       {state.kind === 'error' && (
         <div className="mt-6">
-          <ErrorPanel message={state.message} onRetry={() => void reload('hard')} />
+          <ErrorPanel message={state.message} onRetry={() => void reload('soft')} />
         </div>
       )}
 
@@ -887,9 +902,12 @@ export function ForwardPage() {
           <Badge tone="warning">No forward mark</Badge>
           <p className="mt-3 text-sm text-ink/70">{emptyMessage}</p>
           <pre className="mt-4 overflow-x-auto rounded-xl bg-ink/[.04] p-4 text-[11px] leading-5 text-ink/80">
-{`# Locked 1360pctAlgo paper book (TQQQ weekly + GLD/TLT dual)
+{`# Locked GeneralEquity1 pack (TQQQ+QQQ hybrid + GLD/TLT dual)
 python scripts/paper_prod_return_alpha.py run-day --refresh-data
 # or: bash scripts/daily_paper_prod_return_alpha.sh
+
+# CrestDay companion (pack NAV, $100k):
+python scripts/paper_crest_day.py run-day
 
 # Companion RL LIVE deploy mark:
 python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data`}

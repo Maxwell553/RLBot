@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Daily paper loop for prod_return_alpha_v1 (1360pctAlgo → /ops/forward).
+# Daily paper loop for GeneralEquity1 pack → /ops/forward.
 #
-#   1. Refresh daily OHLC (yfinance)
-#   2. Compute weekly TQQQ + month-end dual targets
+#   1. Refresh daily OHLC (yfinance) for MTM
+#   2. Pull targets from locked GeneralEquity1/ pack
 #   3. Paper-rebalance when due
-#   4. Write shadow ledger + forward mark; activate PROD_RETURN_ALPHA
+#   4. Write shadow ledger + forward mark; activate GENERAL_EQUITY1
 #
 # Usage:
 #   bash scripts/daily_paper_prod_return_alpha.sh
@@ -20,12 +20,12 @@ fi
 LOG_DIR="${MARKETTRAINER_LOG_DIR:-$ROOT/execution/logs}"
 mkdir -p "$LOG_DIR"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-LOG="$LOG_DIR/daily_paper_prod_return_alpha_${STAMP}.log"
+LOG="$LOG_DIR/daily_paper_general_equity1_${STAMP}.log"
 EXTRA=("$@")
 {
-  echo "[daily_paper_1360] start ${STAMP}"
+  echo "[daily_paper_ge1] start ${STAMP}"
   python scripts/paper_prod_return_alpha.py run-day --refresh-data "${EXTRA[@]}"
-  echo "[daily_paper_1360] done → /ops/forward (PROD_RETURN_ALPHA)"
-  echo "[daily_paper_1360] state: execution/paper_prod_return_alpha/state.json"
-  echo "[daily_paper_1360] ledger: execution/shadow_ledger_PROD_RETURN_ALPHA.jsonl"
+  echo "[daily_paper_ge1] done → /ops/forward (GENERAL_EQUITY1)"
+  echo "[daily_paper_ge1] state: execution/paper_general_equity1/state.json"
+  echo "[daily_paper_ge1] ledger: execution/shadow_ledger_GENERAL_EQUITY1.jsonl"
 } | tee "$LOG"

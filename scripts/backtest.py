@@ -1059,20 +1059,36 @@ def _excess_vs_equal_weight_metrics(
     start_bar: int,
     asset_live,
 ) -> dict:
-    """Daily excess-return Sharpe vs equal-weight (for excess DSR)."""
+    """Daily excess-return Sharpe vs equal-weight (for excess DSR) + EW/SPY sleeves."""
     from rlbot.eval_selection import annualized_sharpe
 
     nav_ew = equal_weight_daily_cost_aware_nav(
         navs, ohlcv, start_bar, asset_live=asset_live
     )
     ew_return = float(nav_ew[-1] / max(float(nav_ew[0]), 1e-12) - 1.0)
+    lr_ew = np.diff(np.log(np.maximum(np.asarray(nav_ew, dtype=np.float64), 1e-12)))
+    ew_sharpe = _sharpe_ann_from_log_rets(lr_ew) if lr_ew.size >= 2 else None
     agent_r = np.diff(np.log(np.maximum(np.asarray(navs, dtype=np.float64), 1e-12)))
-    ew_r = np.diff(np.log(np.maximum(np.asarray(nav_ew, dtype=np.float64), 1e-12)))
+    ew_r = lr_ew
     n = min(agent_r.size, ew_r.size)
     out: dict = {
         "equal_weight_daily_return": ew_return,
+        "equal_weight_daily_sharpe": float(ew_sharpe) if ew_sharpe is not None and np.isfinite(ew_sharpe) else None,
         "excess_return": float(navs[-1] / max(float(navs[0]), 1e-12) - 1.0) - ew_return,
     }
+    # SPY / config-benchmark buy&hold (same sleeve as detailed.benchmark_spy).
+    try:
+        nav_spy = benchmark_only_nav(
+            navs, ohlcv, start_bar, tickers=None, asset_live=asset_live,
+        )
+        spy_ret = float(nav_spy[-1] / max(float(nav_spy[0]), 1e-12) - 1.0)
+        lr_spy = np.diff(np.log(np.maximum(np.asarray(nav_spy, dtype=np.float64), 1e-12)))
+        spy_sh = _sharpe_ann_from_log_rets(lr_spy) if lr_spy.size >= 2 else None
+        out["spy_return"] = spy_ret
+        out["spy_sharpe"] = float(spy_sh) if spy_sh is not None and np.isfinite(spy_sh) else None
+    except Exception:
+        out["spy_return"] = None
+        out["spy_sharpe"] = None
     if n < 4:
         return out
     excess = agent_r[:n] - ew_r[:n]
@@ -1187,6 +1203,9 @@ def _write_backtest_summary(
         "oos_trials_conservative": n_trials_conservative,
         "deflated_sharpe": dsr,
         "equal_weight_daily_return": excess_metrics.get("equal_weight_daily_return"),
+        "equal_weight_daily_sharpe": excess_metrics.get("equal_weight_daily_sharpe"),
+        "spy_return": excess_metrics.get("spy_return"),
+        "spy_sharpe": excess_metrics.get("spy_sharpe"),
         "excess_return_vs_equal_weight": excess_metrics.get("excess_return"),
         "excess_sharpe": excess_metrics.get("excess_sharpe"),
         "deflated_sharpe_excess": dsr_excess,
@@ -1195,6 +1214,20 @@ def _write_backtest_summary(
         **git_provenance(),
         "detailed": detailed,
     }
+    # Prefer detailed sleeves when --detailed ran (identical definitions).
+    if isinstance(detailed, dict):
+        ew = detailed.get("benchmark_equal_weight_daily") or detailed.get("benchmark_equal_weight")
+        spy = detailed.get("benchmark_spy") or detailed.get("benchmark_only")
+        if isinstance(ew, dict):
+            if ew.get("total_return") is not None:
+                payload["equal_weight_daily_return"] = ew.get("total_return")
+            if ew.get("sharpe") is not None:
+                payload["equal_weight_daily_sharpe"] = ew.get("sharpe")
+        if isinstance(spy, dict):
+            if spy.get("total_return") is not None:
+                payload["spy_return"] = spy.get("total_return")
+            if spy.get("sharpe") is not None:
+                payload["spy_sharpe"] = spy.get("sharpe")
     override = (getattr(args, "summary_json", "") or "").strip()
     if override:
         out = Path(override)

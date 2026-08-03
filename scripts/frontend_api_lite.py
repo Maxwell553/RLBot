@@ -431,6 +431,10 @@ def _row_from_disk(run_id: str) -> dict[str, Any]:
     return row
 
 
+def _float_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _oos_row_from_backtest(run_id: str, bt: dict[str, Any]) -> dict[str, Any] | None:
     match = _COHORT_RUN_RE.match(run_id)
     if match is None:
@@ -439,17 +443,32 @@ def _oos_row_from_backtest(run_id: str, bt: dict[str, Any]) -> dict[str, Any] | 
     ret = bt.get("total_return")
     if sharpe is None and ret is None:
         return None
+    detailed = bt.get("detailed") if isinstance(bt.get("detailed"), dict) else {}
+    ew = detailed.get("benchmark_equal_weight_daily") or detailed.get("benchmark_equal_weight")
+    spy = detailed.get("benchmark_spy") or detailed.get("benchmark_only")
+    ew_ret = _float_or_none(ew.get("total_return")) if isinstance(ew, dict) else None
+    ew_sh = _float_or_none(ew.get("sharpe")) if isinstance(ew, dict) else None
+    spy_ret = _float_or_none(spy.get("total_return")) if isinstance(spy, dict) else None
+    spy_sh = _float_or_none(spy.get("sharpe")) if isinstance(spy, dict) else None
+    if ew_ret is None:
+        ew_ret = _float_or_none(bt.get("equal_weight_daily_return"))
+    if ew_sh is None:
+        ew_sh = _float_or_none(bt.get("equal_weight_daily_sharpe"))
+    if spy_ret is None:
+        spy_ret = _float_or_none(bt.get("spy_return") or bt.get("benchmark_return"))
+    if spy_sh is None:
+        spy_sh = _float_or_none(bt.get("spy_sharpe"))
     return {
         "run_id": run_id,
         "cohort": match.group(2),
         "window": match.group(1).upper(),
         "model_ret": ret,
         "model_sh": sharpe,
-        "ew_ret": bt.get("equal_weight_daily_return"),
-        "ew_sh": bt.get("equal_weight_daily_sharpe"),
-        "spy_ret": bt.get("spy_return") or bt.get("benchmark_return"),
-        "spy_sh": bt.get("spy_sharpe"),
-        "has_benchmarks": bt.get("equal_weight_daily_return") is not None,
+        "ew_ret": ew_ret,
+        "ew_sh": ew_sh,
+        "spy_ret": spy_ret,
+        "spy_sh": spy_sh,
+        "has_benchmarks": ew_ret is not None and spy_ret is not None,
     }
 
 
@@ -492,18 +511,21 @@ def _build_enriched_rows(budget_s: float = 25.0) -> list[dict[str, Any]]:
         row = _merge_run_row(prev_by_id.get(rid), _row_from_disk(rid))
         rows_by_id[rid] = row
         if row["has_backtest"] and row.get("oos_sharpe") is not None:
-            bt = {
-                "sharpe": row["oos_sharpe"],
-                "total_return": row["oos_return"],
-                "deflated_sharpe": row.get("oos_deflated_sharpe"),
-                "max_drawdown": row.get("oos_max_drawdown"),
-                "equal_weight_daily_return": None,
-                "equal_weight_daily_sharpe": None,
-                "spy_return": None,
-                "spy_sharpe": None,
-                "excess_return_vs_equal_weight": row.get("ew_excess_return"),
-            }
-            # Reuse fields already loaded — avoid a second iCloud hit per run.
+            # Prefer full backtest JSON (detailed EW/SPY sleeves) when cheap;
+            # fall back to run-cache fields so we never invent null benchmarks.
+            bt = _pick_backtest(rid, timeout_s=1.5)
+            if bt is None:
+                bt = {
+                    "sharpe": row["oos_sharpe"],
+                    "total_return": row["oos_return"],
+                    "deflated_sharpe": row.get("oos_deflated_sharpe"),
+                    "max_drawdown": row.get("oos_max_drawdown"),
+                    "equal_weight_daily_return": row.get("equal_weight_daily_return"),
+                    "equal_weight_daily_sharpe": row.get("equal_weight_daily_sharpe"),
+                    "spy_return": row.get("spy_return"),
+                    "spy_sharpe": row.get("spy_sharpe"),
+                    "excess_return_vs_equal_weight": row.get("ew_excess_return"),
+                }
             oos = _oos_row_from_backtest(rid, bt)
             if oos is not None:
                 oos_rows.append(oos)
@@ -1014,6 +1036,12 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            try:
+                from rlbot.forward_mark import merge_crypto_companion
+
+                mark = merge_crypto_companion(mark)
+            except Exception:  # noqa: BLE001
+                pass
             weights = mark.get("weights")
             if isinstance(weights, list) and len(weights) > 400:
                 mark = {**mark, "weights": weights[:: max(1, len(weights) // 200)]}

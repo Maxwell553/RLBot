@@ -22,11 +22,11 @@ type CacheEntry<T> = { at: number; data: T; promise?: Promise<T> }
 
 const memory = new Map<string, CacheEntry<unknown>>()
 /**
- * Short TTL so auto-refresh / hard reload picks up republished snapshots
- * (lite API rewrites public/data after enrich). Soft navigations still share
- * one in-flight fetch via ``promise``.
+ * Soft navigations share one in-flight fetch via ``promise``. TTL is long
+ * enough that 60s auto-refresh is the usual refresh path (not every mount).
+ * Call ``clearStaticDataCache`` after an explicit republish / force refresh.
  */
-const MEMORY_TTL_MS = 5_000
+const MEMORY_TTL_MS = 45_000
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String) : []

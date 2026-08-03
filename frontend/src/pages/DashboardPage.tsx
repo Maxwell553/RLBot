@@ -62,14 +62,30 @@ function windowSharpes(rows: ApiResultRow[]): { window: string; sharpe: number }
 export function DashboardPage() {
   const { state, refreshing, refreshError, reload } = useDashboardData()
   const [workflowState, setWorkflowState] = useState<DataState<WorkflowMandate[]>>({ kind: 'loading' })
+  const [workflowRefreshing, setWorkflowRefreshing] = useState(false)
+
+  const loadMandates = useCallback((signal?: AbortSignal) => {
+    setWorkflowRefreshing(true)
+    setWorkflowState((current) => (current.kind === 'live' ? current : { kind: 'loading' }))
+    fetchMandates(signal, 'operator').then((next) => {
+      if (signal?.aborted || next.kind === 'loading') return
+      setWorkflowRefreshing(false)
+      setWorkflowState((current) => (next.kind === 'error' && current.kind === 'live' ? current : next))
+    })
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
-    fetchMandates(controller.signal, 'operator').then((next) => {
-      if (!controller.signal.aborted) setWorkflowState(next)
-    })
+    loadMandates(controller.signal)
     return () => controller.abort()
-  }, [])
+  }, [loadMandates])
+
+  // Workflow often comes up a few seconds after Vite — keep retrying until live.
+  useAutoRefresh(() => loadMandates(), {
+    enabled: workflowState.kind === 'error' || workflowState.kind === 'loading',
+    intervalMs: 4_000,
+    refreshing: workflowRefreshing,
+  })
 
   const summaryData = state.kind === 'live' ? state.data.summary : state.kind === 'offline' ? sampleSummary : null
   const runData = state.kind === 'live' ? state.data.recent_runs : state.kind === 'offline' ? sampleRuns : null
@@ -91,6 +107,12 @@ export function DashboardPage() {
     ...(run.training_status === 'interrupted' ? [`${run.run_id}: training interrupted`] : []),
     ...blockingWarnings(run.warnings).map((warning) => `${run.run_id}: ${warning}`),
   ]).slice(0, 6)
+  const mandateValue = (n: number) => {
+    if (workflowState.kind === 'live') return String(n)
+    if (workflowState.kind === 'error') return '!'
+    if (workflowState.kind === 'offline') return '—'
+    return '…'
+  }
 
   return (
     <div className="px-5 py-7 sm:px-8 lg:px-10 lg:py-9">
@@ -127,11 +149,11 @@ export function DashboardPage() {
         <section className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-5" aria-label="Operations work queue">
           {summaryData ? (
             [
-              { label: 'Mandates awaiting review', value: workflowState.kind === 'live' ? String(awaitingReview) : '—', note: 'require data and policy preflight', icon: Clock3 },
-              { label: 'Quotes awaiting payment', value: workflowState.kind === 'live' ? String(awaitingPayment) : '—', note: 'payment advances by webhook only', icon: CreditCard },
-              { label: 'Active builds', value: workflowState.kind === 'live' ? String(activeBuilds) : '—', note: `${summaryData.active_runs} active training runs`, icon: Activity },
+              { label: 'Mandates awaiting review', value: mandateValue(awaitingReview), note: workflowState.kind === 'error' ? 'workflow API unavailable — retrying' : 'require data and policy preflight', icon: Clock3 },
+              { label: 'Quotes awaiting payment', value: mandateValue(awaitingPayment), note: workflowState.kind === 'error' ? 'workflow API unavailable — retrying' : 'payment advances by webhook only', icon: CreditCard },
+              { label: 'Active builds', value: mandateValue(activeBuilds), note: `${summaryData.active_runs} active training runs`, icon: Activity },
               { label: 'Needs intervention', value: String(needsIntervention), note: 'interrupted jobs or operational blockers', icon: AlertTriangle },
-              { label: 'Reports ready for release', value: workflowState.kind === 'live' ? String(reportsReady) : '—', note: 'governed OOS completed', icon: FileCheck2 },
+              { label: 'Reports ready for release', value: mandateValue(reportsReady), note: workflowState.kind === 'error' ? 'workflow API unavailable — retrying' : 'governed OOS completed', icon: FileCheck2 },
             ].map((item) => (
               <Card key={item.label} className="p-5">
                 <span className="grid h-9 w-9 place-items-center rounded-xl bg-pine text-mint"><item.icon size={16} aria-hidden="true" /></span>
@@ -144,6 +166,19 @@ export function DashboardPage() {
             Array.from({ length: 5 }).map((_, index) => <Skeleton key={index} className="h-40" />)
           )}
         </section>
+      )}
+
+      {workflowState.kind === 'error' && state.kind !== 'error' && (
+        <Card className="mt-4 border-red-700/15 bg-red-50/70 p-4">
+          <p className="text-xs text-red-900">{workflowState.message}</p>
+          <button
+            type="button"
+            onClick={() => loadMandates()}
+            className="mt-2 text-[11px] font-semibold text-red-950 underline"
+          >
+            Retry workflow connection
+          </button>
+        </Card>
       )}
 
       {systemAlerts.length > 0 && (

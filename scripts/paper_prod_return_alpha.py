@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paper / forward loop for prod_return_alpha_v1 (1360pctAlgo).
+"""Paper / forward loop for GeneralEquity1 (prod_return_alpha_v3 pack).
 
 Examples::
 
@@ -30,7 +30,7 @@ from rlbot.paper_prod_return_alpha import (  # noqa: E402
     load_state,
     run_paper_day,
 )
-from rlbot.prod_return_alpha import PAPER_RUN_ID, STRATEGY_ID  # noqa: E402
+from rlbot.pack_general_equity1 import PAPER_RUN_ID, STRATEGY_ID  # noqa: E402
 
 
 def _parse_date(s: str) -> date | None:
@@ -54,21 +54,21 @@ def main() -> None:
     p_run.add_argument(
         "--no-activate",
         action="store_true",
-        help="Do not point execution/forward_active.json at PROD_RETURN_ALPHA",
+        help="Do not point execution/forward_active.json at GENERAL_EQUITY1",
     )
     p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument("--initial-cash", type=float, default=100_000.0)
 
     sub.add_parser("status", help="Show paper state + active forward pointer")
     sub.add_parser(
-        "activate", help="Point /ops/forward at PROD_RETURN_ALPHA (existing mark)"
+        "activate", help="Point /ops/forward at GENERAL_EQUITY1 (existing mark)"
     )
 
     args = parser.parse_args()
 
     if args.cmd == "activate":
         set_active_forward_run(PAPER_RUN_ID)
-        print(f"[paper_1360] active forward → {PAPER_RUN_ID}")
+        print(f"[paper_ge] active forward → {PAPER_RUN_ID}")
         return
 
     if args.cmd == "status":
@@ -113,11 +113,11 @@ def main() -> None:
     risky = [(k, v) for k, v in tw.items() if str(k).upper() != "CASH"]
     risky.sort(key=lambda kv: -float(kv[1]))
     if risky:
-        print(f"[paper_1360] book (cash={tw.get('CASH', 0):.1%}):")
+        print(f"[paper_ge] book (cash={tw.get('CASH', 0):.1%}):")
         for k, v in risky:
             print(f"  {k:8s} {float(v):6.2%}")
     print(
-        f"[paper_1360] forward: /ops/forward (run_id={result.get('run_id')}) "
+        f"[paper_ge] forward: /ops/forward (run_id={result.get('run_id')}) "
         f"actions={result.get('actions')}"
     )
 

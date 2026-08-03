@@ -42,10 +42,8 @@ environment:
   # so the policy has an explicit gross-exposure head instead of burying cash in a
   # joint softmax (726 stayed ~fully invested OOS on W2–W5).
   two_head_actions: true
-  # Cohort 729: tighten DD exposure taper vs 728 (6→12%/30% → 4→10%/20%).
-  # 728 still saw W2/W3 OOS DDs of −11%/−17% with eval cash >> OOS cash — earlier,
-  # harder mechanical de-risk when underwater.
-  dd_exposure_taper: true
+  # Cohort 809 / 806_720_plus: no mechanical crash floor (807–808 parked cash).
+  dd_exposure_taper: false
   dd_exposure_taper_start: 0.04
   dd_exposure_taper_end: 0.10
   dd_exposure_taper_min_gross: 0.20
@@ -70,9 +68,8 @@ reward:
   # Equal-weight passive benchmark (1/N per asset; feasible under max_single_asset_weight 0.20)
   benchmark_cap_weights: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
   # clip(agent_log_ret - bench_log_ret) * scale; uses same friction model as Sortino benchmark
-  # Cohort 804: restore 730's 300 — 803 kept 250 while cash-centering selection;
-  # median OOS Sharpe fell 0.83 (730) → 0.39 with ~42% cash but no excess.
-  benchmark_excess_scale: 300.0
+  # Cohort 809 / 806_720_plus: restore 720 geometry (600), not 804's 300.
+  benchmark_excess_scale: 600.0
   benchmark_excess_clip: 0.04
   # CONSTANT cap on |sortino + benchmark| per step (reward units; 0 disables both).
   # Deliberately not relative to the other terms: a share-of-other-mass cap let the
@@ -90,34 +87,25 @@ reward:
   # days saturate identically (no gradient). 4.0 saturates at dd = 25%. 0 = uncapped.
   drawdown_amp_max: 4.0
   # Direct drawdown shaping (applied every step; logged as rew_decomp/drawdown_penalty):
-  drawdown_increase_penalty: 2.0  # × reward_scale on fresh dd expansion
-  # Cohort 731: put level on the same scale as increase/return (× reward_scale).
-  # Cohort 801 (was 81): 0.10 → 0.04 overshot into full-invest underperformance.
-  # Cohort 802: 0.07 — midway restore so cash remains usable without T-bill parks.
-  # Cohort 804: keep 0.07 (DD depth was not 803's failure mode — cash-centering was).
-  drawdown_level_times_reward_scale: true
-  drawdown_level_penalty: 0.07
-  drawdown_level_floor: 0.0  # tax any invested underwater NAV
-  # Couple level partially to gross: cash keeps an escape hatch but still pays.
-  drawdown_level_exposure_coupling: 0.5
-  # Re-enable concentration (off in 729/730). Target ~5.5 effective risky assets.
-  concentration_penalty: 1.25
-  concentration_target_eff_assets: 5.5
-  # Cohort 804: zero cash yield. 803's 0.00008 + soft ~40% cash target let the
-  # book earn carry without beating EW (W1_803 62% cash / Sh 0.86 vs W1_730 34% /
-  # Sh 1.47). Selection — not a T-bill coupon — should set cash; see training.*.
-  cash_daily_yield: 0.0
-  # Keep participation off (803's 0.03 did not restore excess).
-  participation_bonus: 0.0
+  drawdown_increase_penalty: 1.0  # × reward_scale on fresh dd expansion (806)
+  # Cohort 809 / 806: raw level penalty (not × reward_scale) — binding level×scale
+  # in 808 parked W5 at ~95% cash.
+  drawdown_level_times_reward_scale: false
+  drawdown_level_penalty: 3.0
+  drawdown_level_floor: 0.05
+  drawdown_level_exposure_coupling: 0.0
+  concentration_penalty: 0.75
+  concentration_target_eff_assets: 6.0
+  cash_daily_yield: 0.00015
+  participation_bonus: 0.02
   participation_reward_scale: 10.0
-  participation_vix_relief: 0.0
+  participation_vix_relief: 1.0
   participation_drawdown_relief: 0.0
-  # Cohort 804: back to 730's milder exposure/vol taxes so invested books can win
-  # when the window rewards risk (803's mid-point still suppressed W1/W5 returns).
-  exposure_risk_mode: vix_positive  # realized_vol | vix_positive
-  exposure_risk_penalty_scale: 3.5
-  vol_penalty_mode: absolute  # excess | absolute
-  vol_penalty_scale: 0.40
+  # Cohort 809 / 806_720_plus: realized_vol@100 + excess vol 0.15 (not vix parks).
+  exposure_risk_mode: realized_vol  # realized_vol | vix_positive
+  exposure_risk_penalty_scale: 100.0
+  vol_penalty_mode: excess  # excess | absolute
+  vol_penalty_scale: 0.15
 
 # Per-asset costs (one entry per universe.assets key, same order)
 transaction_costs:
@@ -169,29 +157,19 @@ training:
   curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
   checkpoint_save_freq_steps: 1000000
   reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
-  early_stop_patience: 0     # 0 = full budget; >0 → stop after K evals with no new best (after curriculum)
+  early_stop_patience: 12    # 806/809: patience after curriculum (0 = full budget)
   # Benchmark-relative eval selection (equal-weight daily passive book by default):
   # score = (1-blend)*mean(excess) + blend*stitched_excess - std_coef*std(excess) - dd_coef*p75(max_dd)
   best_model_score_std_coef: 0.75
-  # Raised 2.0 → 3.0 with excess_sharpe (727); 3.0 → 8.0 with defensive_sharpe (728);
-  # 8.0 → 12.0 (729): 12 × 0.10 DD ≈ −1.2 — reject deep left tails harder.
-  best_model_score_dd_coef: 12.0
+  best_model_score_dd_coef: 3.0
   best_model_score_stitched_blend: 0.5  # 0 = segment mean only; 1 = stitched excess only
   best_model_benchmark: equal_weight_daily  # balanced_6040 | equal_weight_daily
-  # Cohort 728: defensive_sharpe = excess Sharpe signal − dd_coef × max(max_dd_frac)
-  # (not p75). DD depth still enters via best_model_score_dd_coef; no hard/soft
-  # max_dd reject gate (730: removed — 729 hard@0.10 wiped W1/W2 best saves).
-  best_model_score_mode: defensive_sharpe
-  # Cohort 804: revert crash-cash target to 730/802's 0.25. 803's 0.35 made every
-  # window's best_eval_score deeply negative (−0.7…−2.1) and selected parks that
-  # matched the cash target without excess (median Sh 0.39).
-  best_model_worst_regime_cash_coef: 3.0
-  best_model_worst_regime_cash_target: 0.25
-  # Soft anti-park only — punish mean cash above ~50%, do not *center* selection
-  # on 40%. 730's 0.45/4 got median ~37% cash with Sh 0.83; 803's 0.42/5 centered
-  # cash and killed alpha. Cap 0.50 / coef 3.5 = park brake without a cash magnet.
-  best_model_mean_cash_coef: 3.5
-  best_model_mean_cash_cap: 0.50
+  # Cohort 809 / 806_720_plus: excess_sharpe with ZERO cash-centering (804 magnets killed alpha).
+  best_model_score_mode: excess_sharpe
+  best_model_worst_regime_cash_coef: 0.0
+  best_model_worst_regime_cash_target: 0.0
+  best_model_mean_cash_coef: 0.0
+  best_model_mean_cash_cap: 1.0
   # Checkpoint hardening (0 / false = legacy single-eval immediate replace).
   # Enabled after 723/724: single-eval immediate replacement selected checkpoints at the
   # first post-gate eval (still mid-DR-widening) on 4 of 6 runs — a noisy score under a

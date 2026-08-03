@@ -79,8 +79,11 @@ function pkillScript(scriptBasename) {
   })
 }
 
-async function fetchJson(url, timeoutMs = 800) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+async function fetchJson(url, timeoutMs = 800, headers = undefined) {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: headers ?? undefined,
+  })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return response.json()
 }
@@ -96,9 +99,18 @@ async function researchApiIsCurrent() {
 
 async function workflowApiIsHealthy() {
   try {
-    return await portOpen(8790)
+    if (!(await portOpen(8790))) return false
+    const session = await fetchJson('http://127.0.0.1:8790/api/session', 2_000, {
+      Authorization: 'Bearer operator-local',
+    })
+    return Boolean(session && (session.role === 'operator' || session.user_id || session.userId))
   } catch {
-    return false
+    // Port open but not ready yet (or auth shape differs) — treat as unhealthy.
+    try {
+      return await portOpen(8790)
+    } catch {
+      return false
+    }
   }
 }
 
@@ -313,7 +325,21 @@ async function publishFrontendData() {
   }
 }
 
-await publishFrontendData()
+/** Skip blocking publish when snapshots already exist (background refresh later). */
+async function ensureFrontendData() {
+  const marker = path.join(frontendDir, 'public', 'data', 'dashboard.json')
+  try {
+    accessSync(marker, constants.R_OK)
+    console.log('[dev] Existing public/data snapshots — skipping blocking publish')
+    // Refresh in background so Vite is not blocked on iCloud / cache walks.
+    void publishFrontendData()
+    return
+  } catch {
+    await publishFrontendData()
+  }
+}
+
+await ensureFrontendData()
 
 if (SKIP_RESEARCH_API) {
   console.log('[dev] Skipping research API (MARKETTRAINER_SKIP_RESEARCH_API=1); UI uses /data/*.json')
@@ -395,25 +421,32 @@ const vite = spawn(viteBin, process.argv.slice(2), {
 })
 children.push(vite)
 
+const workflowEnv = {
+  ...process.env,
+  MARKETTRAINER_WORKFLOW_TOKENS: process.env.MARKETTRAINER_WORKFLOW_TOKENS || JSON.stringify({
+    'investor-local': { user_id: 'investor_1', org_id: 'org_1', role: 'investor' },
+    'operator-local': { user_id: 'operator_1', org_id: 'internal', role: 'operator' },
+  }),
+  MARKETTRAINER_PAYMENT_WEBHOOK_SECRET:
+    process.env.MARKETTRAINER_PAYMENT_WEBHOOK_SECRET || 'local-webhook-secret',
+}
 if (await workflowApiIsHealthy()) {
   console.log('[dev] Workflow API ready on http://127.0.0.1:8790')
 } else {
-  const workflowEnv = {
-    ...process.env,
-    MARKETTRAINER_WORKFLOW_TOKENS: process.env.MARKETTRAINER_WORKFLOW_TOKENS || JSON.stringify({
-      'investor-local': { user_id: 'investor_1', org_id: 'org_1', role: 'investor' },
-      'operator-local': { user_id: 'operator_1', org_id: 'internal', role: 'operator' },
-    }),
-    MARKETTRAINER_PAYMENT_WEBHOOK_SECRET:
-      process.env.MARKETTRAINER_PAYMENT_WEBHOOK_SECRET || 'local-webhook-secret',
-  }
-  // Fire-and-forget: do not await health — Vite is already up for Forward/Runs.
   start('workflow API', python, ['scripts/workflow_api.py', '--port', '8790'], workflowEnv, {
-    restart: false,
+    restart: true,
+    port: 8790,
+    healthy: workflowApiIsHealthy,
   })
-  console.log(
-    '[dev] Workflow API starting in background (mandates need :8790). Forward/Runs use :8787.',
-  )
+  const ok = await waitFor(workflowApiIsHealthy, 'workflow API /api/session', 40, 250)
+  if (ok) {
+    console.log('[dev] Workflow API ready on http://127.0.0.1:8790 (Vite proxy /workflow-api)')
+  } else {
+    console.error(
+      '[dev] Workflow API did not become healthy — mandates will retry. ' +
+        'Run: python scripts/workflow_api.py --port 8790',
+    )
+  }
 }
 
 function shutdown(signal) {

@@ -54,6 +54,14 @@ export default defineConfig({
         timeout: 30_000,
         proxyTimeout: 30_000,
       },
+      // Same-origin workflow path — avoids browser CORS while :8790 boots.
+      '/workflow-api': {
+        target: 'http://127.0.0.1:8790',
+        changeOrigin: true,
+        rewrite: (p: string) => p.replace(/^\/workflow-api/, ''),
+        timeout: 30_000,
+        proxyTimeout: 30_000,
+      },
     },
     watch: {
       // Function form catches Finder duplicates like "node_modules 2" (space in name).

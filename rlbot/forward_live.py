@@ -17,19 +17,24 @@ import numpy as np
 import pandas as pd
 
 from rlbot.forward_mark import (
+    _series_stats,
     build_forward_mark_payload,
     load_forward_mark,
     resolve_active_forward_run_id,
+    set_active_forward_run,
     write_forward_mark,
 )
 from rlbot.rl_config import get_config, load_config, set_config
 from rlbot.run_artifacts import PROJECT_ROOT
 
 LIVE_STAMP_NAME = "forward_live_stamp.json"
-# Companion RL deploy shown alongside PROD_RETURN_ALPHA on /ops/forward.
+# Companion RL deploy shown alongside GENERAL_EQUITY1 on /ops/forward.
 RL_LIVE_RUN_ID = "LIVE_MODEL"
-# Locked 1360pctAlgo paper book (TQQQ weekly + GLD/TLT dual).
-ALGO_LIVE_RUN_ID = "PROD_RETURN_ALPHA"
+# Locked GeneralEquity1 pack paper book (TQQQ+QQQ hybrid weekly + GLD/TLT dual).
+ALGO_LIVE_RUN_ID = "GENERAL_EQUITY1"
+# Soft companion CrestDay series (pack NAV; never blocks equity forward).
+CRYPTO_LIVE_RUN_ID = "CREST_DAY"
+CRYPTO_SOFT_TIMEOUT_S = 45.0  # pack run can be slow cold; cache hits are fast
 # Candle grid is 5m; refresh Yahoo about once per new bar.
 DEFAULT_MIN_REFRESH_SECONDS = 300
 BAR_INTERVAL = "5m"
@@ -54,6 +59,8 @@ def _resolve_book_start(
 
     Persists across refreshes so 1W/1M toggles keep prior days. Only resets to
     today's US session when ``reset_book`` is set or no prior start exists.
+    On weekends/holidays a reset seeds a flat $initial_cash baseline (no
+    replay of the prior session) until the next cash open.
     """
     if reset_book:
         return _session_date_today()
@@ -68,6 +75,151 @@ def _resolve_book_start(
                 except (TypeError, ValueError):
                     continue
     return _session_date_today()
+
+
+def seed_flat_forward_baseline(
+    run_id: str,
+    *,
+    initial_cash: float | None = None,
+    root: Path | None = None,
+    include_live_model: bool = True,
+) -> dict[str, Any]:
+    """Write a single-point flat mark at ``initial_cash`` (all series).
+
+    Used when ``reset_book`` lands on a session with no 5m prints yet (weekend /
+    holiday / pre-open) so the UI shows a true $100k baseline instead of
+    replaying the prior trading day.
+    """
+    from rlbot.rl_config import get_config, load_config, set_config
+
+    rid = str(run_id).strip()
+    exec_root = (root or PROJECT_ROOT) / "execution"
+    set_config(load_config(PROJECT_ROOT / "config" / "config.yaml"))
+    cfg = get_config()
+    cash = float(
+        initial_cash
+        if initial_cash is not None
+        else cfg.environment.initial_cash
+    )
+    book_start = _session_date_today()
+    # One synthetic bar at session open (US/Eastern); chart reads as flat @ cash.
+    ts = pd.Timestamp(f"{book_start} 09:30:00")
+    flat = np.asarray([cash], dtype=np.float64)
+    flat_ohlc = np.asarray([[cash, cash, cash, cash]], dtype=np.float64)
+    candles = {
+        "model": _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc),
+        "equal_weight": _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc),
+        "spy": _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc),
+        "crypto": _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc),
+    }
+    nav_live = flat.copy() if include_live_model else None
+    if include_live_model:
+        candles["live_model"] = _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc)
+
+    latest_w = _latest_shadow_weights(rid) or {"Cash": 1.0}
+    if not isinstance(latest_w, dict) or not latest_w:
+        latest_w = {"Cash": 1.0}
+    labels = ["Cash"] + [
+        str(k)
+        for k, v in latest_w.items()
+        if str(k).upper() != "CASH" and float(v) > 0
+    ]
+    if len(labels) == 1:
+        labels = ["Cash"]
+    live_vec = _weight_vector(latest_w, labels)
+    w_mat = np.asarray([live_vec], dtype=np.float64)
+
+    payload = build_forward_mark_payload(
+        run_id=rid,
+        checkpoint_label="locked",
+        dates=[ts.date()],
+        nav_model=flat,
+        nav_spy=flat,
+        nav_ew=flat,
+        weights=w_mat,
+        asset_labels=labels,
+        initial_cash=cash,
+        holdout_start=book_start,
+        holdout_end=None,
+        note=(
+            f"Flat baseline reset at {cash:,.0f} on {book_start} "
+            f"(no session bars yet). Live 5m MTM resumes at the next cash open. "
+            f"GENERAL_EQUITY1 + CrestDay + LIVE_MODEL companion."
+        ),
+        bar_interval=BAR_INTERVAL,
+        timestamps=[ts.isoformat(timespec="minutes")],
+        candles=candles,
+        bars_per_year=float(BARS_PER_TRADING_DAY * 252),
+        nav_live_model=nav_live,
+        nav_crypto=flat,
+    )
+    payload["book_start"] = book_start
+    payload["latest_weights"] = {
+        labels[i]: float(live_vec[i]) for i in range(len(labels))
+    }
+    payload["positions"] = _positions_snapshot(
+        latest_w,
+        nav=cash,
+        labels=labels,
+        last_closes=None,
+        tickers=[str(x) for x in labels[1:]],
+    )
+    payload["companion_run_id"] = RL_LIVE_RUN_ID if include_live_model else None
+    payload["companion_crypto_run_id"] = CRYPTO_LIVE_RUN_ID
+    payload["live"] = {
+        "prices_refreshed": False,
+        "as_of_bar": ts.isoformat(timespec="minutes"),
+        "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "min_refresh_seconds": int(DEFAULT_MIN_REFRESH_SECONDS),
+        "bar_interval": BAR_INTERVAL,
+        "source": "flat_baseline",
+        "book_start": book_start,
+        "session_start": book_start,
+        "reset_book": True,
+    }
+    # Wipe intraday caches so soft polls cannot rebuild Friday's path.
+    for path in (
+        exec_root / f"forward_prices_5m_{rid}.npz",
+        exec_root / f"forward_prices_5m_{RL_LIVE_RUN_ID}.npz",
+        exec_root / LIVE_STAMP_NAME,
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    write_forward_mark(payload)
+    if include_live_model:
+        live_payload = dict(payload)
+        live_payload["run_id"] = RL_LIVE_RUN_ID
+        live_payload["checkpoint_label"] = "best"
+        live_payload["companion_run_id"] = None
+        live_payload.pop("companion_crypto_run_id", None)
+        write_forward_mark(live_payload)
+    # CrestDay companion tip at the same flat cash baseline (soft MTM overlays later).
+    crest_payload = dict(payload)
+    crest_payload["run_id"] = CRYPTO_LIVE_RUN_ID
+    crest_payload["checkpoint_label"] = "locked"
+    crest_payload["companion_run_id"] = None
+    crest_payload["companion_crypto_run_id"] = CRYPTO_LIVE_RUN_ID
+    crest_payload["note"] = (
+        f"CrestDay flat baseline reset at {cash:,.0f} on {book_start}."
+    )
+    write_forward_mark(crest_payload)
+    _write_stamp(
+        {
+            "run_id": rid,
+            "bar_interval": BAR_INTERVAL,
+            "book_start": book_start,
+            "holdout_start": book_start,
+            "n_bars": 1,
+            "last_bar": ts.isoformat(timespec="minutes"),
+            "prices_fetched_at_unix": time.time(),
+            "flat_baseline": True,
+        },
+        root,
+    )
+    set_active_forward_run(rid)
+    return payload
 
 
 def _merge_price_history(
@@ -150,7 +302,7 @@ def _nav_series_from_ohlc(ohlc: np.ndarray, *, initial_cash: float) -> np.ndarra
         return np.asarray([], dtype=np.float64)
     nav = arr[:, 3].copy()
     # First plotted point = book cash (candle open), not the first bar's close —
-    # otherwise a hot open makes 1360pctAlgo/SPY appear to start ≠ 100k.
+    # otherwise a hot open makes GeneralEquity/SPY appear to start ≠ 100k.
     nav[0] = float(arr[0, 0]) if np.isfinite(arr[0, 0]) else float(initial_cash)
     return nav
 
@@ -200,6 +352,78 @@ def _weight_vector(
     return out / s
 
 
+def _soft_crypto_nav_on_grid(
+    times: pd.DatetimeIndex,
+    *,
+    initial_cash: float,
+) -> np.ndarray | None:
+    """CrestDay pack NAV aligned onto the equity session grid (soft-fail).
+
+    Uses the locked CrestDay honesty-stack equity curve. Never blocks equity
+    forward on failure — returns None and leaves ``nav.crypto`` unset.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _sim() -> dict[str, Any] | None:
+        try:
+            from rlbot.pack_crestday import simulate_nav_series
+
+            # Match equity book start when possible so the chart window aligns.
+            since = None
+            if len(times):
+                since = pd.Timestamp(times[0]).date()
+            return simulate_nav_series(
+                force_refresh=False,
+                initial_cash=float(initial_cash),
+                since=since,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            sim = pool.submit(_sim).result(timeout=CRYPTO_SOFT_TIMEOUT_S)
+    except Exception:  # noqa: BLE001
+        sim = None
+
+    if not isinstance(sim, dict):
+        # Disk fallback: dedicated CrestDay mark (after paper_crest_day run).
+        mark = load_forward_mark(CRYPTO_LIVE_RUN_ID)
+        if isinstance(mark, dict):
+            nav = (mark.get("nav") or {}).get("model")
+            stamps = mark.get("timestamps") or mark.get("dates") or []
+            if isinstance(nav, list) and len(nav) >= 2 and stamps:
+                try:
+                    s = pd.Series(
+                        np.asarray(nav, dtype=np.float64),
+                        index=pd.DatetimeIndex([pd.Timestamp(x) for x in stamps]).tz_localize(None),
+                    )
+                    aligned = s.reindex(
+                        pd.DatetimeIndex(times).tz_localize(None), method="ffill"
+                    )
+                    arr = aligned.to_numpy(dtype=np.float64)
+                    if np.isfinite(arr[0]) and arr[0] > 0:
+                        return arr / float(arr[0]) * float(initial_cash)
+                except Exception:  # noqa: BLE001
+                    pass
+        return None
+
+    try:
+        s = pd.Series(
+            np.asarray(sim["nav"], dtype=np.float64),
+            index=pd.DatetimeIndex(sim["times"]).tz_localize(None),
+        )
+        aligned = s.reindex(pd.DatetimeIndex(times).tz_localize(None), method="ffill")
+        # Crypto trades 24/7 — before the first pack print, hold cash.
+        aligned = aligned.fillna(float(initial_cash))
+        arr = aligned.to_numpy(dtype=np.float64)
+        if arr.size < 2 or not np.isfinite(arr[0]) or arr[0] <= 0:
+            return None
+        return arr / float(arr[0]) * float(initial_cash)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
     path = PROJECT_ROOT / "execution" / f"shadow_ledger_{run_id}.jsonl"
     if not path.is_file():
@@ -227,7 +451,12 @@ def _is_external_weight_book(
 ) -> bool:
     """True when the live book is not the RL research sleeve (algo ETF / stock picks)."""
     rid = str(run_id).upper()
-    if rid in {ALGO_LIVE_RUN_ID, "FINALMODEL"}:  # FINALMODEL kept for old marks
+    if rid in {
+        ALGO_LIVE_RUN_ID,
+        "GENERAL_EQUITY",
+        "PROD_RETURN_ALPHA",
+        "FINALMODEL",
+    }:
         return True
     if not weights:
         return False
@@ -243,7 +472,7 @@ def _is_external_weight_book(
 
 def _stock_symbols_from_weights(weights: dict[str, float]) -> dict[str, str]:
     """Map display label → Yahoo symbol for external books (BRK.B → BRK-B)."""
-    from rlbot.prod_return_alpha import to_yahoo_symbol
+    from rlbot.pack_general_equity1 import to_yahoo_symbol
 
     out: dict[str, str] = {}
     for k, v in weights.items():
@@ -670,13 +899,18 @@ def refresh_forward_mark_live(
         for path in (
             price_cache,
             exec_root / f"forward_mark_{rid}.json",
+            exec_root / f"forward_prices_5m_{RL_LIVE_RUN_ID}.npz",
         ):
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
         existing = None
-        stamp = {k: v for k, v in stamp.items() if k not in ("holdout_start", "book_start", "n_bars", "last_bar")}
+        stamp = {k: v for k, v in stamp.items() if k not in ("holdout_start", "book_start", "n_bars", "last_bar", "flat_baseline")}
+        # Weekend / holiday: seed flat $100k immediately (no prior-day replay).
+        today = pd.Timestamp.now(tz="America/New_York")
+        if int(today.dayofweek) >= 5:
+            return seed_flat_forward_baseline(rid, root=root, include_live_model=True)
     if (
         need_fetch
         and not force_price_refresh
@@ -685,6 +919,14 @@ def refresh_forward_mark_live(
         and (now - last_attempt) < 60.0
     ):
         need_fetch = False
+    # Keep a flat baseline intact across soft polls until a real session prints.
+    if (
+        not reset_book
+        and not force_price_refresh
+        and isinstance(existing, dict)
+        and (existing.get("live") or {}).get("source") == "flat_baseline"
+    ):
+        return existing
 
     # Always use the repo config — never touch Runs/<id>/config.yaml (iCloud hang).
     cfg_path = PROJECT_ROOT / "config" / "config.yaml"
@@ -850,6 +1092,7 @@ def refresh_forward_mark_live(
         from rlbot.forward_mark import call_with_timeout
 
         cached_pack = _load_price_cache()
+        fetch_ok = False
         try:
             # Stock book + RL sleeve can be ~40 symbols; allow a longer pull.
             fetch_timeout = 45.0 if (force_price_refresh or stock_book or reset_book) else 15.0
@@ -859,13 +1102,27 @@ def refresh_forward_mark_live(
                 symbols,
                 since=since,
             )
-        except Exception:
-            # Fall through to cache / empty handling below.
-            if price_cache.is_file() and not reset_book:
+            fetch_ok = True
+        except Exception as exc:
+            # Weekend / pre-open / holiday: do NOT replay the prior session.
+            # Seed a flat $initial_cash baseline until the next cash open.
+            if reset_book:
+                return seed_flat_forward_baseline(
+                    rid,
+                    initial_cash=initial_cash,
+                    root=root,
+                    include_live_model=True,
+                )
+            if price_cache.is_file():
+                # Fall through to cache / empty handling below.
                 need_fetch = False
+            elif existing is not None and (existing.get("live") or {}).get("source") == "flat_baseline":
+                return existing
             else:
-                raise
-        else:
+                raise RuntimeError(
+                    f"no {BAR_INTERVAL} bars on/after {book_start}: {exc}"
+                ) from exc
+        if fetch_ok:
             (
                 c_times,
                 c_o,
@@ -1120,7 +1377,7 @@ def refresh_forward_mark_live(
         candles_payload["live_model"] = _candles_to_payload(times, live_model_ohlc)
 
     note = (
-        f"PROD_RETURN_ALPHA (1360pctAlgo) + LIVE_MODEL RL sleeve since {book_start}. "
+        f"GENERAL_EQUITY1 (GeneralEquity1) + LIVE_MODEL RL sleeve since {book_start}. "
         "Equal-weight is the original 10-asset research universe (not algo ETF weights). "
         if stock_book
         else f"Live 5-minute NAV candles on the SPY session clock since {book_start} "
@@ -1177,5 +1434,36 @@ def refresh_forward_mark_live(
     payload["latest_weights"] = {
         labels[i]: float(live_vec[i]) for i in range(len(labels))
     }
+    # Soft companion: CrestDay pack mark (never fails the equity book).
+    try:
+        crypto_nav = _soft_crypto_nav_on_grid(times, initial_cash=initial_cash)
+        if crypto_nav is not None and crypto_nav.size >= len(times):
+            crypto_arr = np.asarray(crypto_nav[: len(times)], dtype=np.float64)
+            # Guarantee chart start at initial_cash (pack history can drift).
+            if np.isfinite(crypto_arr[0]) and crypto_arr[0] > 0:
+                crypto_arr = crypto_arr / float(crypto_arr[0]) * float(initial_cash)
+            crypto_s = crypto_arr.tolist()
+            payload["nav"]["crypto"] = crypto_s
+            date_strs = [pd.Timestamp(t).isoformat(timespec="minutes") for t in times]
+            payload["stats"]["crypto"] = _series_stats(
+                crypto_s,
+                bars_per_year=BARS_PER_TRADING_DAY * 252,
+                timestamps=date_strs,
+            )
+            payload["companion_crypto_run_id"] = CRYPTO_LIVE_RUN_ID
+            crypto_ohlc = np.column_stack([crypto_arr, crypto_arr, crypto_arr, crypto_arr])
+            candles = payload.get("candles")
+            if isinstance(candles, dict):
+                candles["crypto"] = _candles_to_payload(times, crypto_ohlc)
+    except Exception:  # noqa: BLE001
+        pass
+    # Disk fallback so static publish / soft polls always show CrestDay.
+    if "crypto" not in (payload.get("nav") or {}):
+        try:
+            from rlbot.forward_mark import merge_crypto_companion
+
+            payload = merge_crypto_companion(payload)
+        except Exception:  # noqa: BLE001
+            pass
     write_forward_mark(payload)
     return payload

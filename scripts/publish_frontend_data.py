@@ -196,6 +196,13 @@ def _load_forward() -> dict[str, Any]:
             "mark": None,
             "message": f"Run {rid} has no execution/forward_mark_{rid}.json",
         }
+    # Ensure CrestDay companion series is present when its mark exists.
+    try:
+        from rlbot.forward_mark import merge_crypto_companion
+
+        mark = merge_crypto_companion(mark)
+    except Exception:  # noqa: BLE001
+        pass
     weights = mark.get("weights")
     if isinstance(weights, list) and len(weights) > 400:
         mark = {**mark, "weights": weights[:: max(1, len(weights) // 200)]}
@@ -516,6 +523,59 @@ def publish(
     return meta
 
 
+def _rebuild_oos_cache(*, budget_s: float = 120.0) -> int:
+    """Re-parse Runs/*/backtest_summary*.json into execution/api_oos_cache.json.
+
+    Uses the lite API parser (reads ``detailed`` EW/SPY sleeves) so older
+    ``--detailed`` summaries populate the OOS UI without re-backtesting.
+    """
+    # Import lazily — keep publish boot light when not rebuilding.
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import frontend_api_lite as lite  # type: ignore
+
+    t0 = time.time()
+    ids = lite._list_run_ids()
+    by_id: dict[str, dict[str, Any]] = {}
+    existing = _read_json(OOS_CACHE)
+    if isinstance(existing, dict):
+        for row in existing.get("rows") or []:
+            if isinstance(row, dict) and row.get("run_id"):
+                by_id[str(row["run_id"])] = row
+    upgraded = 0
+    for rid in ids:
+        if time.time() - t0 > budget_s:
+            break
+        bt = lite._pick_backtest(rid, timeout_s=3.5)
+        if bt is None:
+            continue
+        oos = lite._oos_row_from_backtest(rid, bt)
+        if oos is None:
+            continue
+        prev = by_id.get(rid)
+        by_id[rid] = oos
+        if not prev or prev.get("has_benchmarks") != oos.get("has_benchmarks") or (
+            prev.get("ew_sh") is None and oos.get("ew_sh") is not None
+        ) or (prev.get("spy_sh") is None and oos.get("spy_sh") is not None):
+            upgraded += 1
+    rows = list(by_id.values())
+    _atomic_write_json(
+        OOS_CACHE,
+        {
+            "generated_at_utc": _now(),
+            "n": len(rows),
+            "rows": rows,
+            "note": "rebuild-oos from backtest_summary (detailed EW/SPY sleeves)",
+        },
+    )
+    print(
+        f"[publish-frontend-data] rebuild-oos: {len(rows)} rows, "
+        f"{upgraded} upgraded/added, {sum(1 for r in rows if r.get('has_benchmarks'))} with benchmarks "
+        f"({round((time.time() - t0) * 1000, 1)}ms)",
+        flush=True,
+    )
+    return upgraded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -546,7 +606,20 @@ def main() -> int:
         default=80,
         help="Max run ids to enrich from disk (rest get cache-only stubs)",
     )
+    parser.add_argument(
+        "--rebuild-oos",
+        action="store_true",
+        help="Re-parse backtest summaries into api_oos_cache.json (EW/SPY sleeves)",
+    )
+    parser.add_argument(
+        "--rebuild-oos-budget-s",
+        type=float,
+        default=180.0,
+        help="Wall-clock budget for --rebuild-oos (default 180)",
+    )
     args = parser.parse_args()
+    if args.rebuild_oos:
+        _rebuild_oos_cache(budget_s=float(args.rebuild_oos_budget_s))
     meta = publish(
         with_details=not bool(args.no_details),
         enrich_details=bool(args.enrich_details),

@@ -232,20 +232,24 @@ export type ApiForwardMark = {
     model: number[]
     spy: number[]
     equal_weight: number[]
-    /** Optional companion RL deploy (LIVE_MODEL) alongside PROD_RETURN_ALPHA. */
+    /** Optional companion RL deploy (LIVE_MODEL) alongside GeneralEquity1. */
     live_model?: number[]
+    /** Optional CrestDay pack mark (soft; may be absent). */
+    crypto?: number[]
   }
   candles?: {
     model: ApiForwardCandle[]
     spy: ApiForwardCandle[]
     equal_weight: ApiForwardCandle[]
     live_model?: ApiForwardCandle[]
+    crypto?: ApiForwardCandle[]
   } | null
   stats: {
     model: ApiForwardStats
     spy: ApiForwardStats
     equal_weight: ApiForwardStats
     live_model?: ApiForwardStats
+    crypto?: ApiForwardStats
   }
   latest_weights: Record<string, number> | null
   weights: Record<string, number>[] | null

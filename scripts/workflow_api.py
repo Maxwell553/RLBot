@@ -52,6 +52,22 @@ _store = WorkflowStore(
     os.environ.get("MARKETTRAINER_WORKFLOW_DB", str(PROJECT_ROOT / ".cache" / "workflow.sqlite3"))
 )
 
+# CORS at import time so ``uvicorn scripts.workflow_api:app`` gets the same
+# allowlist as ``python scripts/workflow_api.py`` (main() used to attach it late).
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_DEFAULT_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["authorization", "content-type", "idempotency-key", "Idempotency-Key"],
+    expose_headers=["*"],
+)
+
 
 _DEFAULT_LOCAL_TOKENS = {
     "investor-local": {"user_id": "investor_1", "org_id": "org_1", "role": "investor"},
@@ -416,22 +432,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
-    parser.add_argument("--cors-origin", action="append", default=None)
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=None,
+        help="Extra CORS origin (module-level defaults already cover Vite :5173/:5174).",
+    )
     args = parser.parse_args()
 
-    origins = args.cors_origin or [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["authorization", "content-type", "idempotency-key", "Idempotency-Key"],
-        expose_headers=["*"],
-    )
+    if args.cors_origin:
+        # Starlette stacks middleware; additional origins for non-default hosts.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(args.cors_origin),
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["authorization", "content-type", "idempotency-key", "Idempotency-Key"],
+            expose_headers=["*"],
+        )
 
     import uvicorn
 

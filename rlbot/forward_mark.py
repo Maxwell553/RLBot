@@ -145,6 +145,7 @@ def build_forward_mark_payload(
     candles: dict[str, Any] | None = None,
     bars_per_year: float = 252.0,
     nav_live_model: np.ndarray | None = None,
+    nav_crypto: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Assemble a browser-friendly forward-mark payload (NAVs start at ``initial_cash``)."""
     model = np.asarray(nav_model, dtype=np.float64).reshape(-1)
@@ -155,9 +156,16 @@ def build_forward_mark_payload(
         if nav_live_model is not None
         else None
     )
+    crypto = (
+        np.asarray(nav_crypto, dtype=np.float64).reshape(-1)
+        if nav_crypto is not None
+        else None
+    )
     n = int(min(model.size, spy.size, ew.size, len(dates)))
     if live is not None:
         n = int(min(n, live.size))
+    if crypto is not None:
+        n = int(min(n, crypto.size))
     if n < 1:
         raise ValueError("forward mark requires at least one NAV point")
 
@@ -167,6 +175,7 @@ def build_forward_mark_payload(
         spy_s = spy[:n].tolist()
         ew_s = ew[:n].tolist()
         live_s = live[:n].tolist() if live is not None else None
+        crypto_s = crypto[:n].tolist() if crypto is not None else None
     else:
         scale = float(initial_cash) / max(float(model[0]), 1e-12)
         model_s = (model[:n] * scale).tolist()
@@ -176,6 +185,11 @@ def build_forward_mark_payload(
         live_s = (
             (live[:n] / max(float(live[0]), 1e-12) * float(initial_cash)).tolist()
             if live is not None and live.size
+            else None
+        )
+        crypto_s = (
+            (crypto[:n] / max(float(crypto[0]), 1e-12) * float(initial_cash)).tolist()
+            if crypto is not None and crypto.size
             else None
         )
     if timestamps is not None and len(timestamps) >= n:
@@ -247,6 +261,11 @@ def build_forward_mark_payload(
         payload["stats"]["live_model"] = _series_stats(
             live_s, bars_per_year=bars_per_year, timestamps=date_strs
         )
+    if crypto_s is not None:
+        payload["nav"]["crypto"] = crypto_s
+        payload["stats"]["crypto"] = _series_stats(
+            crypto_s, bars_per_year=bars_per_year, timestamps=date_strs
+        )
     if bar_interval:
         payload["bar_interval"] = bar_interval
     if timestamps is not None:
@@ -254,6 +273,59 @@ def build_forward_mark_payload(
     if candles is not None:
         payload["candles"] = candles
     return payload
+
+
+CRYPTO_COMPANION_RUN_ID = "CREST_DAY"
+
+
+def merge_crypto_companion(mark: dict[str, Any]) -> dict[str, Any]:
+    """Attach ``nav.crypto`` from CREST_DAY when missing (disk-only).
+
+    Soft pack MTM still happens in ``forward_live.refresh_forward_mark_live``.
+    This path keeps the static ``/data/forward.json`` chart complete after publish.
+    """
+    if not isinstance(mark, dict):
+        return mark
+    nav = mark.get("nav") if isinstance(mark.get("nav"), dict) else {}
+    existing = nav.get("crypto")
+    n = int(mark.get("n_bars") or len(mark.get("dates") or []) or 0)
+    if isinstance(existing, list) and len(existing) >= max(2, min(n, 2)):
+        return mark
+    crypto_mark = load_forward_mark(CRYPTO_COMPANION_RUN_ID)
+    if not isinstance(crypto_mark, dict):
+        return mark
+    crypto_nav = (crypto_mark.get("nav") or {}).get("model")
+    if not isinstance(crypto_nav, list) or len(crypto_nav) < 1:
+        return mark
+    initial = float(mark.get("initial_cash") or crypto_mark.get("initial_cash") or 100_000.0)
+    src = np.asarray(crypto_nav, dtype=np.float64)
+    if src.size < 1 or not np.isfinite(src[0]) or src[0] <= 0:
+        return mark
+    # Rebase to the equity book's starting cash, then align length to the chart grid.
+    rebased = src / float(src[0]) * initial
+    if n < 1:
+        n = int(rebased.size)
+    out = np.empty(n, dtype=np.float64)
+    if rebased.size >= n:
+        out[:] = rebased[-n:]
+    else:
+        out[: rebased.size] = rebased
+        out[rebased.size :] = rebased[-1]
+    dates = mark.get("dates") or mark.get("timestamps") or []
+    date_strs = [str(d) for d in list(dates)[:n]] if dates else None
+    bars_per_year = 78.0 * 252.0 if mark.get("bar_interval") in ("5m", "30m") else 252.0
+    crypto_s = out.tolist()
+    next_nav = {**nav, "crypto": crypto_s}
+    next_stats = dict(mark.get("stats") or {})
+    next_stats["crypto"] = _series_stats(
+        crypto_s, bars_per_year=bars_per_year, timestamps=date_strs
+    )
+    return {
+        **mark,
+        "nav": next_nav,
+        "stats": next_stats,
+        "companion_crypto_run_id": CRYPTO_COMPANION_RUN_ID,
+    }
 
 
 def write_forward_mark(payload: dict[str, Any], path: Path | None = None) -> Path:
@@ -307,8 +379,14 @@ def resolve_active_forward_run_id(root: Path | None = None) -> str | None:
     candidates: list[tuple[float, str]] = []
     for path in exec_dir.glob("forward_mark_*.json"):
         name = path.name.removeprefix("forward_mark_").removesuffix(".json")
-        # LIVE_* RL deploy marks, or locked algo paper book (1360pctAlgo).
-        if name.startswith("LIVE_") or name in {"PROD_RETURN_ALPHA", "FINALMODEL"}:
+        # LIVE_* RL deploy marks, GeneralEquity1 / CrestDay, or legacy algo ids.
+        if name.startswith("LIVE_") or name in {
+            "GENERAL_EQUITY1",
+            "GENERAL_EQUITY",
+            "CREST_DAY",
+            "PROD_RETURN_ALPHA",
+            "FINALMODEL",
+        }:
             try:
                 candidates.append((path.stat().st_mtime, name))
             except OSError:

@@ -87,7 +87,10 @@ export const OFFLINE_MODE = DATA_SOURCE === 'offline'
 export const STATIC_DATA_MODE = DATA_SOURCE === 'static'
 const API_URL = DATA_SOURCE === 'api' ? String(rawApiUrl ?? '').replace(/\/$/, '') : undefined
 const API_TOKEN = import.meta.env.VITE_API_TOKEN as string | undefined
-const WORKFLOW_API_URL = (import.meta.env.VITE_WORKFLOW_API_URL as string | undefined)?.replace(/\/$/, '')
+/** Same-origin `/workflow-api` (Vite proxy) by default — avoids CORS boot races. */
+const WORKFLOW_API_URL = (
+  (import.meta.env.VITE_WORKFLOW_API_URL as string | undefined) ?? '/workflow-api'
+).replace(/\/$/, '')
 const INVESTOR_WORKFLOW_TOKEN = import.meta.env.VITE_INVESTOR_WORKFLOW_TOKEN as string | undefined
 const OPS_WORKFLOW_TOKEN = import.meta.env.VITE_OPS_WORKFLOW_TOKEN as string | undefined
 const coordinator = new RequestCoordinator(12_000, 8_000)
@@ -168,8 +171,8 @@ async function toState<T>(
           message:
             `${message} Workflow API on :8790 is down or restarting. ` +
             `From the repo root: python scripts/workflow_api.py --port 8790 ` +
-            `(or restart with bash scripts/start_ui.sh). Confirm VITE_WORKFLOW_API_URL and ` +
-            `VITE_OPS_WORKFLOW_TOKEN in frontend/.env.local.`,
+            `(or restart with bash scripts/start_ui.sh). Dev uses Vite proxy ` +
+            `VITE_WORKFLOW_API_URL=/workflow-api — confirm tokens in frontend/.env.local.`,
         }
       }
       return {
@@ -209,8 +212,6 @@ export type RunQuery = {
 export function fetchRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<DataState<ApiRunsPage>> {
   return toState(async () => {
     if (STATIC_DATA_MODE) {
-      // Drop memoized snapshot so auto-refresh / Retry sees republished OOS.
-      clearStaticDataCache('runs.json')
       const data = await loadStaticRuns(query, signal)
       assertShape(Array.isArray(data.runs), 'runs is not an array')
       assertShape(typeof data.total === 'number' && typeof data.counts?.all === 'number', 'runs pagination missing')
@@ -232,8 +233,6 @@ export function fetchRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<D
 export function fetchDashboard(signal?: AbortSignal): Promise<DataState<ApiDashboard>> {
   return toState(async () => {
     if (STATIC_DATA_MODE) {
-      clearStaticDataCache('dashboard.json')
-      clearStaticDataCache('summary.json')
       const data = await loadStaticDashboard(signal)
       assertShape(typeof data.summary?.total_runs === 'number', 'dashboard.summary missing')
       assertShape(Array.isArray(data.recent_runs), 'dashboard.recent_runs is not an array')
@@ -310,6 +309,7 @@ export function fetchForward(
           FORCE_FORWARD_TIMEOUT_MS,
         )
         assertShape(typeof data.available === 'boolean', 'forward.available missing')
+        clearStaticDataCache('forward.json')
         return data
       } catch {
         const data = await loadStaticForward(signal)
@@ -371,12 +371,15 @@ export function fetchMandates(
 ): Promise<DataState<WorkflowMandate[]>> {
   const offline = !WORKFLOW_API_URL || (audience === 'operator' ? !OPS_WORKFLOW_TOKEN : !INVESTOR_WORKFLOW_TOKEN)
   return toState(async () => {
-    // Avoid serving a failed/empty in-flight cache while the API was still booting.
-    workflowCoordinator.clear()
     const data = await workflowRequest<{ mandates: WorkflowMandate[] }>('/api/mandates', { signal }, audience)
     assertShape(Array.isArray(data.mandates), 'mandates missing')
     return data.mandates.map(normalizeMandate)
   }, offline, 'workflow')
+}
+
+/** Clear coalesced workflow GETs after mutations or a confirmed boot failure. */
+export function invalidateWorkflowCache(): void {
+  workflowCoordinator.clear()
 }
 
 export async function fetchMandateDetail(
@@ -388,7 +391,7 @@ export async function fetchMandateDetail(
 }
 
 export async function submitMandate(submission: MandateSubmission): Promise<WorkflowMandate> {
-  return workflowRequest<WorkflowMandate>('/api/mandates', {
+  const mandate = await workflowRequest<WorkflowMandate>('/api/mandates', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -396,6 +399,8 @@ export async function submitMandate(submission: MandateSubmission): Promise<Work
     },
     body: JSON.stringify(submission),
   })
+  invalidateWorkflowCache()
+  return mandate
 }
 
 export async function performMandateAction(
@@ -404,11 +409,13 @@ export async function performMandateAction(
   detail: Record<string, unknown> = {},
   audience: 'investor' | 'operator' = 'operator',
 ): Promise<WorkflowMandate> {
-  return workflowRequest<WorkflowMandate>(`/api/mandates/${encodeURIComponent(id)}/actions`, {
+  const mandate = await workflowRequest<WorkflowMandate>(`/api/mandates/${encodeURIComponent(id)}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, detail }),
   }, audience)
+  invalidateWorkflowCache()
+  return mandate
 }
 
 export async function cancelMandate(id: string): Promise<WorkflowMandate> {

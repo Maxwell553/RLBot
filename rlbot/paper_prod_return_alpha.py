@@ -1,7 +1,8 @@
-"""Paper / forward loop for prod_return_alpha_v1 (1360pctAlgo).
+"""Paper / forward loop for GeneralEquity1 (prod_return_alpha_v3 pack).
 
-Weekly TQQQ close-to-close + month-end dual momentum → shadow ledger +
-forward mark for ``/ops/forward``. State under ``execution/paper_prod_return_alpha/``.
+Targets come from the locked ``GeneralEquity1/`` pack (read-only). Yahoo daily
+bars are used only for MTM / 5m live refresh. State under
+``execution/paper_general_equity1/``.
 """
 
 from __future__ import annotations
@@ -18,14 +19,16 @@ import pandas as pd
 from rlbot.forward_mark import (
     build_forward_mark_payload,
     set_active_forward_run,
-    write_forward_mark,
 )
-from rlbot.prod_return_alpha import (
+from rlbot.pack_general_equity1 import (
+    DEFAULT_INITIAL_CASH,
     PAPER_RUN_ID,
     STRATEGY_ID,
-    ProdParams,
-    P,
-    compute_target_weights,
+    latest_portfolio_weights,
+    locked_params,
+    paper_plan as pack_paper_plan,
+)
+from rlbot.prod_return_alpha import (
     fetch_daily_ohlc,
     month_end_mask,
     week_end_mask,
@@ -34,12 +37,9 @@ from rlbot.prod_return_alpha import (
 from rlbot.run_artifacts import PROJECT_ROOT
 
 EXECUTION_DIR = PROJECT_ROOT / "execution"
-PAPER_DIR = EXECUTION_DIR / "paper_prod_return_alpha"
+PAPER_DIR = EXECUTION_DIR / "paper_general_equity1"
 STATE_PATH = PAPER_DIR / "state.json"
 ORDERS_PATH = PAPER_DIR / "order_intents.jsonl"
-DEFAULT_INITIAL_CASH = 100_000.0
-
-
 def ledger_path(run_id: str = PAPER_RUN_ID) -> Path:
     return EXECUTION_DIR / f"shadow_ledger_{run_id}.jsonl"
 
@@ -214,8 +214,9 @@ def _append_shadow_ledger(
     _append_jsonl(ledger_path(run_id), rec)
 
 
-def _update_cool_state(state: dict[str, Any], equity: float, p: ProdParams = P) -> bool:
+def _update_cool_state(state: dict[str, Any], equity: float, p: Any | None = None) -> bool:
     """Equity cool on sleeve A: −es from peak → flat for ``cool`` sessions."""
+    p = p if p is not None else locked_params()
     peak = float(state.get("peak_equity") or equity)
     if equity > peak:
         peak = equity
@@ -305,9 +306,9 @@ def build_daily_forward_mark(
         holdout_start=str(as_of),
         holdout_end=None,
         note=(
-            f"{STRATEGY_ID} (1360pctAlgo): weekly TQQQ CC + month-end "
-            f"GLD/{P.dual_b} dual mom (w_a={P.w_a}, vt={P.vt}, dual_vt={P.dual_vt}). "
-            "Live 5m MTM via /api/forward; EW-10 = research sleeve; LIVE_MODEL companion."
+            f"{STRATEGY_ID} (GeneralEquity1 pack): weekly TQQQ+QQQ hybrid + month-end "
+            "dual momentum. Live 5m MTM via /api/forward; EW-10 = research sleeve; "
+            "LIVE_MODEL companion."
         ),
     )
     eq = float(state.get("equity") or initial)
@@ -351,9 +352,10 @@ def run_paper_day(
     set_active: bool = True,
     initial_cash: float = DEFAULT_INITIAL_CASH,
     dry_run: bool = False,
-    params: ProdParams = P,
+    params: Any | None = None,
 ) -> dict[str, Any]:
     t0 = time.time()
+    params = params if params is not None else locked_params()
     state = load_state(initial_cash)
     dates, closes, _ohlc = fetch_daily_ohlc(force_refresh=force_refresh)
     day = as_of or dates[-1]
@@ -372,22 +374,51 @@ def run_paper_day(
     )
     flat = _update_cool_state(state, float(state["equity"]), params)
 
-    targets, meta = compute_target_weights(
-        as_of=day, force_refresh=False, flat_a=flat, p=params
-    )
-    # Rebalance when week-end (TQQQ) or month-end (dual) or book empty.
+    # Signals from locked GeneralEquity1 pack (bars.db) — not the Yahoo fork.
+    plan = pack_paper_plan(aum=float(state["equity"] or initial_cash))
+    targets = latest_portfolio_weights(aum=float(state["equity"] or initial_cash))
+    if flat:
+        # Cool-down: park sleeve A (risky ETFs except dual/GLD stay if already dual-only).
+        dual_keys = {str(plan.get("targets", {}).get("dual_asset") or "GLD").upper()}
+        parked: dict[str, float] = {}
+        for k, v in targets.items():
+            ku = str(k).upper()
+            if ku in dual_keys or ku == "CASH":
+                parked[ku] = float(v)
+            else:
+                parked["CASH"] = parked.get("CASH", 0.0) + float(v)
+        targets = weights_with_cash(parked)
+        actions_note = "flat_a"
+    else:
+        actions_note = "pack_signal"
+    meta = {
+        "source": "GeneralEquity1",
+        "pack_asof": plan.get("asof"),
+        "equity_rebalance_due": plan.get("equity_rebalance_due"),
+        "dual_rebalance_due": plan.get("dual_rebalance_due"),
+        "portfolio_targets": plan.get("portfolio_targets"),
+        "flat_a": flat,
+        "actions_note": actions_note,
+    }
+    # Rebalance when pack says week/month-end due or book empty.
     wk = week_end_mask(dates)
     me = month_end_mask(dates)
-    rebal = bool(wk[i] or me[i] or not (state.get("positions") or {}))
-    actions: list[str] = [f"signal:{day}"]
+    rebal = bool(
+        plan.get("equity_rebalance_due")
+        or plan.get("dual_rebalance_due")
+        or wk[i]
+        or me[i]
+        or not (state.get("positions") or {})
+    )
+    actions: list[str] = [f"signal:{day}", actions_note]
     orders: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
 
     if rebal:
         actions.append("rebalance")
-        if wk[i]:
+        if wk[i] or plan.get("equity_rebalance_due"):
             actions.append("week_end")
-        if me[i]:
+        if me[i] or plan.get("dual_rebalance_due"):
             actions.append("month_end")
         orders = orders_to_targets(
             float(state["equity"]),
@@ -418,12 +449,13 @@ def run_paper_day(
                 meta=meta,
                 orders=orders,
             )
-        state["target_weights"] = weights_with_cash(targets)
+        # Pack weights already include CASH — do not run weights_with_cash (double-counts).
+        state["target_weights"] = {str(k).upper(): float(v) for k, v in targets.items()}
         state["last_signal_date"] = str(day)
         state["last_trade_date"] = str(day)
     else:
         # Hold; still refresh displayed targets for the live mark.
-        state["target_weights"] = weights_with_cash(targets)
+        state["target_weights"] = {str(k).upper(): float(v) for k, v in targets.items()}
         state["last_signal_date"] = str(day)
         actions.append("hold")
 
@@ -439,14 +471,29 @@ def run_paper_day(
         save_state(state)
         if set_active:
             set_active_forward_run(PAPER_RUN_ID)
-        mark_payload = build_daily_forward_mark(
-            state=state,
-            closes=closes,
-            dates=dates,
-            as_of=day,
-            meta=meta,
+        # Never publish a multi-month daily NAV replay as the live forward book.
+        # Keep ledger/weights; start (or continue) today's 5m MTM at $initial_cash.
+        from rlbot.forward_live import refresh_forward_mark_live, seed_flat_forward_baseline
+        from rlbot.forward_mark import load_forward_mark
+
+        existing = load_forward_mark(PAPER_RUN_ID)
+        has_live_5m = (
+            isinstance(existing, dict) and str(existing.get("bar_interval") or "") == "5m"
         )
-        write_forward_mark(mark_payload)
+        try:
+            mark_payload = refresh_forward_mark_live(
+                PAPER_RUN_ID,
+                force_price_refresh=True,
+                reset_book=not has_live_5m,
+            )
+        except Exception:  # noqa: BLE001
+            mark_payload = None
+        if not isinstance(mark_payload, dict):
+            mark_payload = seed_flat_forward_baseline(
+                PAPER_RUN_ID,
+                initial_cash=float(initial_cash),
+                include_live_model=True,
+            )
 
     return {
         "as_of": str(day),
