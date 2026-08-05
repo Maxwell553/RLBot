@@ -34,7 +34,11 @@ RL_LIVE_RUN_ID = "LIVE_MODEL"
 ALGO_LIVE_RUN_ID = "GENERAL_EQUITY1"
 # Soft companion CrestDay series (pack NAV; never blocks equity forward).
 CRYPTO_LIVE_RUN_ID = "CREST_DAY"
-CRYPTO_SOFT_TIMEOUT_S = 45.0  # pack run can be slow cold; cache hits are fast
+# Soft companion Durable.v1 (CDE FCM long/short; never blocks equity forward).
+DURABLE_LIVE_RUN_ID = "DURABLE_V1"
+# Keep CrestDay attach short — a hung pack sim previously pinned the whole
+# Yahoo refresh past the lite-API subprocess timeout (~50s) and left prices stale.
+CRYPTO_SOFT_TIMEOUT_S = 8.0
 # Candle grid is 5m; refresh Yahoo about once per new bar.
 DEFAULT_MIN_REFRESH_SECONDS = 300
 BAR_INTERVAL = "5m"
@@ -187,7 +191,12 @@ def seed_flat_forward_baseline(
             path.unlink(missing_ok=True)
         except OSError:
             pass
-    write_forward_mark(payload)
+    payload = _finalize_forward_mark(
+        payload,
+        model_positions=payload.get("positions"),
+        model_price_source="flat",
+        write=True,
+    )
     if include_live_model:
         live_payload = dict(payload)
         live_payload["run_id"] = RL_LIVE_RUN_ID
@@ -195,7 +204,7 @@ def seed_flat_forward_baseline(
         live_payload["companion_run_id"] = None
         live_payload.pop("companion_crypto_run_id", None)
         write_forward_mark(live_payload)
-    # CrestDay companion tip at the same flat cash baseline (soft MTM overlays later).
+    # CrestDay tip mark at the same flat cash baseline.
     crest_payload = dict(payload)
     crest_payload["run_id"] = CRYPTO_LIVE_RUN_ID
     crest_payload["checkpoint_label"] = "locked"
@@ -352,27 +361,62 @@ def _weight_vector(
     return out / s
 
 
-def _soft_crypto_nav_on_grid(
+def _align_nav_list_on_grid(
+    nav: list[Any],
+    stamps: list[Any],
     times: pd.DatetimeIndex,
     *,
     initial_cash: float,
 ) -> np.ndarray | None:
-    """CrestDay pack NAV aligned onto the equity session grid (soft-fail).
+    """Forward-fill a stamped NAV list onto ``times`` and rebase to ``initial_cash``."""
+    if not isinstance(nav, list) or len(nav) < 1 or not stamps:
+        return None
+    try:
+        s = pd.Series(
+            np.asarray(nav, dtype=np.float64),
+            index=pd.DatetimeIndex([pd.Timestamp(x) for x in stamps]).tz_localize(None),
+        )
+        aligned = s.reindex(pd.DatetimeIndex(times).tz_localize(None), method="ffill")
+        arr = aligned.to_numpy(dtype=np.float64)
+        if arr.size < 1 or not np.isfinite(arr[0]) or arr[0] <= 0:
+            return None
+        return arr / float(arr[0]) * float(initial_cash)
+    except Exception:  # noqa: BLE001
+        return None
 
-    Uses the locked CrestDay honesty-stack equity curve. Never blocks equity
-    forward on failure — returns None and leaves ``nav.crypto`` unset.
+
+def _soft_pack_nav_on_grid(
+    times: pd.DatetimeIndex,
+    *,
+    initial_cash: float,
+    simulate_fn: Any,
+    disk_run_id: str,
+) -> np.ndarray | None:
+    """Align a pack NAV series onto the equity 5m grid (soft-fail).
+
+    Prefers the on-disk companion mark (ms) so equity Yahoo refreshes are not
+    blocked by a cold CrestDay simulate. Pack simulate is best-effort with a
+    short timeout and non-blocking worker shutdown.
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    mark = load_forward_mark(disk_run_id)
+    if isinstance(mark, dict):
+        disk = _align_nav_list_on_grid(
+            (mark.get("nav") or {}).get("model") or [],
+            mark.get("timestamps") or mark.get("dates") or [],
+            times,
+            initial_cash=initial_cash,
+        )
+        if disk is not None:
+            return disk
+
     def _sim() -> dict[str, Any] | None:
         try:
-            from rlbot.pack_crestday import simulate_nav_series
-
-            # Match equity book start when possible so the chart window aligns.
             since = None
             if len(times):
                 since = pd.Timestamp(times[0]).date()
-            return simulate_nav_series(
+            return simulate_fn(
                 force_refresh=False,
                 initial_cash=float(initial_cash),
                 since=since,
@@ -380,32 +424,17 @@ def _soft_crypto_nav_on_grid(
         except Exception:  # noqa: BLE001
             return None
 
+    sim: dict[str, Any] | None = None
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            sim = pool.submit(_sim).result(timeout=CRYPTO_SOFT_TIMEOUT_S)
+        sim = pool.submit(_sim).result(timeout=CRYPTO_SOFT_TIMEOUT_S)
     except Exception:  # noqa: BLE001
         sim = None
+    finally:
+        # Never wait on a hung pack worker — same pattern as call_with_timeout.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     if not isinstance(sim, dict):
-        # Disk fallback: dedicated CrestDay mark (after paper_crest_day run).
-        mark = load_forward_mark(CRYPTO_LIVE_RUN_ID)
-        if isinstance(mark, dict):
-            nav = (mark.get("nav") or {}).get("model")
-            stamps = mark.get("timestamps") or mark.get("dates") or []
-            if isinstance(nav, list) and len(nav) >= 2 and stamps:
-                try:
-                    s = pd.Series(
-                        np.asarray(nav, dtype=np.float64),
-                        index=pd.DatetimeIndex([pd.Timestamp(x) for x in stamps]).tz_localize(None),
-                    )
-                    aligned = s.reindex(
-                        pd.DatetimeIndex(times).tz_localize(None), method="ffill"
-                    )
-                    arr = aligned.to_numpy(dtype=np.float64)
-                    if np.isfinite(arr[0]) and arr[0] > 0:
-                        return arr / float(arr[0]) * float(initial_cash)
-                except Exception:  # noqa: BLE001
-                    pass
         return None
 
     try:
@@ -414,14 +443,45 @@ def _soft_crypto_nav_on_grid(
             index=pd.DatetimeIndex(sim["times"]).tz_localize(None),
         )
         aligned = s.reindex(pd.DatetimeIndex(times).tz_localize(None), method="ffill")
-        # Crypto trades 24/7 — before the first pack print, hold cash.
         aligned = aligned.fillna(float(initial_cash))
         arr = aligned.to_numpy(dtype=np.float64)
-        if arr.size < 2 or not np.isfinite(arr[0]) or arr[0] <= 0:
+        if arr.size < 1 or not np.isfinite(arr[0]) or arr[0] <= 0:
             return None
         return arr / float(arr[0]) * float(initial_cash)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _soft_crypto_nav_on_grid(
+    times: pd.DatetimeIndex,
+    *,
+    initial_cash: float,
+) -> np.ndarray | None:
+    """CrestDay pack NAV on the equity session grid (soft-fail)."""
+    from rlbot.pack_crestday import simulate_nav_series
+
+    return _soft_pack_nav_on_grid(
+        times,
+        initial_cash=initial_cash,
+        simulate_fn=simulate_nav_series,
+        disk_run_id=CRYPTO_LIVE_RUN_ID,
+    )
+
+
+def _soft_durable_nav_on_grid(
+    times: pd.DatetimeIndex,
+    *,
+    initial_cash: float,
+) -> np.ndarray | None:
+    """Durable.v1 pack NAV on the equity session grid (soft-fail)."""
+    from rlbot.pack_durable import simulate_nav_series
+
+    return _soft_pack_nav_on_grid(
+        times,
+        initial_cash=initial_cash,
+        simulate_fn=simulate_nav_series,
+        disk_run_id=DURABLE_LIVE_RUN_ID,
+    )
 
 
 def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
@@ -675,16 +735,19 @@ def _positions_snapshot(
     rows: list[dict[str, Any]] = []
     for i, lab in enumerate(labels):
         value = float(w[i] * nav)
-        price = None
+        if not np.isfinite(value):
+            value = 0.0
+        price: float | None = None
         if i == 0:
             price = 1.0
         elif last_closes is not None and i - 1 < last_closes.shape[0]:
-            price = float(last_closes[i - 1])
+            raw = float(last_closes[i - 1])
+            price = raw if np.isfinite(raw) and raw > 0 else None
         rows.append(
             {
                 "label": lab,
                 "ticker": "CASH" if i == 0 else (tickers[i - 1] if i - 1 < len(tickers) else lab),
-                "weight": float(w[i]),
+                "weight": float(w[i]) if np.isfinite(w[i]) else 0.0,
                 "value_usd": value,
                 "price": price,
             }
@@ -693,6 +756,382 @@ def _positions_snapshot(
         key=lambda r: (-1 if str(r["label"]).lower() == "cash" else 0, -float(r["weight"]))
     )
     return rows
+
+
+# Forward allocation panels (nav key → UI label + paper/shadow run id).
+_ALLOCATION_BOOKS: tuple[tuple[str, str, str], ...] = (
+    ("model", "GeneralEquity1", ALGO_LIVE_RUN_ID),
+    ("live_model", "RLModel", RL_LIVE_RUN_ID),
+    ("crypto", "CrestDay", CRYPTO_LIVE_RUN_ID),
+)
+
+_PAPER_STATE_BY_RUN: dict[str, Path] = {
+    ALGO_LIVE_RUN_ID: PROJECT_ROOT / "execution" / "paper_general_equity1" / "state.json",
+    CRYPTO_LIVE_RUN_ID: PROJECT_ROOT / "execution" / "paper_crest_day" / "state.json",
+}
+
+
+def _equity_rth_open_now() -> bool:
+    """True during Mon–Fri US cash session (09:30–16:00 America/New_York)."""
+    now = pd.Timestamp.now(tz="America/New_York")
+    if int(now.dayofweek) >= 5:
+        return False
+    minutes = int(now.hour) * 60 + int(now.minute)
+    return (9 * 60 + 30) <= minutes < (16 * 60)
+
+
+def _now_et_floor_5m() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="America/New_York").tz_localize(None).floor("5min")
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _weights_from_paper_state(run_id: str) -> dict[str, float] | None:
+    path = _PAPER_STATE_BY_RUN.get(str(run_id).upper())
+    if path is None:
+        return None
+    st = _read_json_file(path)
+    tw = st.get("target_weights")
+    if not isinstance(tw, dict) or not tw:
+        return None
+    return {str(k): float(v) for k, v in tw.items()}
+
+
+def _resolve_strategy_weights(run_id: str, *, aum: float) -> dict[str, float]:
+    """Prefer shadow ledger / paper state (fast); avoid pack engine on soft polls."""
+    del aum  # reserved for future tip-mark AUM scaling
+    for getter in (
+        lambda: _latest_shadow_weights(run_id),
+        lambda: _weights_from_paper_state(run_id),
+    ):
+        try:
+            w = getter()
+        except Exception:  # noqa: BLE001
+            w = None
+        if isinstance(w, dict) and w:
+            return {str(k): float(v) for k, v in w.items()}
+    tip = load_forward_mark(run_id)
+    if isinstance(tip, dict):
+        tw = tip.get("latest_weights")
+        if isinstance(tw, dict) and tw:
+            return {str(k): float(v) for k, v in tw.items()}
+    return {"Cash": 1.0}
+
+
+def _positions_from_weight_map(
+    weights: dict[str, float],
+    *,
+    nav: float,
+    price_by_ticker: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Build allocation rows from an arbitrary weight dict (Cash + names)."""
+    price_by_ticker = price_by_ticker or {}
+    by_key = {_normalize_weight_key(k): float(v) for k, v in weights.items()}
+    cash_w = float(by_key.get("CASH", 0.0))
+    risky_keys = [k for k in by_key if k != "CASH" and abs(by_key[k]) > 1e-12]
+    # Preserve insertion order from original weights where possible.
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for k in weights:
+        nk = _normalize_weight_key(k)
+        if nk == "CASH" or nk in seen or nk not in by_key:
+            continue
+        if abs(by_key[nk]) <= 1e-12:
+            continue
+        ordered.append(nk)
+        seen.add(nk)
+    for nk in risky_keys:
+        if nk not in seen:
+            ordered.append(nk)
+            seen.add(nk)
+    labels = ["Cash"] + ordered
+    tickers = ["CASH"] + ordered
+    closes = None
+    if ordered and price_by_ticker:
+        vals = []
+        any_px = False
+        for lab in ordered:
+            px = price_by_ticker.get(lab, price_by_ticker.get(lab.upper()))
+            try:
+                fpx = float(px) if px is not None else float("nan")
+            except (TypeError, ValueError):
+                fpx = float("nan")
+            if np.isfinite(fpx) and fpx > 0:
+                any_px = True
+                vals.append(fpx)
+            else:
+                vals.append(float("nan"))
+        closes = np.asarray(vals, dtype=np.float64) if any_px else None
+    return _positions_snapshot(
+        {**{lab: by_key.get(_normalize_weight_key(lab), 0.0) for lab in labels}, "Cash": cash_w},
+        nav=float(nav),
+        labels=labels,
+        last_closes=closes,
+        tickers=tickers[1:],
+    )
+
+
+def _coinbase_prices_for_weights(weights: dict[str, float]) -> dict[str, float]:
+    syms = [
+        str(k)
+        for k, v in weights.items()
+        if str(k).upper() not in {"CASH", "USD"} and abs(float(v)) > 1e-12
+    ]
+    if not syms:
+        return {}
+    try:
+        from rlbot.coinbase_market import fetch_last_prices
+
+        return fetch_last_prices(syms)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _build_allocations_payload(
+    mark: dict[str, Any],
+    *,
+    model_positions: list[dict[str, Any]] | None = None,
+    model_price_source: str = "yahoo",
+) -> dict[str, Any]:
+    """Snapshot current positions for every live strategy sleeve."""
+    nav_map = mark.get("nav") if isinstance(mark.get("nav"), dict) else {}
+    stats = mark.get("stats") if isinstance(mark.get("stats"), dict) else {}
+    initial_cash = float(mark.get("initial_cash") or 100_000.0)
+    as_of = (mark.get("live") or {}).get("as_of_utc") or mark.get("generated_at_utc")
+    out: dict[str, Any] = {}
+
+    for key, label, run_id in _ALLOCATION_BOOKS:
+        tip_nav = None
+        st = stats.get(key) if isinstance(stats.get(key), dict) else None
+        if st and st.get("nav") is not None:
+            tip_nav = float(st["nav"])
+        elif isinstance(nav_map.get(key), list) and nav_map[key]:
+            tip_nav = float(nav_map[key][-1])
+        nav = float(tip_nav) if tip_nav is not None else initial_cash
+
+        if key == "model" and model_positions is not None:
+            positions = model_positions
+            price_source = model_price_source
+            weights = mark.get("latest_weights") if isinstance(mark.get("latest_weights"), dict) else {}
+        else:
+            weights = _resolve_strategy_weights(run_id, aum=nav)
+            if key == "crypto":
+                prices = _coinbase_prices_for_weights(weights)
+                price_source = "coinbase" if prices else "weights"
+            else:
+                prices = {}
+                price_source = "weights"
+                # Avoid per-poll Yahoo fan-out for the RL sleeve (model panel
+                # already carries Yahoo-marked ETF prices from the live refresh).
+            positions = _positions_from_weight_map(weights, nav=nav, price_by_ticker=prices)
+
+        out[key] = {
+            "key": key,
+            "label": label,
+            "run_id": run_id,
+            "nav": nav,
+            "as_of": as_of,
+            "price_source": price_source,
+            "positions": positions,
+            "latest_weights": {
+                str(k): float(v) for k, v in (weights or {}).items()
+            },
+        }
+    return out
+
+
+def _payload_times(mark: dict[str, Any]) -> pd.DatetimeIndex:
+    stamps = mark.get("timestamps") or mark.get("dates") or []
+    if not stamps:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex([pd.Timestamp(x).tz_localize(None) for x in stamps])
+
+
+def _extend_nav_series(series: list[Any] | None, n_add: int) -> list[float]:
+    if not series:
+        return []
+    last = float(series[-1])
+    return [float(x) for x in series] + [last] * int(n_add)
+
+
+def _extend_payload_clock_24_7(mark: dict[str, Any]) -> dict[str, Any]:
+    """Append 5m bars past the last equity print so crypto sleeves keep updating.
+
+    Only extends outside the US cash session. During RTH, inventing flat equity
+    bars after a failed Yahoo pull made the chart look live while NAV was frozen.
+    """
+    times = _payload_times(mark)
+    if len(times) < 1:
+        return mark
+    now = _now_et_floor_5m()
+    last = pd.Timestamp(times[-1])
+    if now <= last:
+        return mark
+    # During RTH wait for real Yahoo bars — do not ffill invent.
+    if _equity_rth_open_now():
+        return mark
+    extra = pd.date_range(last + pd.Timedelta(minutes=5), now, freq="5min")
+    # Cap weekend growth (~3 calendar days of 5m bars).
+    max_extra = 3 * 24 * 12
+    if len(extra) > max_extra:
+        extra = extra[-max_extra:]
+    if len(extra) < 1:
+        return mark
+
+    n_add = int(len(extra))
+    new_times = times.append(extra)
+    iso = [pd.Timestamp(t).isoformat(timespec="minutes") for t in new_times]
+    mark = dict(mark)
+    mark["timestamps"] = iso
+    mark["dates"] = iso
+    mark["n_bars"] = int(len(iso))
+
+    nav = dict(mark.get("nav") or {})
+    for key in ("model", "spy", "equal_weight", "live_model", "crypto"):
+        if key in nav and isinstance(nav[key], list) and nav[key]:
+            nav[key] = _extend_nav_series(nav[key], n_add)
+    # Drop retired Durable.v1 series so 24/7 extension does not keep them alive.
+    nav.pop("durable", None)
+    mark["nav"] = nav
+
+    stats = dict(mark.get("stats") or {})
+    stats.pop("durable", None)
+    bpy = float(BARS_PER_TRADING_DAY * 252)
+    for key, series in nav.items():
+        if isinstance(series, list) and series:
+            stats[key] = _series_stats(series, bars_per_year=bpy, timestamps=iso)
+    mark["stats"] = stats
+
+    candles = mark.get("candles")
+    if isinstance(candles, dict):
+        new_candles = dict(candles)
+        new_candles.pop("durable", None)
+        for key, series in nav.items():
+            if not isinstance(series, list) or len(series) != len(new_times):
+                continue
+            arr = np.asarray(series, dtype=np.float64)
+            ohlc = np.column_stack([arr, arr, arr, arr])
+            new_candles[key] = _candles_to_payload(new_times, ohlc)
+        mark["candles"] = new_candles
+
+    live = dict(mark.get("live") or {})
+    live["as_of_bar"] = iso[-1]
+    live["as_of_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    live["crypto_clock"] = "24_7"
+    if not _equity_rth_open_now():
+        live["equity_session"] = "closed"
+    mark["live"] = live
+    mark.pop("companion_durable_run_id", None)
+    note = str(mark.get("note") or "")
+    if "24/7 crypto clock" not in note:
+        mark["note"] = (
+            note
+            + (" " if note and not note.endswith(".") else "")
+            + " After the cash close, equity sleeves hold last print; "
+            "CrestDay keeps a 24/7 5m clock."
+        ).strip()
+    return mark
+
+
+def _attach_soft_companions_to_mark(payload: dict[str, Any]) -> dict[str, Any]:
+    """Align CrestDay NAV onto the mark's timestamp grid (soft-fail)."""
+    times = _payload_times(payload)
+    if len(times) < 1:
+        return payload
+    initial_cash = float(payload.get("initial_cash") or 100_000.0)
+    date_strs = [pd.Timestamp(t).isoformat(timespec="minutes") for t in times]
+    candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else None
+    nav = dict(payload.get("nav") or {})
+    stats = dict(payload.get("stats") or {})
+    bpy = float(BARS_PER_TRADING_DAY * 252)
+    # Strip retired Durable.v1 series from older marks.
+    nav.pop("durable", None)
+    stats.pop("durable", None)
+    if isinstance(candles, dict):
+        candles = dict(candles)
+        candles.pop("durable", None)
+    payload.pop("companion_durable_run_id", None)
+    allocations = payload.get("allocations")
+    if isinstance(allocations, dict) and "durable" in allocations:
+        allocations = dict(allocations)
+        allocations.pop("durable", None)
+        payload["allocations"] = allocations
+
+    def _attach(nav_key: str, arr: np.ndarray | None, companion_field: str, run_id: str) -> None:
+        if arr is None or arr.size < len(times):
+            return
+        series = np.asarray(arr[: len(times)], dtype=np.float64)
+        if np.isfinite(series[0]) and series[0] > 0:
+            series = series / float(series[0]) * float(initial_cash)
+        nav[nav_key] = series.tolist()
+        stats[nav_key] = _series_stats(
+            series.tolist(), bars_per_year=bpy, timestamps=date_strs
+        )
+        payload[companion_field] = run_id
+        if candles is not None:
+            ohlc = np.column_stack([series, series, series, series])
+            candles[nav_key] = _candles_to_payload(times, ohlc)
+
+    try:
+        _attach(
+            "crypto",
+            _soft_crypto_nav_on_grid(times, initial_cash=initial_cash),
+            "companion_crypto_run_id",
+            CRYPTO_LIVE_RUN_ID,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    payload["nav"] = nav
+    payload["stats"] = stats
+    if candles is not None:
+        payload["candles"] = candles
+    if "crypto" not in nav:
+        try:
+            from rlbot.forward_mark import merge_crypto_companion
+
+            payload = merge_crypto_companion(payload)
+        except Exception:  # noqa: BLE001
+            pass
+    return payload
+
+
+def _finalize_forward_mark(
+    payload: dict[str, Any],
+    *,
+    model_positions: list[dict[str, Any]] | None = None,
+    model_price_source: str = "yahoo",
+    write: bool = True,
+) -> dict[str, Any]:
+    """Extend 24/7 crypto clock, soft-attach companions, stamp all allocations."""
+    payload = _extend_payload_clock_24_7(dict(payload))
+    payload = _attach_soft_companions_to_mark(payload)
+    positions = model_positions
+    if positions is None and isinstance(payload.get("positions"), list):
+        positions = payload["positions"]
+    allocations = _build_allocations_payload(
+        payload,
+        model_positions=positions,
+        model_price_source=model_price_source,
+    )
+    payload["allocations"] = allocations
+    model_alloc = allocations.get("model") or {}
+    if isinstance(model_alloc.get("positions"), list):
+        payload["positions"] = model_alloc["positions"]
+    live = dict(payload.get("live") or {})
+    live["as_of_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    payload["live"] = live
+    payload["generated_at_utc"] = live["as_of_utc"]
+    if write:
+        write_forward_mark(payload)
+    return payload
 
 
 def _yahoo_chart_ohlc(
@@ -919,14 +1358,15 @@ def refresh_forward_mark_live(
         and (now - last_attempt) < 60.0
     ):
         need_fetch = False
-    # Keep a flat baseline intact across soft polls until a real session prints.
+    # Keep equity flat baseline until a real session prints, but still extend the
+    # 24/7 crypto clock and refresh per-strategy allocations on soft polls.
     if (
         not reset_book
         and not force_price_refresh
         and isinstance(existing, dict)
         and (existing.get("live") or {}).get("source") == "flat_baseline"
     ):
-        return existing
+        return _finalize_forward_mark(existing)
 
     # Always use the repo config — never touch Runs/<id>/config.yaml (iCloud hang).
     cfg_path = PROJECT_ROOT / "config" / "config.yaml"
@@ -1117,7 +1557,9 @@ def refresh_forward_mark_live(
                 # Fall through to cache / empty handling below.
                 need_fetch = False
             elif existing is not None and (existing.get("live") or {}).get("source") == "flat_baseline":
-                return existing
+                return _finalize_forward_mark(existing)
+            elif existing is not None:
+                return _finalize_forward_mark(existing)
             else:
                 raise RuntimeError(
                     f"no {BAR_INTERVAL} bars on/after {book_start}: {exc}"
@@ -1277,7 +1719,7 @@ def refresh_forward_mark_live(
             times, o, h, l, c, so, sh, sl, sc, start=book_start
         )
         if len(times) < 1:
-            return existing
+            return _finalize_forward_mark(existing) if isinstance(existing, dict) else existing
         price_cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             price_cache,
@@ -1311,7 +1753,7 @@ def refresh_forward_mark_live(
         )
 
     if o is None or len(times) < 1:
-        return existing
+        return _finalize_forward_mark(existing) if isinstance(existing, dict) else existing
 
     lab_index = {lab: i for i, lab in enumerate(fetch_labels)}
 
@@ -1434,36 +1876,9 @@ def refresh_forward_mark_live(
     payload["latest_weights"] = {
         labels[i]: float(live_vec[i]) for i in range(len(labels))
     }
-    # Soft companion: CrestDay pack mark (never fails the equity book).
-    try:
-        crypto_nav = _soft_crypto_nav_on_grid(times, initial_cash=initial_cash)
-        if crypto_nav is not None and crypto_nav.size >= len(times):
-            crypto_arr = np.asarray(crypto_nav[: len(times)], dtype=np.float64)
-            # Guarantee chart start at initial_cash (pack history can drift).
-            if np.isfinite(crypto_arr[0]) and crypto_arr[0] > 0:
-                crypto_arr = crypto_arr / float(crypto_arr[0]) * float(initial_cash)
-            crypto_s = crypto_arr.tolist()
-            payload["nav"]["crypto"] = crypto_s
-            date_strs = [pd.Timestamp(t).isoformat(timespec="minutes") for t in times]
-            payload["stats"]["crypto"] = _series_stats(
-                crypto_s,
-                bars_per_year=BARS_PER_TRADING_DAY * 252,
-                timestamps=date_strs,
-            )
-            payload["companion_crypto_run_id"] = CRYPTO_LIVE_RUN_ID
-            crypto_ohlc = np.column_stack([crypto_arr, crypto_arr, crypto_arr, crypto_arr])
-            candles = payload.get("candles")
-            if isinstance(candles, dict):
-                candles["crypto"] = _candles_to_payload(times, crypto_ohlc)
-    except Exception:  # noqa: BLE001
-        pass
-    # Disk fallback so static publish / soft polls always show CrestDay.
-    if "crypto" not in (payload.get("nav") or {}):
-        try:
-            from rlbot.forward_mark import merge_crypto_companion
-
-            payload = merge_crypto_companion(payload)
-        except Exception:  # noqa: BLE001
-            pass
-    write_forward_mark(payload)
-    return payload
+    return _finalize_forward_mark(
+        payload,
+        model_positions=positions,
+        model_price_source="yahoo",
+        write=True,
+    )

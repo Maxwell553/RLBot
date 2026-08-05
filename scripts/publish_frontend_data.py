@@ -43,7 +43,8 @@ OOS_CACHE = EXEC / "api_oos_cache.json"
 ACTIVE_PTR = EXEC / "forward_active.json"
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(.+)$", re.IGNORECASE)
+# W{window}_{cohort} or W{window}_{cohort}_s{seed} (seed ensembles).
+_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(\d+)(?:_[A-Za-z0-9]+)?$", re.IGNORECASE)
 
 
 def _now() -> str:
@@ -71,11 +72,8 @@ def _run_sort_key(run_id: str) -> tuple[Any, ...]:
     if m is None:
         return (1, 0, 0, run_id)
     window = int(m.group(1))
-    cohort = m.group(2)
-    try:
-        return (0, -int(cohort), window, run_id)
-    except ValueError:
-        return (0, 0, window, run_id.lower())
+    cohort = int(m.group(2))
+    return (0, -cohort, window, run_id)
 
 
 def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
@@ -203,6 +201,14 @@ def _load_forward() -> dict[str, Any]:
         mark = merge_crypto_companion(mark)
     except Exception:  # noqa: BLE001
         pass
+    # Durable.v1 retired from the ops forward surface.
+    for section in ("nav", "stats", "candles", "allocations"):
+        blob = mark.get(section)
+        if isinstance(blob, dict) and "durable" in blob:
+            cleaned = dict(blob)
+            cleaned.pop("durable", None)
+            mark[section] = cleaned
+    mark.pop("companion_durable_run_id", None)
     weights = mark.get("weights")
     if isinstance(weights, list) and len(weights) > 400:
         mark = {**mark, "weights": weights[:: max(1, len(weights) // 200)]}
@@ -316,6 +322,50 @@ def _patch_missing_oos(rows: list[dict[str, Any]], *, budget_s: float = 60.0) ->
     return patched
 
 
+def _backtest_payload_from_summary(bt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "checkpoint_label": bt.get("checkpoint_label"),
+        "oos_window": bt.get("oos_window"),
+        "total_return": bt.get("total_return"),
+        "sharpe": bt.get("sharpe"),
+        "excess_sharpe": bt.get("excess_sharpe"),
+        "max_drawdown": bt.get("max_drawdown"),
+        "deflated_sharpe": bt.get("deflated_sharpe"),
+        "deflated_sharpe_excess": bt.get("deflated_sharpe_excess"),
+        "oos_trials_for_window": bt.get("oos_trials_for_window"),
+        "oos_trials_conservative": bt.get("oos_trials_conservative"),
+        "equal_weight_daily_return": bt.get("equal_weight_daily_return"),
+        "excess_return_vs_equal_weight": bt.get("excess_return_vs_equal_weight"),
+        "hash_drift": bt.get("hash_drift"),
+        "n_bars": bt.get("n_bars"),
+        "portfolio_diagnostics": bt.get("portfolio_diagnostics"),
+    }
+
+
+def _backtest_payload_from_audit(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a detail ``backtest`` block from runs-index OOS fields (no Runs/ I/O)."""
+    if not row.get("has_backtest") and row.get("oos_sharpe") is None and row.get("oos_return") is None:
+        return None
+    labels = row.get("labels") if isinstance(row.get("labels"), list) else []
+    return {
+        "checkpoint_label": labels[0] if labels else None,
+        "oos_window": row.get("window"),
+        "total_return": row.get("oos_return"),
+        "sharpe": row.get("oos_sharpe"),
+        "excess_sharpe": None,
+        "max_drawdown": row.get("oos_max_drawdown"),
+        "deflated_sharpe": row.get("oos_deflated_sharpe"),
+        "deflated_sharpe_excess": None,
+        "oos_trials_for_window": None,
+        "oos_trials_conservative": None,
+        "equal_weight_daily_return": row.get("equal_weight_daily_return"),
+        "excess_return_vs_equal_weight": row.get("ew_excess_return"),
+        "hash_drift": None,
+        "n_bars": None,
+        "portfolio_diagnostics": None,
+    }
+
+
 def _detail_from_caches(
     run_id: str,
     audit: dict[str, Any] | None,
@@ -356,23 +406,11 @@ def _detail_from_caches(
         "backtest": None,
     }
     if bt is not None:
-        detail["backtest"] = {
-            "checkpoint_label": bt.get("checkpoint_label"),
-            "oos_window": bt.get("oos_window"),
-            "total_return": bt.get("total_return"),
-            "sharpe": bt.get("sharpe"),
-            "excess_sharpe": bt.get("excess_sharpe"),
-            "max_drawdown": bt.get("max_drawdown"),
-            "deflated_sharpe": bt.get("deflated_sharpe"),
-            "deflated_sharpe_excess": bt.get("deflated_sharpe_excess"),
-            "oos_trials_for_window": bt.get("oos_trials_for_window"),
-            "oos_trials_conservative": bt.get("oos_trials_conservative"),
-            "equal_weight_daily_return": bt.get("equal_weight_daily_return"),
-            "excess_return_vs_equal_weight": bt.get("excess_return_vs_equal_weight"),
-            "hash_drift": bt.get("hash_drift"),
-            "n_bars": bt.get("n_bars"),
-            "portfolio_diagnostics": bt.get("portfolio_diagnostics"),
-        }
+        detail["backtest"] = _backtest_payload_from_summary(bt)
+    else:
+        # Cache-only stubs still carry OOS on the audit row; expose them in the
+        # backtest block so expand doesn't say "no OOS" while the list shows Sharpe.
+        detail["backtest"] = _backtest_payload_from_audit(row)
     return detail
 
 
@@ -508,12 +546,34 @@ def publish(
                 detail = _detail_from_caches(rid, by_id.get(rid), read_disk=True)
                 _atomic_write_json(details_dir / f"{rid}.json", detail)
                 details_written += 1
-        # Cache-only stubs for any missing detail files (no Runs/ I/O).
+        # Cache-only stubs for remaining runs (no Runs/ I/O). Prefer synthesizing
+        # backtest from audit OOS so expand matches the list Sharpe/DSR.
         for rid, audit in by_id.items():
             path = details_dir / f"{rid}.json"
             if enrich_details and path.is_file():
-                continue  # keep enriched file written above
+                continue  # keep disk-enriched file written above
             detail = _detail_from_caches(rid, audit, read_disk=False)
+            if not enrich_details and path.is_file():
+                existing = _read_json(path)
+                # Don't discard a richer on-disk backtest block from a prior enrich.
+                if (
+                    isinstance(existing, dict)
+                    and isinstance(existing.get("backtest"), dict)
+                    and existing["backtest"].get("n_bars") is not None
+                    and (
+                        not isinstance(detail.get("backtest"), dict)
+                        or detail["backtest"].get("n_bars") is None
+                    )
+                ):
+                    detail["backtest"] = existing["backtest"]
+                    if isinstance(existing.get("holdout"), dict) and not detail.get("holdout"):
+                        detail["holdout"] = existing["holdout"]
+                    if isinstance(existing.get("provenance"), dict):
+                        prov = dict(detail.get("provenance") or {})
+                        for key, val in existing["provenance"].items():
+                            if prov.get(key) in (None, "") and val not in (None, ""):
+                                prov[key] = val
+                        detail["provenance"] = prov
             _atomic_write_json(path, detail)
             details_written += 1
 

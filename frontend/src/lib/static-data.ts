@@ -25,8 +25,14 @@ const memory = new Map<string, CacheEntry<unknown>>()
  * Soft navigations share one in-flight fetch via ``promise``. TTL is long
  * enough that 60s auto-refresh is the usual refresh path (not every mount).
  * Call ``clearStaticDataCache`` after an explicit republish / force refresh.
+ * Forward marks use a shorter TTL so the page does not stick on yesterday's snapshot.
  */
 const MEMORY_TTL_MS = 45_000
+const FORWARD_MEMORY_TTL_MS = 8_000
+
+function ttlFor(relPath: string): number {
+  return relPath === 'forward.json' ? FORWARD_MEMORY_TTL_MS : MEMORY_TTL_MS
+}
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String) : []
@@ -40,11 +46,22 @@ export function normalizeRun(run: ApiRun): ApiRun {
   }
 }
 
-async function loadJson<T>(relPath: string, signal?: AbortSignal): Promise<T> {
+async function loadJson<T>(
+  relPath: string,
+  signal?: AbortSignal,
+  opts: { bypassCache?: boolean } = {},
+): Promise<T> {
   const key = relPath
   const now = Date.now()
+  const ttl = ttlFor(relPath)
   const hit = memory.get(key) as CacheEntry<T> | undefined
-  if (hit && hit.data !== undefined && now - hit.at < MEMORY_TTL_MS && !hit.promise) {
+  if (
+    !opts.bypassCache &&
+    hit &&
+    hit.data !== undefined &&
+    now - hit.at < ttl &&
+    !hit.promise
+  ) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     return hit.data
   }
@@ -52,11 +69,12 @@ async function loadJson<T>(relPath: string, signal?: AbortSignal): Promise<T> {
   // Shared in-flight fetch must NOT be tied to any one caller's AbortSignal —
   // React Strict Mode / tab changes abort the first subscriber and would cancel
   // the download for everyone waiting on the same promise (Runs "All" stuck loading).
-  let promise = hit?.promise
+  let promise = !opts.bypassCache ? hit?.promise : undefined
   if (!promise) {
     promise = (async () => {
-      const url = `${DATA_BASE}/${relPath}?v=${Math.floor(now / MEMORY_TTL_MS)}`
-      const response = await fetch(url, { cache: 'no-cache' })
+      const bust = opts.bypassCache ? now : Math.floor(now / ttl)
+      const url = `${DATA_BASE}/${relPath}?v=${bust}`
+      const response = await fetch(url, { cache: 'no-store' })
       if (!response.ok) {
         throw new Error(`Static data HTTP ${response.status} for /data/${relPath}`)
       }
@@ -100,8 +118,11 @@ export async function loadStaticResults(cohort = '', signal?: AbortSignal): Prom
   return { ...data, rows }
 }
 
-export async function loadStaticForward(signal?: AbortSignal): Promise<ApiForward> {
-  return loadJson<ApiForward>('forward.json', signal)
+export async function loadStaticForward(
+  signal?: AbortSignal,
+  opts: { bypassCache?: boolean } = {},
+): Promise<ApiForward> {
+  return loadJson<ApiForward>('forward.json', signal, opts)
 }
 
 export type StaticRunQuery = {
@@ -152,11 +173,36 @@ export async function loadStaticRunDetail(
   runId: string,
   signal?: AbortSignal,
 ): Promise<ApiRunDetail> {
+  const synthesizeBacktest = (audit: ApiRun | null): ApiRunDetail['backtest'] => {
+    if (!audit) return null
+    if (!audit.has_backtest && audit.oos_sharpe == null && audit.oos_return == null) return null
+    return {
+      checkpoint_label: audit.labels[0] ?? null,
+      oos_window: audit.window,
+      total_return: audit.oos_return,
+      sharpe: audit.oos_sharpe,
+      excess_sharpe: null,
+      max_drawdown: audit.oos_max_drawdown,
+      deflated_sharpe: audit.oos_deflated_sharpe,
+      deflated_sharpe_excess: null,
+      oos_trials_for_window: null,
+      oos_trials_conservative: null,
+      equal_weight_daily_return: null,
+      excess_return_vs_equal_weight: audit.ew_excess_return,
+      hash_drift: null,
+      n_bars: null,
+      portfolio_diagnostics: null,
+    }
+  }
+
   try {
     const data = await loadJson<ApiRunDetail>(`details/${encodeURIComponent(runId)}.json`, signal)
+    const audit = data.audit ? normalizeRun(data.audit) : null
     return {
       ...data,
-      audit: data.audit ? normalizeRun(data.audit) : null,
+      audit,
+      // Stale publish stubs left backtest=null while audit already had OOS Sharpe.
+      backtest: data.backtest ?? synthesizeBacktest(audit),
     }
   } catch {
     // Fallback: synthesize a minimal detail from the runs index (still ms-fast).
@@ -176,25 +222,7 @@ export async function loadStaticRunDetail(
       },
       holdout: null,
       universe: null,
-      backtest: audit.has_backtest
-        ? {
-            checkpoint_label: audit.labels[0] ?? null,
-            oos_window: audit.window,
-            total_return: audit.oos_return,
-            sharpe: audit.oos_sharpe,
-            excess_sharpe: null,
-            max_drawdown: audit.oos_max_drawdown,
-            deflated_sharpe: audit.oos_deflated_sharpe,
-            deflated_sharpe_excess: null,
-            oos_trials_for_window: null,
-            oos_trials_conservative: null,
-            equal_weight_daily_return: null,
-            excess_return_vs_equal_weight: audit.ew_excess_return,
-            hash_drift: null,
-            n_bars: null,
-            portfolio_diagnostics: null,
-          }
-        : null,
+      backtest: synthesizeBacktest(audit),
     }
   }
 }

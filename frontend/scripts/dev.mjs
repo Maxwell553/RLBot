@@ -103,14 +103,10 @@ async function workflowApiIsHealthy() {
     const session = await fetchJson('http://127.0.0.1:8790/api/session', 2_000, {
       Authorization: 'Bearer operator-local',
     })
+    // Require a real session — a hung listener that accepts TCP is not healthy.
     return Boolean(session && (session.role === 'operator' || session.user_id || session.userId))
   } catch {
-    // Port open but not ready yet (or auth shape differs) — treat as unhealthy.
-    try {
-      return await portOpen(8790)
-    } catch {
-      return false
-    }
+    return false
   }
 }
 
@@ -423,6 +419,7 @@ children.push(vite)
 
 const workflowEnv = {
   ...process.env,
+  PYTHONUNBUFFERED: '1',
   MARKETTRAINER_WORKFLOW_TOKENS: process.env.MARKETTRAINER_WORKFLOW_TOKENS || JSON.stringify({
     'investor-local': { user_id: 'investor_1', org_id: 'org_1', role: 'investor' },
     'operator-local': { user_id: 'operator_1', org_id: 'internal', role: 'operator' },
@@ -433,12 +430,16 @@ const workflowEnv = {
 if (await workflowApiIsHealthy()) {
   console.log('[dev] Workflow API ready on http://127.0.0.1:8790')
 } else {
+  // Exact basename kill + free port (stale hung listeners accept TCP but never answer).
+  await pkillScript('workflow_api.py')
+  await freePort(8790)
+  await new Promise((resolve) => setTimeout(resolve, 400))
   start('workflow API', python, ['scripts/workflow_api.py', '--port', '8790'], workflowEnv, {
     restart: true,
     port: 8790,
     healthy: workflowApiIsHealthy,
   })
-  const ok = await waitFor(workflowApiIsHealthy, 'workflow API /api/session', 40, 250)
+  const ok = await waitFor(workflowApiIsHealthy, 'workflow API /api/session', 60, 250)
   if (ok) {
     console.log('[dev] Workflow API ready on http://127.0.0.1:8790 (Vite proxy /workflow-api)')
   } else {

@@ -4,6 +4,9 @@
     "target": "es2023",
     "lib": ["ES2023", "DOM"],
     "module": "esnext",
+    // Include package roots so `vite/client` resolves to node_modules/vite/client.d.ts
+    // (default typeRoots is only node_modules/@types, which breaks IDE lookup).
+    "typeRoots": ["./node_modules", "./node_modules/@types"],
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,

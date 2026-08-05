@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -31,8 +31,9 @@ RUNS_CACHE = EXEC / "api_runs_cache.json"
 OOS_CACHE = EXEC / "api_oos_cache.json"
 ACTIVE_PTR = EXEC / "forward_active.json"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-_COHORT_RUN_RE = re.compile(r"^(W\d+)_(.+)$", re.IGNORECASE)
-_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(.+)$", re.IGNORECASE)
+# W{window}_{cohort} or W{window}_{cohort}_s{seed} (seed ensembles).
+_COHORT_RUN_RE = re.compile(r"^(W\d+)_(\d+)(?:_[A-Za-z0-9]+)?$", re.IGNORECASE)
+_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(\d+)(?:_[A-Za-z0-9]+)?$", re.IGNORECASE)
 _CKPT_STEP_RE = re.compile(r"^ppo_(\d+)_steps\.zip$")
 _DEFAULT_NOMINAL_STEPS = 50_000_000
 # No checkpoint/manifest updates for this long → treat as interrupted (not active).
@@ -44,6 +45,9 @@ _rows_cache: list[dict[str, Any]] | None = None
 _rows_at = 0.0
 _enrich_lock = threading.Lock()
 _enriching = False
+_forward_refresh_lock = threading.Lock()
+_forward_refreshing = False
+_PUBLIC_DATA = ROOT / "frontend" / "public" / "data"
 
 
 def _now() -> str:
@@ -51,16 +55,13 @@ def _now() -> str:
 
 
 def _run_sort_key(run_id: str) -> tuple[Any, ...]:
-    """Newest cohort first, then W1…W5 within the cohort."""
+    """Newest numeric cohort first, then W1…W5 (seed suffixes sort after)."""
     m = _WINDOW_COHORT_RE.match(run_id)
     if m is None:
         return (1, 0, 0, run_id)
     window = int(m.group(1))
-    cohort = m.group(2)
-    try:
-        return (0, -int(cohort), window, run_id)
-    except ValueError:
-        return (0, 0, window, run_id.lower())
+    cohort = int(m.group(2))
+    return (0, -cohort, window, run_id)
 
 
 def _sort_run_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -256,6 +257,167 @@ def _mark_age_s(run_id: str) -> float | None:
         return max(0.0, time.time() - path.stat().st_mtime)
     except OSError:
         return None
+
+
+def _prices_age_s(run_id: str) -> float | None:
+    """Seconds since the last successful Yahoo price fetch (stamp), not mark mtime.
+
+    Clock-touch rewrites the mark file every poll, so mtime cannot mean "fresh prices".
+    """
+    stamp = _read_json(EXEC / "forward_live_stamp.json")
+    if not isinstance(stamp, dict):
+        return None
+    if str(stamp.get("run_id") or "") and str(stamp.get("run_id")) != run_id:
+        # Stamp is for another book — treat as unknown / stale.
+        return None
+    fetched = stamp.get("prices_fetched_at_unix")
+    try:
+        ts = float(fetched)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return max(0.0, time.time() - ts)
+
+
+def _parse_mark_ts(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except ValueError:
+        return None
+
+
+def _floor_5m(dt: datetime) -> datetime:
+    return dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
+
+
+def _in_us_cash_session(dt: datetime) -> bool:
+    """Mon–Fri 09:30–16:00 ET (naive Eastern wall clock)."""
+    if dt.weekday() >= 5:
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
+def _extend_nav_hold(series: list[Any], n_add: int) -> list[float]:
+    vals = [float(v) for v in series if isinstance(v, (int, float))]
+    if not vals or n_add < 1:
+        return [float(v) for v in series] if isinstance(series, list) else []
+    tip = vals[-1]
+    return vals + [tip] * int(n_add)
+
+
+def _touch_forward_clock(run_id: str, mark: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Bump freshness metadata without inventing flat equity bars during RTH.
+
+    During the US cash session, fake 5m extensions after a failed Yahoo pull made
+    the chart look "current" while NAV was frozen (the big flat gap). Overnight /
+    weekend we still hold the last print so CrestDay's 24/7 tip can advance.
+    """
+    payload = dict(mark) if isinstance(mark, dict) else _load_mark(run_id)
+    if not isinstance(payload, dict):
+        return None
+    payload = _strip_durable_series(payload)
+    stamps = payload.get("timestamps") or payload.get("dates") or []
+    if not isinstance(stamps, list) or not stamps:
+        return payload
+    last = _parse_mark_ts(str(stamps[-1]))
+    if last is None:
+        return payload
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    except Exception:  # noqa: BLE001
+        now = datetime.now()
+    now = _floor_5m(now)
+    live = dict(payload.get("live") or {})
+    live["as_of_utc"] = _now()
+    payload["generated_at_utc"] = live["as_of_utc"]
+
+    # RTH: never invent equity bars — wait for Yahoo. Only refresh metadata.
+    if now <= last or _in_us_cash_session(now):
+        live["as_of_bar"] = str(stamps[-1])
+        live["clock_touch"] = "meta"
+        payload["live"] = live
+        try:
+            path = EXEC / f"forward_mark_{run_id}.json"
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            text = json.dumps(payload, indent=2, default=str, allow_nan=False)
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[lite-api] clock-touch write skipped: {exc}", file=sys.stderr, flush=True)
+        _write_public_forward(run_id, payload)
+        return payload
+
+    extra: list[str] = []
+    cursor = last + timedelta(minutes=5)
+    # Cap runaway weekend growth (~3 calendar days of 5m bars).
+    max_extra = 3 * 24 * 12
+    while cursor <= now and len(extra) < max_extra:
+        extra.append(cursor.isoformat(timespec="minutes"))
+        cursor = cursor + timedelta(minutes=5)
+    if extra:
+        new_stamps = [str(s) for s in stamps] + extra
+        n_add = len(extra)
+        payload["timestamps"] = new_stamps
+        payload["dates"] = new_stamps
+        payload["n_bars"] = len(new_stamps)
+        nav = dict(payload.get("nav") or {})
+        for key, series in list(nav.items()):
+            if isinstance(series, list) and series:
+                nav[key] = _extend_nav_hold(series, n_add)
+        payload["nav"] = nav
+        stats = dict(payload.get("stats") or {})
+        for key, series in nav.items():
+            if not isinstance(series, list) or not series:
+                continue
+            tip = float(series[-1])
+            base = float(series[0]) if series[0] else tip
+            ret = (tip / base - 1.0) if base else 0.0
+            prev = stats.get(key) if isinstance(stats.get(key), dict) else {}
+            stats[key] = {
+                **prev,
+                "nav": tip,
+                "total_return": ret,
+            }
+        payload["stats"] = stats
+        candles = payload.get("candles")
+        if isinstance(candles, dict):
+            new_candles = dict(candles)
+            for key, series in nav.items():
+                if not isinstance(series, list) or len(series) != len(new_stamps):
+                    continue
+                rows = []
+                for i, ts in enumerate(new_stamps):
+                    v = float(series[i])
+                    rows.append({"t": ts, "o": v, "h": v, "l": v, "c": v})
+                new_candles[key] = rows
+            payload["candles"] = new_candles
+        live["as_of_bar"] = new_stamps[-1]
+        live["crypto_clock"] = "24_7"
+        live["clock_touch"] = "lite_offhours"
+    payload["live"] = live
+    # Persist so /data/forward.json and the next soft poll stay fresh.
+    try:
+        path = EXEC / f"forward_mark_{run_id}.json"
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        text = json.dumps(payload, indent=2, default=str, allow_nan=False)
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[lite-api] clock-touch write skipped: {exc}", file=sys.stderr, flush=True)
+    _write_public_forward(run_id, payload)
+    return payload
 
 
 def _normalize_run_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -488,14 +650,10 @@ def _build_enriched_rows(budget_s: float = 25.0) -> list[dict[str, Any]]:
         prev_row = prev_by_id.get(rid) or {}
         missing_oos = 0 if prev_row.get("oos_sharpe") is None else 1
         activeish = 0 if prev_row.get("training_status") in (None, "", "active", "running") else 1
-        m = re.match(r"^W(\d+)_(.+)$", rid, re.IGNORECASE)
+        m = _WINDOW_COHORT_RE.match(rid)
         if m is not None:
             window = int(m.group(1))
-            cohort = m.group(2)
-            try:
-                cohort_key = -int(cohort)  # 804 before 803
-            except ValueError:
-                cohort_key = 0
+            cohort_key = -int(m.group(2))  # 809 before 808
             return (missing_oos, activeish, cohort_key, window, rid)
         if rid.startswith("LIVE_"):
             return (missing_oos, 0, 1, 0, rid)
@@ -744,11 +902,11 @@ def _sync_live_refresh(
     *,
     force: bool,
     reset_book: bool = False,
-    timeout_s: float = 90.0,
+    timeout_s: float = 75.0,
 ) -> dict[str, Any] | None:
     """Block until Yahoo refresh writes execution/forward_mark_*.json (or timeout)."""
     py = _venv_python()
-    # Chart-API fetch is fast; the cost is importing rlbot under iCloud load.
+    # Chart-API fetch is fast; CrestDay attach used to push this past 50s.
     code = (
         "from rlbot.forward_live import refresh_forward_mark_live;"
         f"p=refresh_forward_mark_live({run_id!r}, force_price_refresh={bool(force)}, "
@@ -772,12 +930,81 @@ def _sync_live_refresh(
     return _load_mark(run_id)
 
 
-def _kick_live_refresh(run_id: str) -> None:
+def _kick_live_refresh(run_id: str, *, force: bool = False) -> None:
+    """Single-flight background Yahoo refresh so soft polls do not pile up."""
+    global _forward_refreshing
+    with _forward_refresh_lock:
+        if _forward_refreshing:
+            return
+        _forward_refreshing = True
+
     def _worker() -> None:
-        _sync_live_refresh(run_id, force=False, timeout_s=50.0)
+        global _forward_refreshing
+        try:
+            mark = _sync_live_refresh(
+                run_id, force=force, timeout_s=90.0 if force else 75.0
+            )
+            if mark is not None:
+                _write_public_forward(run_id, mark)
+        finally:
+            with _forward_refresh_lock:
+                _forward_refreshing = False
 
     threading.Thread(target=_worker, name="lite-forward-refresh", daemon=True).start()
 
+
+def _strip_durable_series(mark: dict[str, Any]) -> dict[str, Any]:
+    """Durable.v1 is retired from the ops forward UI — drop leftover series."""
+    out = dict(mark)
+    for section in ("nav", "stats", "candles", "allocations"):
+        blob = out.get(section)
+        if isinstance(blob, dict) and "durable" in blob:
+            cleaned = dict(blob)
+            cleaned.pop("durable", None)
+            out[section] = cleaned
+    out.pop("companion_durable_run_id", None)
+    return out
+
+
+def _json_safe_lite(value: Any) -> Any:
+    """Finite-float JSON sanitizer (no rlbot import — iCloud-safe)."""
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe_lite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_lite(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_lite(v) for v in value]
+    return value
+
+
+def _write_public_forward(run_id: str, mark: dict[str, Any]) -> None:
+    """Keep Vite /data/forward.json in sync with execution marks (no full publish)."""
+    payload = {
+        "generated_at_utc": _now(),
+        "available": True,
+        "run_id": run_id,
+        "mark": _strip_durable_series(mark),
+        "message": None,
+    }
+    tmp: Path | None = None
+    try:
+        _PUBLIC_DATA.mkdir(parents=True, exist_ok=True)
+        path = _PUBLIC_DATA / "forward.json"
+        # Unique tmp avoids concurrent clock-touch / refresh replace races.
+        tmp = path.with_name(f"forward.{os.getpid()}.{threading.get_ident()}.tmp")
+        text = json.dumps(_json_safe_lite(payload), indent=2, default=str, allow_nan=False)
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+        tmp = None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[lite-api] forward.json publish skipped: {exc}", file=sys.stderr, flush=True)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 def _run_detail(run_id: str) -> dict[str, Any] | None:
     known = set(_list_run_ids())
@@ -853,7 +1080,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "authorization, content-type, accept")
 
     def _json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload, default=str).encode("utf-8")
+        try:
+            from rlbot.forward_mark import _json_safe
+
+            payload = _json_safe(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        body = json.dumps(payload, default=str, allow_nan=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1011,19 +1244,23 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             mark = _load_mark(rid)
-            age = _mark_age_s(rid)
-            stale = age is None or age > 180.0  # Yahoo 5m marks go stale after ~3 minutes
-            if live and (force or reset_book):
-                # Only force_refresh / reset_book blocks; soft polls never wait on Yahoo.
+            # Prefer Yahoo stamp age — mark mtime is bumped by clock-touch every poll.
+            price_age = _prices_age_s(rid)
+            mark_age = _mark_age_s(rid)
+            stale = (
+                price_age is None
+                or price_age > 300.0  # 5m candle cadence
+                or mark_age is None
+                or mark_age > 600.0
+            )
+            if live and reset_book:
+                # Reset must complete before paint — keep a bounded wait.
                 mark = _sync_live_refresh(
-                    rid, force=True, reset_book=reset_book, timeout_s=120.0
+                    rid, force=True, reset_book=True, timeout_s=90.0
                 ) or mark
-            elif live and (mark is None or stale):
-                _kick_live_refresh(rid)
-                mark = _load_mark(rid) or mark
             elif live:
-                _kick_live_refresh(rid)
-                mark = _load_mark(rid) or mark
+                # Kick Yahoo in the background (may hang on rlbot import under iCloud).
+                _kick_live_refresh(rid, force=force or stale)
             if mark is None:
                 self._json(
                     200,
@@ -1036,15 +1273,16 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            try:
-                from rlbot.forward_mark import merge_crypto_companion
-
-                mark = merge_crypto_companion(mark)
-            except Exception:  # noqa: BLE001
-                pass
+            # Instant clock touch so the tip never sticks on yesterday while a
+            # Yahoo subprocess is stuck importing under iCloud.
+            if live and not reset_book:
+                mark = _touch_forward_clock(rid, mark) or mark
+            # Avoid importing rlbot on the request path (iCloud hang).
+            mark = _strip_durable_series(mark)
             weights = mark.get("weights")
             if isinstance(weights, list) and len(weights) > 400:
                 mark = {**mark, "weights": weights[:: max(1, len(weights) // 200)]}
+            _write_public_forward(rid, mark)
             self._json(
                 200,
                 {

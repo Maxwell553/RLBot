@@ -16,7 +16,7 @@ const SERIES = [
   { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
   { key: 'crypto' as const, label: 'CrestDay', color: '#6b4f9a' },
-  { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#b0892e' },
+  { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#5c6b7a' },
   { key: 'spy' as const, label: 'S&P (SPY)', color: '#c45c3e' },
 ]
 
@@ -32,8 +32,8 @@ const RANGE_OPTIONS = [
 type RangeId = (typeof RANGE_OPTIONS)[number]['id']
 type SeriesKey = (typeof SERIES)[number]['key']
 
-/** UI poll; Yahoo 5m NAV marks refresh about every 5 minutes server-side. */
-const FORWARD_POLL_MS = 60_000
+/** UI poll; soft loads hit the live lite API and kick a Yahoo rewrite in the background. */
+const FORWARD_POLL_MS = 20_000
 const BARS_PER_YEAR_5M = 78 * 252
 /** Hide annualized Sharpe until we have ~1 trading month of daily closes. */
 const MIN_TRADING_DAYS_FOR_SHARPE = 21
@@ -222,7 +222,11 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
       ...(crypto.length ? { crypto } : {}),
     },
     candles:
-      modelCandles.length || spyCandles.length || ewCandles.length || liveCandles.length || cryptoCandles.length
+      modelCandles.length ||
+      spyCandles.length ||
+      ewCandles.length ||
+      liveCandles.length ||
+      cryptoCandles.length
         ? {
             model: modelCandles,
             spy: spyCandles,
@@ -281,17 +285,17 @@ function dateTickIndexes(stamps: string[], maxTicks = 5): number[] {
   const spanMs = Math.max(t1 - t0, 1)
   const intraday = spanMs < 36 * 3_600_000 && stamps.some((s) => s.includes('T') || s.length > 10)
 
+  let idxs: number[] = []
   if (intraday) {
-    // Snap labels to round clock marks (15m / 1h) so axes don't look jittery.
-    const stepMin = spanMs <= 4 * 3_600_000 ? 15 : 60
+    // Prefer hour marks on a full session; 30m when the window is short.
+    const stepMin = spanMs <= 3 * 3_600_000 ? 30 : 60
     const stepMs = stepMin * 60_000
     const firstAligned = Math.ceil(t0 / stepMs) * stepMs
     const targets: number[] = [t0]
-    for (let t = firstAligned; t < t1; t += stepMs) targets.push(t)
+    for (let t = firstAligned; t < t1 - stepMs / 4; t += stepMs) targets.push(t)
     targets.push(t1)
     const stride = Math.max(1, Math.ceil((targets.length - 2) / Math.max(maxTicks - 2, 1)))
     const kept = targets.filter((_, i) => i === 0 || i === targets.length - 1 || i % stride === 0)
-    const idxs: number[] = []
     for (const target of kept) {
       let best = 0
       let bestDist = Infinity
@@ -304,15 +308,53 @@ function dateTickIndexes(stamps: string[], maxTicks = 5): number[] {
       }
       if (!idxs.includes(best)) idxs.push(best)
     }
-    return idxs.sort((a, b) => a - b)
+    idxs.sort((a, b) => a - b)
+  } else {
+    const count = Math.min(maxTicks, n)
+    for (let i = 0; i < count; i++) {
+      idxs.push(Math.round((i * (n - 1)) / (count - 1)))
+    }
+    idxs = [...new Set(idxs)]
   }
 
-  const count = Math.min(maxTicks, n)
-  const out: number[] = []
-  for (let i = 0; i < count; i++) {
-    out.push(Math.round((i * (n - 1)) / (count - 1)))
+  // Drop ticks that sit too close in index space (prevents stacked labels at the
+  // right edge when first/last + hourly snaps collide).
+  const minGap = Math.max(1, Math.floor(n / Math.max(maxTicks, 2) / 2))
+  const spaced: number[] = []
+  for (const i of idxs) {
+    if (!spaced.length || i - spaced[spaced.length - 1] >= minGap) spaced.push(i)
+    else if (i === n - 1) {
+      // Prefer keeping the true end label; replace previous if too close.
+      spaced[spaced.length - 1] = i
+    }
   }
-  return [...new Set(out)]
+  if (spaced[0] !== 0) spaced.unshift(0)
+  if (spaced[spaced.length - 1] !== n - 1) spaced.push(n - 1)
+  // Final pass: if first/last forced a collision, drop the neighbor.
+  const out: number[] = []
+  for (const i of spaced) {
+    if (!out.length || i - out[out.length - 1] >= minGap) out.push(i)
+    else if (i === n - 1) out[out.length - 1] = i
+  }
+  return out
+}
+
+/** Last index at or before 16:00 on the session of ``stamps[0]`` (US cash close). */
+function cashSessionEndIndex(stamps: string[]): number | null {
+  if (stamps.length < 2) return null
+  const first = parseTs(stamps[0])
+  if (Number.isNaN(first.getTime())) return null
+  let lastRth = -1
+  for (let i = 0; i < stamps.length; i++) {
+    const d = parseTs(stamps[i])
+    if (Number.isNaN(d.getTime())) continue
+    if (d.toDateString() !== first.toDateString()) break
+    const minutes = d.getHours() * 60 + d.getMinutes()
+    if (minutes <= 16 * 60) lastRth = i
+  }
+  // Only trim when we actually have after-close bars.
+  if (lastRth >= 0 && lastRth < stamps.length - 1) return lastRth
+  return null
 }
 
 function shortDate(iso: string, opts: { timeOnly?: boolean } = {}): string {
@@ -354,11 +396,19 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
   const [hover, setHover] = useState<HoverPoint | null>(null)
 
   const plot = useMemo(() => {
-    const stamps = markTimestamps(mark)
+    let stamps = markTimestamps(mark)
     const nav = mark.nav ?? { model: [], spy: [], equal_weight: [] }
+    const sameDay =
+      stamps.length >= 2 &&
+      parseTs(stamps[0]).toDateString() === parseTs(stamps[stamps.length - 1]).toDateString()
+    // Same-day view: stop at cash close so after-hours flat holds don't leave a
+    // long empty tail (24/7 crypto clock still updates tip NAV in the cards).
+    const rthEnd = sameDay ? cashSessionEndIndex(stamps) : null
+    if (rthEnd != null) stamps = stamps.slice(0, rthEnd + 1)
+
     const series = SERIES.map((s) => ({
       ...s,
-      values: asNumArray(nav[s.key]),
+      values: asNumArray(nav[s.key]).slice(0, stamps.length),
     })).filter((s) => s.values.length > 0)
     const lengths = series.map((s) => s.values.length)
     const n = Math.max(stamps.length, ...(lengths.length ? lengths : [0]), 0)
@@ -366,15 +416,10 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
     const cash = Number.isFinite(mark.initial_cash) ? mark.initial_cash : 100_000
     const dataMin = all.length ? Math.min(...all) : cash
     const dataMax = all.length ? Math.max(...all) : cash
-    // Floor span so a near-flat cash book still has readable vertical room
-    // without the SPY/EW range crushing the model line into the midline.
     const span = Math.max(dataMax - dataMin, cash * 0.0015, 50)
     const pad = Math.max(span * 0.15, 25)
     const yMin = dataMin - pad
     const yMax = dataMax + pad
-    const sameDay =
-      stamps.length >= 2 &&
-      parseTs(stamps[0]).toDateString() === parseTs(stamps[stamps.length - 1]).toDateString()
     return {
       stamps,
       series,
@@ -383,12 +428,13 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       yMax,
       yTicks: niceTicks(yMin, yMax, 5),
       timeOnly: sameDay,
+      trimmedAfterClose: rthEnd != null,
     }
   }, [mark])
 
   const width = 760
   const height = 320
-  const margin = { top: 16, right: 20, bottom: 44, left: 64 }
+  const margin = { top: 16, right: 28, bottom: 44, left: 64 }
   const innerW = width - margin.left - margin.right
   const innerH = height - margin.top - margin.bottom
 
@@ -419,7 +465,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       idx = Math.max(0, Math.min(plot.n - 1, idx))
     }
     const at = (key: SeriesKey) => {
-      const vals = mark.nav?.[key]
+      const vals = plot.series.find((s) => s.key === key)?.values
       return vals && vals[idx] != null ? vals[idx] : null
     }
     setHover({
@@ -433,7 +479,24 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
     })
   }
 
-  const xTicks = dateTickIndexes(plot.stamps)
+  const xTicks = useMemo(() => {
+    const idxs = dateTickIndexes(plot.stamps, 6)
+    const minPx = 72
+    const kept: number[] = []
+    for (const i of idxs) {
+      const x = xAt(i)
+      if (!kept.length) {
+        kept.push(i)
+        continue
+      }
+      const prevX = xAt(kept[kept.length - 1])
+      if (x - prevX >= minPx) kept.push(i)
+      else if (i === plot.n - 1) kept[kept.length - 1] = i
+    }
+    return kept
+    // xAt depends on plot.n / margins which are stable for a given plot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plot.stamps, plot.n])
 
   return (
     <div className="relative">
@@ -523,6 +586,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
           const label = plot.stamps[i]
             ? shortDate(plot.stamps[i], { timeOnly: plot.timeOnly })
             : String(i + 1)
+          const anchor = i === 0 ? 'start' : i === plot.n - 1 ? 'end' : 'middle'
           return (
             <g key={`x-${i}`}>
               <line
@@ -537,7 +601,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
               <text
                 x={x}
                 y={margin.top + innerH + 18}
-                textAnchor="middle"
+                textAnchor={anchor}
                 className="fill-ink/55"
                 style={{ fontSize: 10, fontFamily: 'var(--font-mono), ui-monospace, monospace' }}
               >
@@ -615,6 +679,9 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       <p className="mt-1.5 text-[10px] text-ink/45">
         5-minute MTM marks · prices refresh about every 5 minutes (Yahoo intraday history tops out
         near 60 days).
+        {plot.trimmedAfterClose
+          ? ' Chart ends at the cash close (4:00 PM); after-hours marks still update tip NAV in the cards.'
+          : ''}
       </p>
     </div>
   )
@@ -661,9 +728,34 @@ function StatsCard({
   )
 }
 
+const ALLOCATION_TABS = [
+  { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
+  { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
+  { key: 'crypto' as const, label: 'CrestDay', color: '#6b4f9a' },
+]
+
 function WeightsPanel({ mark }: { mark: ApiForwardMark }) {
-  const positions = mark.positions
-  const latest = mark.latest_weights
+  const availableTabs = useMemo(
+    () =>
+      ALLOCATION_TABS.filter((tab) => {
+        const book = mark.allocations?.[tab.key]
+        if (book && book.positions?.length) return true
+        if (tab.key === 'model' && (mark.positions?.length || mark.latest_weights)) return true
+        return (mark.nav?.[tab.key]?.length ?? 0) > 0
+      }),
+    [mark],
+  )
+  const [tab, setTab] = useState<(typeof ALLOCATION_TABS)[number]['key']>('model')
+  useEffect(() => {
+    if (!availableTabs.some((t) => t.key === tab) && availableTabs[0]) {
+      setTab(availableTabs[0].key)
+    }
+  }, [availableTabs, tab])
+
+  const book = mark.allocations?.[tab]
+  const positions = book?.positions ?? (tab === 'model' ? mark.positions : null)
+  const latest =
+    book?.latest_weights ?? (tab === 'model' ? mark.latest_weights : null)
   const rows =
     positions && positions.length > 0
       ? positions.map((p) => ({
@@ -678,7 +770,14 @@ function WeightsPanel({ mark }: { mark: ApiForwardMark }) {
             .map(([label, weight]) => ({
               label,
               weight: Number(weight),
-              value: Number(weight) * Number(mark.stats?.model?.nav ?? mark.initial_cash),
+              value:
+                Number(weight) *
+                Number(
+                  book?.nav ??
+                    mark.stats?.[tab]?.nav ??
+                    mark.stats?.model?.nav ??
+                    mark.initial_cash,
+                ),
               price: null as number | null,
               ticker: label,
             }))
@@ -689,90 +788,138 @@ function WeightsPanel({ mark }: { mark: ApiForwardMark }) {
               return b.weight - a.weight
             })
         : []
-  if (!rows.length) return null
+  if (!availableTabs.length) return null
 
   const cashRow = rows.find((r) => r.label.toLowerCase() === 'cash')
   const risky = rows.filter((r) => r.label.toLowerCase() !== 'cash').sort((a, b) => b.weight - a.weight)
-  const cashW = cashRow?.weight ?? 0
+  const cashW = cashRow?.weight ?? (rows.length ? 0 : 1)
   const investedW = Math.max(0, 1 - cashW)
-  const nav = mark.stats?.model?.nav ?? mark.initial_cash
+  const nav =
+    book?.nav ?? mark.stats?.[tab]?.nav ?? mark.stats?.model?.nav ?? mark.initial_cash
   const riskyTotal = risky.reduce((s, r) => s + r.value, 0)
+  const activeMeta = ALLOCATION_TABS.find((t) => t.key === tab)
+  const priceSource = book?.price_source
 
   return (
     <div>
+      <div className="mb-4 flex flex-wrap gap-1.5" role="tablist" aria-label="Strategy allocation">
+        {availableTabs.map((t) => {
+          const active = t.key === tab
+          return (
+            <button
+              key={t.key}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setTab(t.key)}
+              className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
+                active ? 'text-paper' : 'text-ink/60 hover:bg-ink/[.04] hover:text-ink/85'
+              }`}
+              style={
+                active
+                  ? { backgroundColor: t.color }
+                  : { backgroundColor: 'transparent', border: '1px solid var(--line, #d5ddd8)' }
+              }
+            >
+              {t.label}
+            </button>
+          )
+        })}
+      </div>
+
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-semibold">Current positions</p>
+          <p className="text-sm font-semibold">
+            Current positions
+            {activeMeta ? (
+              <span className="font-normal text-ink/50"> · {activeMeta.label}</span>
+            ) : null}
+          </p>
           <p className="mt-1 text-[11px] text-ink/60">
-            Marked to latest closes · book NAV {fmtNav(nav)}
-            {mark.live?.as_of_bar ? ` · prices through ${mark.live.as_of_bar}` : ''}
+            Book NAV {fmtNav(nav)}
+            {book?.as_of || mark.live?.as_of_bar
+              ? ` · as of ${book?.as_of ? fmtDate(book.as_of) : mark.live?.as_of_bar}`
+              : ''}
+            {priceSource ? ` · prices via ${priceSource}` : ''}
+            {tab === 'model' && mark.live?.as_of_bar && !book?.as_of
+              ? ` · closes through ${mark.live.as_of_bar}`
+              : ''}
           </p>
         </div>
-        {cashW >= 0.6 ? (
+        {tab === 'live_model' && cashW >= 0.6 ? (
           <Badge tone="warning">Cash park · {(cashW * 100).toFixed(1)}% cash</Badge>
-        ) : (
+        ) : investedW >= 0.4 ? (
           <Badge tone="success">{(investedW * 100).toFixed(1)}% invested</Badge>
-        )}
+        ) : null}
       </div>
 
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <div className="rounded-xl border border-line bg-white/50 p-3">
-          <p className="text-[10px] uppercase tracking-wide text-ink/50">Cash</p>
-          <p className="mt-1 font-mono text-lg text-ink/90">{(cashW * 100).toFixed(1)}%</p>
-          <p className="mt-0.5 font-mono text-[11px] text-ink/55">{fmtNav(cashRow?.value ?? 0)}</p>
-        </div>
-        <div className="rounded-xl border border-line bg-white/50 p-3">
-          <p className="text-[10px] uppercase tracking-wide text-ink/50">Risky assets</p>
-          <p className="mt-1 font-mono text-lg text-ink/90">{(investedW * 100).toFixed(1)}%</p>
-          <p className="mt-0.5 font-mono text-[11px] text-ink/55">{fmtNav(riskyTotal)}</p>
-        </div>
-      </div>
-
-      <div className="mt-4 flex h-3 overflow-hidden rounded-full bg-ink/8">
-        <div
-          title={`Cash ${(cashW * 100).toFixed(1)}%`}
-          style={{ width: `${Math.max(cashW * 100, 0)}%`, backgroundColor: '#8a9a92' }}
-        />
-        <div
-          title={`Invested ${(investedW * 100).toFixed(1)}%`}
-          style={{ width: `${Math.max(investedW * 100, 0)}%`, backgroundColor: '#1f3d34' }}
-        />
-      </div>
-
-      <p className="mt-5 text-[11px] font-semibold text-ink/70">
-        Risky sleeve{investedW < 0.05 ? ' (tiny — model is almost fully in cash)' : ''}
-      </p>
-      {investedW < 1e-6 ? (
-        <p className="mt-2 text-[11px] text-ink/55">No risky holdings right now.</p>
+      {!rows.length ? (
+        <p className="mt-4 text-[11px] text-ink/55">No position snapshot for this sleeve yet.</p>
       ) : (
         <>
-          <div className="mt-2 flex h-2.5 overflow-hidden rounded-full bg-ink/8">
-            {risky.map((row, i) => (
-              <div
-                key={row.label}
-                title={`${row.label}: ${((row.weight / Math.max(investedW, 1e-12)) * 100).toFixed(1)}% of risky`}
-                style={{
-                  width: `${(row.weight / Math.max(investedW, 1e-12)) * 100}%`,
-                  backgroundColor: SERIES[i % SERIES.length]?.color ?? '#5c6b7a',
-                }}
-              />
-            ))}
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-xl border border-line bg-white/50 p-3">
+              <p className="text-[10px] uppercase tracking-wide text-ink/50">Cash</p>
+              <p className="mt-1 font-mono text-lg text-ink/90">{(cashW * 100).toFixed(1)}%</p>
+              <p className="mt-0.5 font-mono text-[11px] text-ink/55">{fmtNav(cashRow?.value ?? 0)}</p>
+            </div>
+            <div className="rounded-xl border border-line bg-white/50 p-3">
+              <p className="text-[10px] uppercase tracking-wide text-ink/50">Risky assets</p>
+              <p className="mt-1 font-mono text-lg text-ink/90">{(investedW * 100).toFixed(1)}%</p>
+              <p className="mt-0.5 font-mono text-[11px] text-ink/55">{fmtNav(riskyTotal)}</p>
+            </div>
           </div>
-          <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
-            {risky.map((row) => (
-              <div key={row.label} className="flex justify-between gap-3 text-[11px]">
-                <span className="truncate text-ink/65">
-                  {row.label}
-                  {row.price != null ? (
-                    <span className="text-ink/40"> · px {row.price.toFixed(2)}</span>
-                  ) : null}
-                </span>
-                <span className="shrink-0 font-mono text-ink/85">
-                  {(row.weight * 100).toFixed(2)}% · {fmtNav(row.value)}
-                </span>
+
+          <div className="mt-4 flex h-3 overflow-hidden rounded-full bg-ink/8">
+            <div
+              title={`Cash ${(cashW * 100).toFixed(1)}%`}
+              style={{ width: `${Math.max(cashW * 100, 0)}%`, backgroundColor: '#8a9a92' }}
+            />
+            <div
+              title={`Invested ${(investedW * 100).toFixed(1)}%`}
+              style={{
+                width: `${Math.max(investedW * 100, 0)}%`,
+                backgroundColor: activeMeta?.color ?? '#1f3d34',
+              }}
+            />
+          </div>
+
+          <p className="mt-5 text-[11px] font-semibold text-ink/70">
+            Risky sleeve{investedW < 0.05 ? ' (tiny — almost fully in cash)' : ''}
+          </p>
+          {investedW < 1e-6 ? (
+            <p className="mt-2 text-[11px] text-ink/55">No risky holdings right now.</p>
+          ) : (
+            <>
+              <div className="mt-2 flex h-2.5 overflow-hidden rounded-full bg-ink/8">
+                {risky.map((row, i) => (
+                  <div
+                    key={row.label}
+                    title={`${row.label}: ${((row.weight / Math.max(investedW, 1e-12)) * 100).toFixed(1)}% of risky`}
+                    style={{
+                      width: `${(row.weight / Math.max(investedW, 1e-12)) * 100}%`,
+                      backgroundColor: SERIES[i % SERIES.length]?.color ?? '#5c6b7a',
+                    }}
+                  />
+                ))}
               </div>
-            ))}
-          </div>
+              <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+                {risky.map((row) => (
+                  <div key={row.label} className="flex justify-between gap-3 text-[11px]">
+                    <span className="truncate text-ink/65">
+                      {row.label}
+                      {row.price != null ? (
+                        <span className="text-ink/40"> · px {row.price.toFixed(2)}</span>
+                      ) : null}
+                    </span>
+                    <span className="shrink-0 font-mono text-ink/85">
+                      {(row.weight * 100).toFixed(2)}% · {fmtNav(row.value)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </>
       )}
     </div>
@@ -870,8 +1017,8 @@ export function ForwardPage() {
           <h1 className="mt-2 font-display text-3xl text-ink">Live book vs benchmarks</h1>
           <p className="mt-2 max-w-2xl text-sm text-ink/60">
             Five-minute NAV marks from the live paper book (GENERAL_EQUITY1 / GeneralEquity1,
-            CrestDay, or a LIVE_* RL deploy) vs equal-weight and SPY. Soft loads use
-            snapshots; Refresh pulls live Yahoo marks.
+            CrestDay, or a LIVE_* RL deploy) vs equal-weight and SPY. Soft loads hit the live
+            API; Refresh forces a Yahoo rewrite.
           </p>
           {state.kind === 'live' && refreshing && (
             <p className="mt-2 text-[11px] text-ink/55">Refreshing forward mark…</p>
@@ -931,8 +1078,8 @@ python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data`}
             )}
           </div>
 
-          <section className="mt-5 grid gap-5 lg:grid-cols-[1.45fr_.55fr]">
-            <Card className="p-6">
+          <section className="mt-5 grid items-start gap-5 lg:grid-cols-[1.45fr_.55fr]">
+            <Card className="p-6 self-start">
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <TrendingUp size={16} className="text-pine" aria-hidden="true" />

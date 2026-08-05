@@ -198,6 +198,17 @@ export type ApiForwardPosition = {
   price: number | null
 }
 
+export type ApiForwardAllocationBook = {
+  key: string
+  label: string
+  run_id: string
+  nav: number
+  as_of?: string | null
+  price_source?: string | null
+  positions: ApiForwardPosition[]
+  latest_weights?: Record<string, number> | null
+}
+
 export type ApiForwardLiveMeta = {
   prices_refreshed?: boolean
   as_of_bar?: string
@@ -205,6 +216,8 @@ export type ApiForwardLiveMeta = {
   min_refresh_seconds?: number
   bar_interval?: string
   source?: string
+  crypto_clock?: string
+  equity_session?: string
 }
 
 export type ApiForwardCandle = {
@@ -255,10 +268,14 @@ export type ApiForwardMark = {
   weights: Record<string, number>[] | null
   asset_labels: string[]
   positions?: ApiForwardPosition[] | null
+  /** Per-strategy allocation snapshots (GeneralEquity1, RL, CrestDay). */
+  allocations?: Partial<Record<SeriesAllocKey, ApiForwardAllocationBook>> | null
   live?: ApiForwardLiveMeta | null
   companion_run_id?: string | null
   note?: string
 }
+
+type SeriesAllocKey = 'model' | 'live_model' | 'crypto'
 
 export type ApiForward = {
   generated_at_utc: string

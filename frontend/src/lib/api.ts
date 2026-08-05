@@ -95,10 +95,12 @@ const INVESTOR_WORKFLOW_TOKEN = import.meta.env.VITE_INVESTOR_WORKFLOW_TOKEN as 
 const OPS_WORKFLOW_TOKEN = import.meta.env.VITE_OPS_WORKFLOW_TOKEN as string | undefined
 const coordinator = new RequestCoordinator(12_000, 8_000)
 const workflowCoordinator = new RequestCoordinator(20_000, 5_000)
-/** Forward live MTM can wait on a Yahoo pull; allow longer than the default. */
-const FORWARD_TIMEOUT_MS = 45_000
-/** Manual / hard reload waits for Yahoo 5m history to refresh server-side. */
-const FORCE_FORWARD_TIMEOUT_MS = 95_000
+/** Soft live mark poll — lite API returns a clock-touched disk mark quickly. */
+const FORWARD_TIMEOUT_MS = 12_000
+/** Manual refresh is instant (clock touch + background Yahoo); keep a short budget. */
+const FORCE_FORWARD_TIMEOUT_MS = 12_000
+/** Prefer live research API even in static mode (falls back to /data/forward.json). */
+const SOFT_LIVE_FORWARD_TIMEOUT_MS = 8_000
 
 export const WORKFLOW_OFFLINE = !WORKFLOW_API_URL || !INVESTOR_WORKFLOW_TOKEN
 /** @deprecated Use OFFLINE_MODE */
@@ -285,47 +287,52 @@ export function fetchForward(
   opts: { forceRefresh?: boolean } = {},
 ): Promise<DataState<ApiForward>> {
   return toState(async () => {
-    // Force refresh still needs the research API (Yahoo pull). Soft loads use snapshots.
-    if (STATIC_DATA_MODE && !opts.forceRefresh) {
-      const data = await loadStaticForward(signal)
+    const buildParams = (force: boolean) => {
+      const params = new URLSearchParams()
+      if (runId) params.set('run_id', runId)
+      params.set('live', '1')
+      if (force) params.set('force_refresh', '1')
+      params.set('_', String(Date.now()))
+      return params
+    }
+
+    const tryLive = async (force: boolean, timeoutMs: number): Promise<ApiForward> => {
+      const path = `/api/forward?${buildParams(force).toString()}`
+      const data =
+        STATIC_DATA_MODE || API_URL === undefined
+          ? await coordinator.request<ApiForward>(path, {}, signal, timeoutMs)
+          : await request<ApiForward>(path, { signal }, timeoutMs)
       assertShape(typeof data.available === 'boolean', 'forward.available missing')
-      if (runId && data.run_id && data.run_id !== runId) {
-        // Snapshot is for the active LIVE run; ignore mismatched ids.
-      }
+      clearStaticDataCache('forward.json')
       return data
     }
-    if (STATIC_DATA_MODE && opts.forceRefresh) {
-      // Best-effort: hit same-origin proxy if lite API is up; else return static.
+
+    // Soft/poll: prefer live lite API (fresh execution mark + background Yahoo),
+    // then fall back to a cache-busted static snapshot.
+    if (STATIC_DATA_MODE && !opts.forceRefresh) {
       try {
-        const params = new URLSearchParams()
-        if (runId) params.set('run_id', runId)
-        params.set('live', '1')
-        params.set('force_refresh', '1')
-        params.set('_', String(Date.now()))
-        const data = await coordinator.request<ApiForward>(
-          `/api/forward?${params.toString()}`,
-          {},
-          signal,
-          FORCE_FORWARD_TIMEOUT_MS,
-        )
-        assertShape(typeof data.available === 'boolean', 'forward.available missing')
-        clearStaticDataCache('forward.json')
-        return data
+        return await tryLive(false, SOFT_LIVE_FORWARD_TIMEOUT_MS)
       } catch {
-        const data = await loadStaticForward(signal)
+        const data = await loadStaticForward(signal, { bypassCache: true })
         assertShape(typeof data.available === 'boolean', 'forward.available missing')
         return data
       }
     }
-    const params = new URLSearchParams()
-    if (runId) params.set('run_id', runId)
-    params.set('live', '1')
-    if (opts.forceRefresh) params.set('force_refresh', '1')
-    params.set('_', String(Date.now()))
+
+    if (STATIC_DATA_MODE && opts.forceRefresh) {
+      clearStaticDataCache('forward.json')
+      try {
+        return await tryLive(true, FORCE_FORWARD_TIMEOUT_MS)
+      } catch {
+        // API timed out mid-refresh — still re-read disk snapshot (may have updated).
+        const data = await loadStaticForward(signal, { bypassCache: true })
+        assertShape(typeof data.available === 'boolean', 'forward.available missing')
+        return data
+      }
+    }
+
     const timeoutMs = opts.forceRefresh ? FORCE_FORWARD_TIMEOUT_MS : FORWARD_TIMEOUT_MS
-    const data = await request<ApiForward>(`/api/forward?${params.toString()}`, { signal }, timeoutMs)
-    assertShape(typeof data.available === 'boolean', 'forward.available missing')
-    return data
+    return await tryLive(Boolean(opts.forceRefresh), timeoutMs)
   })
 }
 
