@@ -186,3 +186,22 @@ def test_shadow_ledger_lives_under_gitignored_execution_dir() -> None:
     assert shadow.EXECUTION_DIR.name == "execution"
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "execution/" in gitignore
+
+
+def test_reset_stub_does_not_block_real_record_dedupe() -> None:
+    import scripts.shadow_trade as shadow
+
+    stub = {
+        "decision_bar": "2026-08-14",
+        "checkpoint": "best",
+        "target_weights": {"CASH": 1.0},
+        "note": "Reset to 100k cash (flat paper book).",
+    }
+    real = {
+        "decision_bar": "2026-08-14",
+        "checkpoint": "best",
+        "target_weights": {"SP500": 0.2, "CASH": 0.1},
+        "note": None,
+    }
+    assert shadow._is_reset_stub(stub) is True
+    assert shadow._is_reset_stub(real) is False

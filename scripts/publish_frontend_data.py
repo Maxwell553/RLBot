@@ -43,8 +43,8 @@ OOS_CACHE = EXEC / "api_oos_cache.json"
 ACTIVE_PTR = EXEC / "forward_active.json"
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-# W{window}_{cohort} or W{window}_{cohort}_s{seed} (seed ensembles).
-_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(\d+)(?:_[A-Za-z0-9]+)?$", re.IGNORECASE)
+# W{window}_{cohort}[letter] or W{window}_{cohort}_s{seed} (811a/b variants, seed ensembles).
+_WINDOW_COHORT_RE = re.compile(r"^W(\d+)_(\d+)([a-z]*)(?:_[A-Za-z0-9]+)?$", re.IGNORECASE)
 
 
 def _now() -> str:
@@ -70,10 +70,11 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 def _run_sort_key(run_id: str) -> tuple[Any, ...]:
     m = _WINDOW_COHORT_RE.match(run_id)
     if m is None:
-        return (1, 0, 0, run_id)
+        return (1, 0, 0, "", run_id)
     window = int(m.group(1))
     cohort = int(m.group(2))
-    return (0, -cohort, window, run_id)
+    letter = (m.group(3) or "").lower()
+    return (0, -cohort, window, letter, run_id)
 
 
 def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
@@ -155,10 +156,10 @@ def _window_sharpes(oos_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _cohort_sort_key(cohort: str) -> tuple[Any, ...]:
-    try:
-        return (0, -int(cohort))
-    except ValueError:
-        return (1, cohort)
+    m = re.match(r"^(\d+)([a-z]*)$", str(cohort), re.IGNORECASE)
+    if m:
+        return (0, -int(m.group(1)), (m.group(2) or "").lower())
+    return (1, 0, str(cohort))
 
 
 def _active_run_id() -> str | None:

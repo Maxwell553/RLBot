@@ -169,6 +169,7 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         if not self.id:
             raise ValueError("ExperimentSpec.id is required")
+        self.id = str(self.id)
         if re.search(r"__seed\d", self.id):
             raise ValueError(
                 f"spec id {self.id!r} must not contain '__seed<digits>' — it would "
@@ -231,48 +232,112 @@ def _grid_combos(grid: dict) -> list[dict]:
     return [dict(zip(keys, combo)) for combo in itertools.product(*value_lists)]
 
 
-def _short(value: Any) -> str:
-    s = str(value).replace(" ", "")
-    if len(s) <= 16:
-        return s
-    # Disambiguate truncated long values: a bare s[:16] collapsed distinct grid
-    # cells into ONE variant_id/run_id, silently overwriting configs and skipping
-    # cells at launch.
-    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:6]
-    return f"{s[:10]}~{digest}"
+_COHORT_DIGITS = re.compile(r"(\d{3,})$")
+
+
+def spec_cohort_tag(spec_id: str) -> str:
+    """``w3_dd_coupling_811`` → ``811``; otherwise the spec id as-is."""
+    m = _COHORT_DIGITS.search(str(spec_id))
+    return m.group(1) if m else str(spec_id)
+
+
+def _grid_letter(index: int) -> str:
+    """0 → a, 25 → z, 26 → aa. Distinguishes grid cells without knob-name essays."""
+    if index < 26:
+        return chr(ord("a") + index)
+    return _grid_letter(index // 26 - 1) + chr(ord("a") + index % 26)
+
+
+def _window_code(window: dict | None) -> str:
+    name = str((window or {}).get("name") or "").upper()
+    if name.startswith("W") and name[1:].isdigit():
+        return name
+    if name.isdigit():
+        return f"W{name}"
+    return name
+
+
+def canonical_run_id(
+    *,
+    spec_id: str,
+    window: dict | None,
+    grid_index: int,
+    n_grid: int,
+    seed: int,
+) -> tuple[str, str]:
+    """Return ``(run_id, group_id)`` in ``W3_811`` / ``W3_811a`` / ``W3_811a_s42`` form.
+
+    Seed 0 is omitted (``W3_811``). Extra seeds use ``_s{seed}``. A one-cell grid
+    has no letter; two or more cells get ``a``, ``b``, … The knob values live in
+    that run's ``config.yaml`` header, not the directory name.
+    """
+    cohort = spec_cohort_tag(spec_id)
+    letter = _grid_letter(grid_index) if n_grid > 1 else ""
+    wcode = _window_code(window)
+    if wcode:
+        group_id = f"{wcode}_{cohort}{letter}"
+    elif letter:
+        group_id = f"{cohort}_{letter}"
+    else:
+        group_id = cohort
+    seed_i = int(seed)
+    run_id = group_id if seed_i == 0 else f"{group_id}_s{seed_i}"
+    return run_id, group_id
+
+
+def variant_config_header(spec: ExperimentSpec, variant: Variant) -> str:
+    """Comment block so a later reader can see the delta without the directory name."""
+    lines = [
+        f"# {variant.variant_id} — cohort {spec.id}",
+        "#",
+    ]
+    hyp = " ".join(str(spec.hypothesis or "").split())
+    if hyp:
+        lines.append(f"# Hypothesis: {hyp}")
+        lines.append("#")
+    if spec.parent:
+        lines.append(f"# Parent: {spec.parent}")
+    lines.append("# Patch vs config/config.yaml (this file is the source of truth):")
+    if variant.concrete_patch:
+        for key in sorted(variant.concrete_patch):
+            lines.append(f"#   {key}: {variant.concrete_patch[key]!r}")
+    else:
+        lines.append("#   (none — identical to base)")
+    w = variant.window or {}
+    if w.get("name") or w.get("train_end"):
+        lines.append(
+            f"# Window: {w.get('name', '')}  train_end={w.get('train_end', '')}  "
+            f"holdout={w.get('holdout_start', '')}..{w.get('holdout_end', '')}"
+        )
+    lines.append(f"# Seed: {variant.seed}")
+    lines.append("#")
+    return "\n".join(lines) + "\n"
 
 
 def resolve_variants(spec: ExperimentSpec) -> list[Variant]:
     """Cartesian product of grid × seeds × windows; ``patch`` applied to all."""
     windows = spec.windows or [{}]
+    combos = _grid_combos(spec.grid)
+    n_grid = len(combos)
     variants: list[Variant] = []
-    for combo in _grid_combos(spec.grid):
+    for grid_index, combo in enumerate(combos):
         concrete = {**spec.patch, **combo}
-        last_segments = [k.split(".")[-1] for k in combo]
-        # Two grid keys sharing a last segment (reward.a vs curriculum.a) must not
-        # produce the same tag; fall back to the full dotted path in that case.
-        tag_key = {
-            k: (k.split(".")[-1] if last_segments.count(k.split(".")[-1]) == 1 else k.replace(".", "-"))
-            for k in combo
-        }
-        grid_tag = "_".join(f"{tag_key[k]}={_short(v)}" for k, v in combo.items())
         for seed in spec.seeds:
             for window in windows:
-                wname = window.get("name", "") if window else ""
-                parts = [spec.id]
-                if grid_tag:
-                    parts.append(grid_tag)
-                group_parts = list(parts) + ([wname] if wname else [])
-                parts.append(f"seed{seed}")
-                if wname:
-                    parts.append(wname)
+                run_id, group_id = canonical_run_id(
+                    spec_id=spec.id,
+                    window=window,
+                    grid_index=grid_index,
+                    n_grid=n_grid,
+                    seed=int(seed),
+                )
                 variants.append(
                     Variant(
-                        variant_id="__".join(parts),
+                        variant_id=run_id,
                         concrete_patch=dict(concrete),
                         seed=int(seed),
                         window=dict(window),
-                        group_id="__".join(group_parts),
+                        group_id=group_id,
                     )
                 )
     ids = [v.variant_id for v in variants]

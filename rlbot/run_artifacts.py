@@ -239,6 +239,51 @@ def discover_run_ids_with_models() -> list[str]:
     return sorted(found, key=lambda x: (0 if pat.match(x) else 1, x))
 
 
+def walk_forward_group_ids(
+    cohort: str, windows: tuple[str, ...] = ("W1", "W2", "W3", "W4", "W5")
+) -> list[str]:
+    """Research group ids ``W1_<cohort>`` … ``W5_<cohort>`` (seed 0 has no suffix)."""
+    tag = str(cohort).strip()
+    if not tag:
+        return []
+    return [f"{w}_{tag}" for w in windows]
+
+
+def discover_ensemble_run_ids(prefix: str, seeds: list[int] | None = None) -> list[str]:
+    """Runs matching a seed-ensemble prefix, sorted by seed.
+
+    Accepts both layouts:
+
+    - legacy ``<prefix>_seed_<n>``
+    - research ``<prefix>`` (seed 0) and ``<prefix>_s<n>`` (``W1_809`` / ``W1_809_s42``)
+    """
+    if not prefix:
+        return []
+    import re
+
+    found: list[tuple[int, str]] = []
+    pat_legacy = re.compile(rf"^{re.escape(prefix)}_seed_(\d+)$")
+    pat_research = re.compile(rf"^{re.escape(prefix)}_s(\d+)$")
+    for rid in discover_run_ids_with_models():
+        seed: int | None = None
+        m = pat_legacy.match(rid)
+        if m:
+            seed = int(m.group(1))
+        else:
+            m = pat_research.match(rid)
+            if m:
+                seed = int(m.group(1))
+            elif rid == prefix:
+                seed = 0
+        if seed is None:
+            continue
+        if seeds is not None and seed not in seeds:
+            continue
+        found.append((seed, rid))
+    found.sort(key=lambda x: (x[0], x[1]))
+    return [name for _, name in found]
+
+
 def snapshot_data_cache(src: Path, dest: Path) -> None:
     if src.is_file():
         dest.parent.mkdir(parents=True, exist_ok=True)

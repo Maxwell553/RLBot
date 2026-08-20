@@ -1,0 +1,31 @@
+# LiveTrader — GeneralEquity1 vs Interactive Brokers
+# Default is dry-run. This file cannot arm live capital by itself.
+
+aum_override: null   # null = use IB NetLiquidation when connected
+
+ibkr:
+  host: 127.0.0.1
+  port: 7497          # TWS paper 7497 / live 7496; Gateway paper 4002 / live 4001
+  client_id: 17
+  account: ""         # required for paper/live submit (set IBKR_ACCOUNT)
+  market_data_type: 1 # 1=live, 3=delayed
+  connect_timeout_s: 10
+  mkt_data_wait_s: 1.5
+
+execution:
+  mode: live          # dry_run | paper | live
+  order_type: MOC     # whole shares only (IBKR rejects fractional MOC)
+  fractional_order_type: MKT
+  tif: DAY
+  allow_fractional: true
+  min_notional: 1.0
+  allow_foreign_positions: false
+  seed_if_flat: true  # first fill when the IB book is empty (even mid-week)
+  sleeve_split: true  # Friday → TQQQ/QQQ; month-end → GLD/TLT; seed → both
+  cap_buys_to_cash: true
+  require_account: true
+  fill_timeout_s: 120
+  allow_live: true    # still needs CLI --arm-live AND env LIVE_TRADER_CONFIRM=GE1
+
+safety:
+  confirm_phrase: GE1

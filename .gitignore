@@ -28,11 +28,15 @@ outputs/
 .cache/
 data_cache.npz
 Runs/
-config/cohorts/
+config/cohorts/*
+!config/cohorts/809_720_plus.yaml
 paper/
 # Broker credentials and local execution state (reserved for the tier-5 shadow
 # ledger and any future broker integration; never tracked)
 execution/**
+LiveTrader/.env
+LiveTrader/state/
+LiveTrader/logs/
 
 # Frontend: source is tracked; only installs and build output are ignored
 frontend/node_modules/

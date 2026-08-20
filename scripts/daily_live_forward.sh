@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# Daily LIVE forward loop: one decision/day + dashboard mark.
+# Daily LIVE forward (RLModel shadow + optional mark rebuild).
 #
-# After the US cash close (~18:00 America/New_York on weekdays):
+# The 5-minute NAV collector is separate and must keep running while the UI is
+# closed:
+#   bash scripts/install_live_forward_launchd.sh
+#   python scripts/live_forward_loop.py --once
+#
+# This script is the post-close decision pass (also invoked by the collector
+# after 18:00 ET):
 #   1. Refresh global yfinance cache
 #   2. shadow_trade record  — append today's target weights (one trade)
 #   3. shadow_trade reconcile — mark prior decisions when bars are available
 #   4. forward_mark export  — rebuild NAV chart (model / EW / SPY) for /ops/forward
 #
-# Install (launchd, macOS):
-#   bash scripts/install_live_forward_launchd.sh
-#
 # Manual:
-#   bash scripts/daily_live_forward.sh [--run-id LIVE_MODEL]
+#   bash scripts/daily_live_forward.sh [--run-id RLModel]
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-RUN_ID="LIVE_MODEL"
+RUN_ID="RLModel"
 if [[ "${1:-}" == "--run-id" && -n "${2:-}" ]]; then
   RUN_ID="$2"
 elif [[ -n "${MARKETTRAINER_LIVE_RUN_ID:-}" ]]; then

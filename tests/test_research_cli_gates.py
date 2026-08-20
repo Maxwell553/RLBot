@@ -173,7 +173,7 @@ def test_tier4_launch_over_oos_budget_is_refused_before_subprocess(harness) -> N
 def test_promote_records_attempt_then_score_and_blocks_repeat(harness) -> None:
     mod, tmp, state = harness
     spec_path = _write_spec(tmp, spec_id="exp_c", tier=3, seeds=[0])
-    variant = "exp_c__seed0__W4"
+    variant = "W4_exp_c"
     _fabricate_manifest(tmp, variant)  # already trained at tier 3
     mod._materialize(mod.load_spec(spec_path))  # promote loads cohort.json, never rewrites it
 
@@ -184,7 +184,7 @@ def test_promote_records_attempt_then_score_and_blocks_repeat(harness) -> None:
     records = registry.read_records(tmp / "Runs" / "exp_c" / "registry.jsonl")
     assert [r["status"] for r in records] == ["oos_read_attempt", "ok"]
     # group_id threading: materialize → cohort entry → _collect_one → record
-    assert all(r.get("group_id") == "exp_c__W4" for r in records), records
+    assert all(r.get("group_id") == "W4_exp_c" for r in records), records
     assert all(int(r["evaluation_tier"]) >= 4 for r in records)
 
     # a second promote of the same variant is refused (multiple-testing guard)
@@ -199,7 +199,7 @@ def test_promote_records_attempt_then_score_and_blocks_repeat(harness) -> None:
 def test_promote_crash_fails_closed_and_rescore_needs_flag(harness) -> None:
     mod, tmp, state = harness
     spec_path = _write_spec(tmp, spec_id="exp_d", tier=3, seeds=[0])
-    variant = "exp_d__seed0__W4"
+    variant = "W4_exp_d"
     _fabricate_manifest(tmp, variant)
     mod._materialize(mod.load_spec(spec_path))
     reg = tmp / "Runs" / "exp_d" / "registry.jsonl"
@@ -232,7 +232,7 @@ def test_promote_crash_fails_closed_and_rescore_needs_flag(harness) -> None:
 def test_launch_resume_skips_scored_variant(harness) -> None:
     mod, tmp, state = harness
     spec_path = _write_spec(tmp, spec_id="exp_e", tier=3, seeds=[0])
-    variant = "exp_e__seed0__W4"
+    variant = "W4_exp_e"
     reg = tmp / "Runs" / "exp_e" / "registry.jsonl"
     registry.append_record(
         reg,
@@ -247,7 +247,7 @@ def test_launch_runs_unscored_variant(harness) -> None:
     """Inverse of the resume test: without an ok record the variant trains and collects."""
     mod, tmp, state = harness
     spec_path = _write_spec(tmp, spec_id="exp_f", tier=3, seeds=[0])
-    variant = "exp_f__seed0__W4"
+    variant = "W4_exp_f"
     reg = tmp / "Runs" / "exp_f" / "registry.jsonl"
     # a failed record does NOT count as collected at this tier
     registry.append_record(
@@ -272,7 +272,7 @@ def test_train_cmd_modal_backend_constructs_modal_invocation() -> None:
         "window": {"train_end": "2021-12-31", "holdout_start": "2022-01-01",
                    "holdout_end": "2023-12-31"},
     }
-    spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
+    spec = research.ExperimentSpec(id="t", evaluation_tier=3, timesteps=50_000_000)
     cmd = research._train_cmd(entry, spec, backend="modal", modal_gpu="H100")
     # modal_app.py has several local entrypoints — the ::train one must be named,
     # else `modal run` refuses to dispatch
@@ -299,7 +299,7 @@ def test_train_cmd_modal_never_hard_requires_path_binary(monkeypatch) -> None:
 
     monkeypatch.setattr(mc.shutil, "which", lambda b: None)
     entry = {"config_path": "c.yaml", "run_id": "v", "seed": 1, "window": {}}
-    spec = research.load_spec(research.PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
+    spec = research.ExperimentSpec(id="t", evaluation_tier=3, timesteps=50_000_000)
     cmd = research._train_cmd(entry, spec, backend="modal")
     head = cmd[: cmd.index("run")]
     assert head[-1].endswith("modal") or head[-2:] == ["-m", "modal"], head
@@ -392,7 +392,7 @@ def test_promote_always_records_at_tier_4(harness) -> None:
     must record at tier 4, never 5 (shadow evidence lives in execution/, not here)."""
     mod, tmp, state = harness
     spec_path = _write_spec(tmp, spec_id="exp_p5", tier=5, seeds=[0])
-    variant = "exp_p5__seed0__W4"
+    variant = "W4_exp_p5"
     _fabricate_manifest(tmp, variant)
     mod._materialize(mod.load_spec(spec_path))
     mod.cmd_promote(_promote_args(spec_path, variant))

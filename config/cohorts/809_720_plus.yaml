@@ -1,0 +1,260 @@
+# Frozen 809 / 720-plus live default (cohort 809).
+# LSTM 64, inactivity 0.35/0.15, fee_ramp_fraction 0.45, residual_actions false.
+# Train 816 residual via specs/residual_816.yaml (one-change patch on this recipe).
+# Copied from config/config.yaml at freeze time — keep the two in sync.
+#
+# RLBot centralized configuration — version control this file with training runs.
+# CLI flags in train.py override run-specific dates/run-id; hyperparameters default here.
+
+# Number of tradeable assets N = number of keys under ``assets`` (supported range: 5–55).
+# Each list in reward.benchmark_cap_weights and transaction_costs.* must have exactly N floats
+# in the same key order. After edits: ``python scripts/train.py --refresh-data`` then a new --run-id.
+universe:
+  benchmark: SP500
+  assets:
+    SP500: SPY
+    GOLD: GLD
+    OIL: USO
+    EURUSD: EURUSD=X
+    USDJPY: USDJPY=X
+    NIKKEI: "^N225"
+    FTSE: "^FTSE"
+    BOND10Y: IEF
+    COPPER: HG=F
+    EM: EEM
+
+environment:
+  initial_cash: 100000.0
+  max_episode_steps: 252
+  lookback: 20
+  obs_lag_default: 1
+  min_obs_lag: 0
+  max_obs_lag: 2
+  max_single_asset_weight: 0.20
+  fee_scale_default: 1.0
+  stop_loss_fraction: 0.45
+  domain_randomize_fee_dr_min: 0.75
+  domain_randomize_fee_dr_max: 1.1
+  action_smoothing_alpha: 0.15  # same train + backtest (EMA on raw policy logits)
+  domain_randomize_fee_beta_a: 5.0
+  domain_randomize_fee_beta_b: 5.0
+  # Append 4 causal portfolio self-state features to the observation (realized vol,
+  # downside vol, rolling excess vs the reward benchmark, near-cap fraction) so the
+  # policy can see its own risk state. Changes obs_dim (10N+28 → 10N+32); old run
+  # snapshots without this key keep their original layout.
+  self_state_features: true
+  # Two-head action (exposure logit + risky allocation). Cohort 727 science flip: ON
+  # so the policy has an explicit gross-exposure head instead of burying cash in a
+  # joint softmax (726 stayed ~fully invested OOS on W2–W5).
+  two_head_actions: true
+  # Residual policy (cohort 816 only): lock EW core, learn ±clip tilts. Off for 809.
+  residual_actions: false
+  residual_clip: 0.08
+  residual_core: equal_weight  # equal_weight | reward_benchmark
+  # Cohort 809 / 806_720_plus: no mechanical crash floor (807–808 parked cash).
+  dd_exposure_taper: false
+  dd_exposure_taper_start: 0.04
+  dd_exposure_taper_end: 0.10
+  dd_exposure_taper_min_gross: 0.20
+
+reward:
+  reward_scale: 2000.0
+  max_step_log_return: 0.06
+  max_step_log_return_downside: -0.12
+  risk_window: 63
+  sortino_min_steps: 20
+  # Floor on downside deviation in the Sortino ratio, in daily-return units (0.001 =
+  # 10 bp/day). The old 1e-4 floor let any no-loss window (e.g. ~90% cash + carry)
+  # saturate the ±3 clipped differential — a quasi-binary +risk_bonus_scale*3 exploit.
+  sortino_downside_floor: 0.001
+  # Sortino diff scale (paired with benchmark_excess; capped together at benchmark_combined_abs_cap).
+  # Reverted 4.0 → 2.5 after the 721/722 cohorts: the diff is clipped at ±3, so extra
+  # weight adds a constant "stay ahead of benchmark" bonus (risk-on on trending train
+  # data), not gradient. Under 4.0 the in-training eval excess-Sharpe DECLINED
+  # monotonically past ~20M steps on W3/W5 (720 under 2.5 stayed flat) and OOS mean
+  # Sharpe dropped 0.98 → 0.92. See docs/RESEARCH.md (721/722 postmortem).
+  risk_bonus_scale: 2.5
+  # Equal-weight passive benchmark (1/N per asset; feasible under max_single_asset_weight 0.20)
+  benchmark_cap_weights: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+  # clip(agent_log_ret - bench_log_ret) * scale; uses same friction model as Sortino benchmark
+  # Cohort 809 / 806_720_plus: restore 720 geometry (600), not 804's 300.
+  benchmark_excess_scale: 600.0
+  benchmark_excess_clip: 0.04
+  # CONSTANT cap on |sortino + benchmark| per step (reward units; 0 disables both).
+  # Deliberately not relative to the other terms: a share-of-other-mass cap let the
+  # agent raise the cap by burning costs / taking losses (reward-hacking gradient).
+  # 24 ≈ the benchmark-excess clip max (0.04 × 600); it trims only extreme days when
+  # the Sortino diff (≤ ±7.5) and the excess clip saturate together (raw max 31.5).
+  benchmark_combined_abs_cap: 24.0
+  # tx_cost_frac * churn_penalty * reward_scale * VIX_scale * curriculum_churn_scale
+  churn_penalty: 4.0  # multiplier on realized tx cost (slippage + fees) in reward units
+  # turnover_frac * turnover_penalty * reward_scale * VIX_scale * curriculum_churn_scale
+  turnover_penalty: 0.007
+  drawdown_downside_gamma: 12.0  # amplifies negative step returns when already in drawdown
+  # Cap on the (1 + gamma * dd) amplification factor. Uncapped, deep-drawdown days
+  # produce reward outliers far beyond VecNormalize's clip_reward band, so all bad
+  # days saturate identically (no gradient). 4.0 saturates at dd = 25%. 0 = uncapped.
+  drawdown_amp_max: 4.0
+  # Direct drawdown shaping (applied every step; logged as rew_decomp/drawdown_penalty):
+  drawdown_increase_penalty: 1.0  # × reward_scale on fresh dd expansion (806)
+  # Cohort 809 / 806: raw level penalty (not × reward_scale) — binding level×scale
+  # in 808 parked W5 at ~95% cash.
+  drawdown_level_times_reward_scale: false
+  drawdown_level_penalty: 3.0
+  drawdown_level_floor: 0.05
+  drawdown_level_exposure_coupling: 0.0
+  concentration_penalty: 0.75
+  concentration_target_eff_assets: 6.0
+  cash_daily_yield: 0.00015
+  # Cohort 809: cash-park tax (omitted in later yaml; 810–814 trained without it).
+  inactivity_penalty_over_50: 0.35
+  inactivity_penalty_over_90: 0.15
+  inactivity_vix_relief: 1.0
+  eval_inactivity_penalty_scale: 1.0
+  participation_bonus: 0.02
+  participation_reward_scale: 10.0
+  participation_vix_relief: 1.0
+  participation_drawdown_relief: 0.0
+  # Cohort 809 / 806_720_plus: realized_vol@100 + excess vol 0.15 (not vix parks).
+  exposure_risk_mode: realized_vol  # realized_vol | vix_positive
+  exposure_risk_penalty_scale: 100.0
+  vol_penalty_mode: excess  # excess | absolute
+  vol_penalty_scale: 0.15
+
+# Per-asset costs (one entry per universe.assets key, same order)
+transaction_costs:
+  slippage: [0.0001, 0.0002, 0.0003, 0.0001, 0.0001, 0.0005, 0.0005, 0.0001, 0.0008, 0.0002]
+  tx_fee: [0.0001, 0.0002, 0.0002, 0.00005, 0.00005, 0.0010, 0.0010, 0.0001, 0.0005, 0.0002]
+  annual_holding_cost: [0.0009, 0.0040, 0.0083, 0.0, 0.0, 0.0010, 0.0010, 0.0015, 0.0060, 0.0067]
+  trading_days_per_year: 252
+
+hyperparameters:
+  learning_rate: 3.0e-4
+  learning_rate_floor: 1.0e-6
+  # phase_aware: hold 3e-4 until DR widening completes (~35M on the 809 50M
+  # schedule), then cosine → floor over the settled remainder. The legacy global
+  # cosine had LR at ~1e-4 by the best-model gate and ~2e-5 at full DR — adaptation
+  # was frozen exactly while fee/lag conditions were still changing (723/724 evidence:
+  # post-gate eval scores declined monotonically and never recovered).
+  lr_schedule: phase_aware
+  batch_size: 16384  # <= n_steps * n_envs; 65536/16384 = 4 mini-batches/epoch × n_epochs 3 = 12 backprop loops/pause
+  n_steps: 4096
+  n_epochs: 3
+  gamma: 0.975
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_finetune: 0.1
+  ent_coef_initial: 0.045
+  ent_coef_finetune: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  weight_decay: 1.0e-3
+
+policy:
+  # Frozen 809 / 809_720_plus: LSTM 64. Do not train 128 (that was 815).
+  lstm_hidden_size: 64
+  n_lstm_layers: 2
+  net_arch_pi: [128, 128]
+  net_arch_vf: [128, 128]
+
+training:
+  timesteps: 50000000
+  n_envs: 16
+  obs_noise: 0.02
+  seed: 0
+  block_size: 126
+  eval_stride: 4
+  eval_n_episodes: 1  # fallback if segment list empty; train.py sets n_eval = #eval blocks
+  eval_freq_steps: 500000          # post fee-ramp eval cadence (global timesteps)
+  eval_freq_pre_gate_steps: 3000000  # pre fee-ramp cadence (best saves gated until ramp end)
+  holdout_days: 365
+  viz_freq: 500000
+  curriculum_update_freq: 50000   # GLOBAL timesteps between curriculum/decomp updates (divided by n_envs internally)
+  checkpoint_save_freq_steps: 1000000
+  reproducible: false        # true → deterministic per-env seed streams (bit-reproducible)
+  early_stop_patience: 12    # 806/809: patience after curriculum (0 = full budget)
+  # Benchmark-relative eval selection (equal-weight daily passive book by default):
+  # score = (1-blend)*mean(excess) + blend*stitched_excess - std_coef*std(excess) - dd_coef*p75(max_dd)
+  best_model_score_std_coef: 0.75
+  best_model_score_dd_coef: 3.0
+  best_model_score_stitched_blend: 0.5  # 0 = segment mean only; 1 = stitched excess only
+  best_model_benchmark: equal_weight_daily  # balanced_6040 | equal_weight_daily
+  # Cohort 809 / 806_720_plus: excess_sharpe with ZERO cash-centering (804 magnets killed alpha).
+  best_model_score_mode: excess_sharpe
+  best_model_worst_regime_cash_coef: 0.0
+  best_model_worst_regime_cash_target: 0.0
+  best_model_mean_cash_coef: 0.0
+  best_model_mean_cash_cap: 1.0
+  # Checkpoint hardening (0 / false = legacy single-eval immediate replace).
+  # Enabled after 723/724: single-eval immediate replacement selected checkpoints at the
+  # first post-gate eval (still mid-DR-widening) on 4 of 6 runs — a noisy score under a
+  # moving training distribution. Trailing-3 median + like-for-like stress blend selects
+  # for sustained quality under fixed adverse (1.5× fee / lag-2) conditions instead.
+  best_model_trailing_evals: 3       # median of last 3 post-gate scores
+  best_model_trailing_agg: median
+  best_model_confirm_evals: 0        # trailing median already suppresses one-eval spikes
+  best_model_stress_suite: true      # blend fixed high-fee/high-lag stress eval (both sides priced)
+  best_model_stress_weight: 0.3
+  # Cohort 729: longer continuous overlays (252→378) so cash-restart burn-in is a
+  # smaller fraction of each slice — short 1y overlays inflated eval cash vs 2y OOS.
+  oos_aligned_eval: true
+  oos_aligned_eval_bars: 378         # ~1.5y continuous per regime
+  oos_aligned_eval_weight: 1.0       # selection fully on multi-regime aggregate
+  multi_regime_eval: true
+  multi_regime_eval_slices: 5        # evenly spaced continuous overlays
+  multi_regime_eval_agg: p25         # p25 | median | min | mean
+  eval_score_burn_in_bars: 21        # ~1 month deploy transient discarded per episode
+
+vec_normalize:
+  norm_obs: true
+  norm_reward_train: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+
+entropy_schedule:
+  explore_ent: 0.045
+  final_ent: 0.001
+  early_floor: 0.01
+  early_floor_high: 0.02
+  warmup_improvements: 5  # logged only (eval NAV); does not gate decay
+  decay_start_fraction: 0.45  # cosine decay starts after fee_ramp_fraction (0.45)
+  dr_lock_fraction: 0.10
+  early_floor_fraction: 0.45  # exploration floors through fee ramp (same milestone as decay start)
+
+# Smoothed curriculum track: spread fee / churn / DR shifts across the 50M run (avoids mid-run cliffs).
+curriculum:
+  budget_short: 50000000
+  budget_long: 120000000
+  # ≤ budget_short: 809 schedule (0.10/0.45): full fees ~22.5M, DR widen → ~35M,
+  # ~15M settled full-DR (patience-12 stop ~41–49M). 810–814 used 0.30 by mistake.
+  fee_free_fraction: 0.10   # ~5M
+  fee_ramp_fraction: 0.45   # ~22.5M
+  churn_ramp_floor: 0.10  # churn scale at fee-ramp start; ramps to 1.0 by fee_ramp_end
+  # 0.25 → DR widen ends ~35M (fee_ramp 22.5M + 12.5M), leaving ~15M stationary full-DR.
+  dr_widen_span_fraction: 0.25
+  # Long-run anchors (≥ budget_long)
+  fee_free_long: 13300000
+  fee_ramp_end_long: 40000000
+  dr_widen_span_long: 30000000
+  # Gate models/best/ saves until this step (null = fee_ramp_end for learn budget).
+  # Eval NAV is always logged; set 0 to disable the gate.
+  best_model_min_step: null
+
+data:
+  since: "2005-01-01"
+  fracdiff_d: 0.4
+  feature_purge_warmup: 25  # neutralize first N bars only where preroll history is unavailable (panel head)
+  # Causal warmup history recomputed per segment in independent mode (sliced off after
+  # feature computation) so EMA-100/MACD/fracdiff are not dominated by truncation
+  # transients inside 126-bar eval blocks.
+  feature_preroll_bars: 252
+  # "continuous": features precomputed on the contiguous panel then sliced into
+  #   train/eval blocks (matches continuous backtest memory; purge NOT applied).
+  # "independent" (default): recompute features per segment over a BOUNDED causal
+  #   preroll window (uniform history depth at every segment head, vs continuous's
+  #   unbounded panel memory). NOTE: the preroll bars ARE the adjacent train blocks,
+  #   so short-memory indicators (RSI-14/MACD-26/EMA-100/vol-20) match continuous
+  #   bit-for-bit once preroll covers their memory — the modes differ mainly in
+  #   fracdiff's long tail and in head-of-panel handling, not in train/eval isolation.
+  #   Only panel-head bars with insufficient preroll are purged.
+  feature_split_mode: independent

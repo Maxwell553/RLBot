@@ -62,6 +62,11 @@ def _clip_redistribute_cap(w: np.ndarray, max_w: float) -> np.ndarray:
     return out
 
 
+def project_long_only_capped(w: np.ndarray, max_w: float) -> np.ndarray:
+    """Public simplex + per-risky-asset cap projection (cash absorbs overflow)."""
+    return _clip_redistribute_cap(w, max_w)
+
+
 def portfolio_weights_two_head(
     action: np.ndarray,
     *,

@@ -39,6 +39,8 @@ from rlbot.research.spec import (  # noqa: E402
     build_variant_config_dict,
     load_spec,
     resolve_variants,
+    spec_cohort_tag,
+    variant_config_header,
 )
 from rlbot.rl_config import load_config  # noqa: E402
 from rlbot.run_artifacts import (  # noqa: E402
@@ -53,7 +55,11 @@ RUNS = REPO / "Runs"
 
 
 def _cohort_dir(cohort: str) -> Path:
-    return RUNS / cohort
+    return RUNS / spec_cohort_tag(cohort)
+
+
+def _spec_cohort(spec: ExperimentSpec) -> str:
+    return spec_cohort_tag(spec.id)
 
 
 def _registry_path(cohort: str) -> Path:
@@ -79,7 +85,7 @@ def _materialize(spec: ExperimentSpec) -> dict:
     over trained runs would silently relabel the plan of record (and refresh the
     spec_sha256 that promote's edit guard checks). Register a new spec id instead.
     """
-    cohort = spec.id
+    cohort = spec_cohort_tag(spec.id)
     cdir = _cohort_dir(cohort)
     prior = _read_json(cdir / "cohort.json")
     if prior:
@@ -105,7 +111,8 @@ def _materialize(spec: ExperimentSpec) -> dict:
     for v in resolve_variants(spec):
         cfg_dict = build_variant_config_dict(base_dict, v.concrete_patch)
         cfg_path = cdir / "configs" / f"{v.variant_id}.yaml"
-        cfg_path.write_text(yaml.safe_dump(cfg_dict, sort_keys=False), encoding="utf-8")
+        body = yaml.safe_dump(cfg_dict, sort_keys=False)
+        cfg_path.write_text(variant_config_header(spec, v) + body, encoding="utf-8")
         load_config(cfg_path)  # validate eagerly (raises on a bad patch value)
         entries.append(
             {
@@ -121,6 +128,7 @@ def _materialize(spec: ExperimentSpec) -> dict:
         )
     cohort_manifest = {
         "cohort": cohort,
+        "spec_id": spec.id,
         "hypothesis": spec.hypothesis,
         "parent": spec.parent,
         "checkpoint_rule": spec.checkpoint_rule,
@@ -162,6 +170,10 @@ def _train_cmd(
         "--seed",
         str(entry["seed"]),
         "--no-viz",
+        # train.py defaults to a post-train OOS backtest. Research OOS is only
+        # the explicit _backtest_cmd at tier ≥ 4; otherwise the holdout is burned
+        # as context=manual (810 leaked six W3/W4 reads this way).
+        "--no-post-backtest",
     ]
     if overwrite_run:
         # Deliberate retry of a crashed/failed (never-scored) variant: train.py's
@@ -326,7 +338,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
     if gates.tier_touches_oos(spec.evaluation_tier):
         _assert_clean_tree_for_oos(getattr(args, "allow_dirty", False))
     cm = _materialize(spec)
-    reg = _registry_path(spec.id)
+    reg = _registry_path(_spec_cohort(spec))
     touches_oos = gates.tier_touches_oos(spec.evaluation_tier)
     tier = int(cm["evaluation_tier"])
     variants = cm["variants"]
@@ -547,9 +559,9 @@ def cmd_promote(args: argparse.Namespace) -> None:
     # the *current* spec/config would silently clobber the plan of record the runs
     # actually trained under. Load the launch-time cohort manifest and verify the
     # spec file is unchanged.
-    cm = _read_json(_cohort_dir(spec.id) / "cohort.json")
+    cm = _read_json(_cohort_dir(_spec_cohort(spec)) / "cohort.json")
     if not cm:
-        raise SystemExit(f"No cohort.json for {spec.id!r}; run `plan`/`launch` first.")
+        raise SystemExit(f"No cohort.json for {_spec_cohort(spec)!r}; run `plan`/`launch` first.")
     spec_now = hashlib.sha256(Path(args.spec).read_bytes()).hexdigest()
     spec_then = cm.get("spec_sha256")
     if spec_then and spec_now != spec_then:
@@ -560,8 +572,8 @@ def cmd_promote(args: argparse.Namespace) -> None:
         )
     entry = next((e for e in cm["variants"] if e["variant_id"] == args.variant), None)
     if entry is None:
-        raise SystemExit(f"variant {args.variant!r} not in cohort {spec.id!r}")
-    reg = _registry_path(spec.id)
+        raise SystemExit(f"variant {args.variant!r} not in cohort {_spec_cohort(spec)!r}")
+    reg = _registry_path(_spec_cohort(spec))
     # Promote means exactly one thing: read the holdout once. Always tier 4 — a
     # tier-5 spec's forward evidence lives in execution/ shadow ledgers, never in
     # the registry, so registry tier>=4 records stay synonymous with holdout reads.
@@ -723,7 +735,7 @@ def cmd_run_queue(args: argparse.Namespace) -> None:
                 modal_gpu=getattr(args, "modal_gpu", None),
             )
             cmd_launch(sub)
-            cmd_report(argparse.Namespace(cohort=spec.id))
+            cmd_report(argparse.Namespace(cohort=_spec_cohort(spec)))
         except SystemExit as exc:
             # cmd_launch exits non-zero on per-variant failures after finishing the
             # sweep — record and keep draining the queue.
@@ -777,7 +789,7 @@ def cmd_screen(args: argparse.Namespace) -> None:
     if not spec.grid:
         raise SystemExit("screen requires a spec with a grid (nothing to halve).")
     cm = _materialize(spec)
-    reg = _registry_path(spec.id)
+    reg = _registry_path(_spec_cohort(spec))
     screen_tier = 1
     ts = int(args.screen_timesteps)
     max_h = (spec.budget or {}).get("max_modal_hours")
@@ -833,7 +845,7 @@ def cmd_screen(args: argparse.Namespace) -> None:
         "ranking": [{"group_id": g, "median_best_eval_score": v} for g, v in ranked],
         "advance": advance,
     }
-    out_path = _cohort_dir(spec.id) / "screen_ranking.json"
+    out_path = _cohort_dir(_spec_cohort(spec)) / "screen_ranking.json"
     out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"\n[research] screen ranking ({len(ranked)} group(s); advancing top {keep_n}):")
     for g, v in ranked:

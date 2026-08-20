@@ -98,7 +98,16 @@ def load_vec_normalize_for_inference(
     venv: VecEnv,
 ) -> VecNormalize:
     """Load frozen training observation statistics (``vec_normalize.pkl``)."""
-    vec_env = VecNormalize.load(str(Path(stats_path).resolve()), venv)
+    path = Path(stats_path).resolve()
+    try:
+        vec_env = VecNormalize.load(str(path), venv)
+    except TimeoutError as e:
+        raise TimeoutError(
+            f"Timed out reading {path} (errno {getattr(e, 'errno', '?')}). "
+            "If this repo lives on iCloud Desktop, the pickle is catalogued but "
+            "not downloaded — Finder → download the Runs/ tree, or copy it off Desktop, "
+            "then retry."
+        ) from e
     return freeze_vec_normalize_for_inference(vec_env)
 
 

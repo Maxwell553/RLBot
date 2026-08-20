@@ -1,18 +1,37 @@
 #!/usr/bin/env bash
-# Install a weekday LaunchAgent that runs scripts/daily_live_forward.sh at 18:15 ET.
+# Install a KeepAlive LaunchAgent for the headless forward collector.
+#
+# Writes 5m NAV marks + paper/shadow ledgers to execution/ even when the
+# frontend is closed. Replaces the old weekday-18:15-only job.
+#
+#   bash scripts/install_live_forward_launchd.sh
+#   python scripts/live_forward_loop.py --once     # one tick now
+#   python scripts/live_forward_loop.py --status
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.markettrainer.live-forward"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+SUPPORT="$HOME/Library/Application Support/MarketTrainer"
+TRAMPOLINE="$SUPPORT/live_forward_loop.sh"
 LOG_DIR="$ROOT/execution/logs"
-mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents" "$SUPPORT"
 
-RUN_ID="${MARKETTRAINER_LIVE_RUN_ID:-LIVE_MODEL}"
-PYTHON_BIN="$ROOT/.venv/bin/python"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(command -v python3)"
-fi
+RUN_ID="${MARKETTRAINER_LIVE_RUN_ID:-RLModel}"
+
+# Copy the stdlib collector off iCloud Desktop — LaunchAgents get
+# "Operation not permitted" opening files under ~/Desktop.
+cp "$ROOT/scripts/frontend_api_lite.py" "$SUPPORT/frontend_api_lite.py"
+cat >"$TRAMPOLINE" <<EOF
+#!/bin/bash
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+export MARKETTRAINER_LIVE_RUN_ID=${RUN_ID}
+export MARKETTRAINER_ROOT="${ROOT}"
+cd /tmp || exit 1
+exec /usr/bin/python3 "${SUPPORT}/frontend_api_lite.py" --collect-loop --interval 300
+EOF
+chmod +x "$TRAMPOLINE"
 
 cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,42 +41,40 @@ cat >"$PLIST" <<EOF
   <key>Label</key>
   <string>${LABEL}</string>
   <key>WorkingDirectory</key>
-  <string>${ROOT}</string>
+  <string>/tmp</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${ROOT}/scripts/daily_live_forward.sh</string>
-    <string>--run-id</string>
-    <string>${RUN_ID}</string>
+    <string>${TRAMPOLINE}</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${ROOT}/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>MARKETTRAINER_LIVE_RUN_ID</key>
-    <string>${RUN_ID}</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
-  </array>
-  <key>StandardOutPath</key>
-  <string>${LOG_DIR}/launchd_stdout.log</string>
-  <key>StandardErrorPath</key>
-  <string>${LOG_DIR}/launchd_stderr.log</string>
+  <key>KeepAlive</key>
+  <true/>
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/forward_loop_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/forward_loop_stderr.log</string>
 </dict>
 </plist>
 EOF
 
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
+echo "Unload:     launchctl bootout gui/\$UID $PLIST"
+
+# Start the TCC-holding collector first so it owns the lock, then KeepAlive
+# LaunchAgent (waits on the lock; takes over after reboot / collector exit).
+bash "$ROOT/scripts/start_forward_collector.sh"
+
+launchctl bootout "gui/${UID}" "$PLIST" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+if ! launchctl bootstrap "gui/${UID}" "$PLIST" 2>/dev/null; then
+  launchctl load "$PLIST"
+fi
 echo "Installed $PLIST"
-echo "Runs weekdays 18:15 local time for run_id=$RUN_ID"
-echo "Test now:  bash $ROOT/scripts/daily_live_forward.sh --run-id $RUN_ID"
-echo "Unload:    launchctl unload $PLIST"
+echo "Trampoline: $TRAMPOLINE"
+echo "KeepAlive collector every 5 minutes (Yahoo 5m + paper + RLModel shadow)."
+echo "Active RL shadow run_id=$RUN_ID (after 18:00 ET, or immediately if the ledger is a cash reset)."
+echo "Status:     python $ROOT/scripts/live_forward_loop.py --status"
+echo "One tick:   python $ROOT/scripts/live_forward_loop.py --once"
+echo "Unload:     launchctl bootout gui/\$UID $PLIST"

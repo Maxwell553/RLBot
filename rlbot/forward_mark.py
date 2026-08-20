@@ -430,6 +430,7 @@ def resolve_active_forward_run_id(root: Path | None = None) -> str | None:
         name = path.name.removeprefix("forward_mark_").removesuffix(".json")
         # LIVE_* RL deploy marks, GeneralEquity1 / CrestDay, or legacy algo ids.
         if name.startswith("LIVE_") or name in {
+            "RLModel",
             "GENERAL_EQUITY1",
             "GENERAL_EQUITY",
             "CREST_DAY",

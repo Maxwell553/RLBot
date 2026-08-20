@@ -8,6 +8,7 @@ import pandas as pd
 
 from rlbot.forward_live import (
     _ew_nav,
+    _fill_ohlc_nans,
     _merge_price_history,
     _nav_from_weights,
     _nav_series_from_ohlc,
@@ -15,7 +16,9 @@ from rlbot.forward_live import (
     _spy_nav,
     _weight_vector,
     equal_weight_ohlc_candles,
+    offhours_extend_until,
     portfolio_ohlc_candles,
+    prices_are_stale,
     spy_ohlc_candles,
 )
 
@@ -149,3 +152,201 @@ def test_merge_price_history_unions_and_prefers_fresh() -> None:
     assert abs(float(o[1, 0]) - 9.0) < 1e-9  # fresh overlap
     assert abs(float(o[2, 0]) - 3.0) < 1e-9
     assert abs(float(so[1]) - 29.0) < 1e-9
+
+
+def test_offhours_extend_refuses_mid_session_gap() -> None:
+    """A Thursday 10:32 last print must not invent bars through later sessions."""
+    last = pd.Timestamp("2026-08-06 10:32")  # Thursday, mid-RTH
+    # Same evening
+    assert offhours_extend_until(last, pd.Timestamp("2026-08-06 22:00")) is None
+    # Following week
+    assert offhours_extend_until(last, pd.Timestamp("2026-08-12 10:32")) is None
+
+
+def test_offhours_extend_allows_same_evening_after_close() -> None:
+    last = pd.Timestamp("2026-08-06 15:55")  # Thursday close
+    until = offhours_extend_until(last, pd.Timestamp("2026-08-06 22:00"))
+    assert until is not None
+    assert until == pd.Timestamp("2026-08-06 22:00")
+
+
+def test_offhours_extend_weekend_from_friday_close() -> None:
+    last = pd.Timestamp("2026-08-07 15:55")  # Friday close
+    until = offhours_extend_until(last, pd.Timestamp("2026-08-09 18:00"))  # Sunday
+    assert until is not None
+    assert until == pd.Timestamp("2026-08-09 18:00")
+
+
+def test_prices_stale_after_missed_session() -> None:
+    last = pd.Timestamp("2026-08-06 10:32")
+    assert prices_are_stale(last, pd.Timestamp("2026-08-06 22:00"))
+    assert prices_are_stale(last, pd.Timestamp("2026-08-12 10:32"))
+    friday_close = pd.Timestamp("2026-08-07 15:55")
+    assert not prices_are_stale(friday_close, pd.Timestamp("2026-08-09 18:00"))
+
+
+def test_fill_ohlc_nans_uses_cache_then_flat() -> None:
+    o = np.array([[1.0, np.nan], [1.1, np.nan]], dtype=np.float64)
+    spy = np.array([10.0, np.nan], dtype=np.float64)
+    filled_o, filled_spy = _fill_ohlc_nans(o, spy)
+    assert filled_o.shape == (2, 2)
+    assert abs(float(filled_o[0, 1]) - 1.0) < 1e-9  # empty col → 1.0
+    assert abs(float(filled_spy[1]) - 10.0) < 1e-9
+    assert filled_spy.ndim == 1
+
+
+def test_last_invested_shadow_weights_skips_reset_stub(tmp_path) -> None:
+    from rlbot.forward_live import last_invested_shadow_weights
+
+    path = tmp_path / "shadow_ledger_RLModel.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                '{"target_weights": {"CASH": 0.1, "GOLD": 0.9}, "note": null}',
+                '{"target_weights": {"CASH": 1.0}, "note": "Reset to 100k cash (flat paper book)."}',
+                '{"target_weights": {"CASH": 0.06, "GOLD": 0.2, "OIL": 0.2}, "note": null}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    w = last_invested_shadow_weights(path)
+    assert w is not None
+    assert abs(w["CASH"] - 0.06) < 1e-9
+    assert abs(w["GOLD"] - 0.2) < 1e-9
+
+    path.write_text(
+        '{"target_weights": {"CASH": 1.0}, "note": "Reset to 100k cash (flat paper book)."}\n',
+        encoding="utf-8",
+    )
+    assert last_invested_shadow_weights(path) is None
+
+
+def test_portfolio_ohlc_switches_weights_mid_series() -> None:
+    open_ = np.array([[100.0], [100.0], [110.0]], dtype=np.float64)
+    high = open_.copy()
+    low = open_.copy()
+    close = np.array([[100.0], [110.0], [121.0]], dtype=np.float64)
+    cash = _weight_vector({"Cash": 1.0}, ["Cash", "A"])
+    long_a = _weight_vector({"Cash": 0.0, "A": 1.0}, ["Cash", "A"])
+    W = np.vstack([cash, long_a, long_a])
+    candles = portfolio_ohlc_candles(
+        open_, high, low, close, W, initial_cash=100_000.0, cash_yield_per_bar=0.0
+    )
+    assert abs(candles[0, 3] - 100_000.0) < 1e-6
+    # Rebalance to 100% A at bar 1 open; close 110 vs prior close 100.
+    assert abs(candles[1, 3] - 110_000.0) < 1e-6
+    assert abs(candles[2, 3] / candles[1, 3] - 121.0 / 110.0) < 1e-9
+
+
+def test_mtm_from_start_is_flat_cash_until_start() -> None:
+    from rlbot.forward_live import mtm_ohlc_from_start
+
+    open_ = np.array([[100.0], [100.0], [110.0]], dtype=np.float64)
+    high = open_.copy()
+    low = open_.copy()
+    close = np.array([[100.0], [100.0], [110.0]], dtype=np.float64)
+    long_a = _weight_vector({"Cash": 0.0, "A": 1.0}, ["Cash", "A"])
+    W = np.vstack([long_a, long_a, long_a])
+    times = pd.DatetimeIndex(["2026-08-14 15:55", "2026-08-17 09:30", "2026-08-17 09:35"])
+    candles = mtm_ohlc_from_start(
+        open_,
+        high,
+        low,
+        close,
+        W,
+        times=times,
+        start=pd.Timestamp("2026-08-17 09:30"),
+        initial_cash=100_000.0,
+        cash_yield_per_bar=0.001,
+    )
+    assert abs(candles[0, 3] - 100_000.0) < 1e-6
+    assert abs(candles[1, 0] - 100_000.0) < 1e-6
+
+
+def test_lots_ohlc_marks_held_shares_not_rebalanced_weights() -> None:
+    from rlbot.forward_live import lots_ohlc_candles
+
+    # One share of A bought at the second bar; cash leftover 50k.
+    open_ = np.array([[100.0], [100.0], [110.0]], dtype=np.float64)
+    high = open_.copy()
+    low = open_.copy()
+    close = np.array([[100.0], [100.0], [110.0]], dtype=np.float64)
+    times = pd.DatetimeIndex(["2026-08-03 09:30", "2026-08-03 12:05", "2026-08-04 09:30"])
+    candles = lots_ohlc_candles(
+        open_,
+        high,
+        low,
+        close,
+        cash=50_000.0,
+        quantities=np.array([500.0]),
+        times=times,
+        start=pd.Timestamp("2026-08-03 12:05"),
+        initial_cash=100_000.0,
+    )
+    assert abs(candles[0, 3] - 100_000.0) < 1e-6
+    assert abs(candles[1, 3] - 100_000.0) < 1e-6  # 50k cash + 500*100
+    assert abs(candles[2, 3] - 105_000.0) < 1e-6  # 50k + 500*110
+
+
+def test_weight_matrix_from_events_cash_until_start_then_switches() -> None:
+    from rlbot.forward_live import weight_matrix_from_events
+
+    times = pd.DatetimeIndex(
+        [
+            "2026-08-14 15:55",
+            "2026-08-17 09:30",
+            "2026-08-18 15:37",
+            "2026-08-18 15:40",
+            "2026-08-18 15:45",
+        ]
+    )
+    events = [
+        (pd.Timestamp("2026-08-14 16:00"), {"CASH": 1.0, "GOLD": 0.0, "OIL": 0.0}),
+        (pd.Timestamp("2026-08-18 15:37"), {"CASH": 0.0, "GOLD": 1.0, "OIL": 0.0}),
+        (pd.Timestamp("2026-08-18 15:40"), {"CASH": 0.0, "GOLD": 0.0, "OIL": 1.0}),
+    ]
+    W = weight_matrix_from_events(
+        times,
+        events,
+        ["Cash", "GOLD", "OIL"],
+        start=pd.Timestamp("2026-08-17 09:30"),
+    )
+    assert abs(W[0, 0] - 1.0) < 1e-9  # before start: cash
+    assert abs(W[1, 0] - 1.0) < 1e-9  # after start, before first record: cash
+    assert abs(W[2, 1] - 1.0) < 1e-9  # recorded GOLD book
+    assert abs(W[3, 2] - 1.0) < 1e-9  # later ledger row switches the book
+    assert abs(W[4, 2] - 1.0) < 1e-9
+
+
+def test_resolve_live_model_start_after_close() -> None:
+    from rlbot.forward_live import resolve_live_model_start
+
+    existing = {"live_model_start": "2026-08-17T09:30"}
+    ts = resolve_live_model_start(existing, None)
+    assert str(ts.date()) == "2026-08-17"
+    assert ts.hour == 9 and ts.minute == 30
+
+
+def test_paper_lots_start_ignores_later_mark_timestamp() -> None:
+    from rlbot.forward_live import paper_lots_start_from_state
+
+    fill = paper_lots_start_from_state(
+        {
+            "last_trade_date": "2026-08-03",
+            "updated_at_utc": "2026-08-03T16:04:26+00:00",
+        }
+    )
+    assert fill is not None
+    assert str(fill.date()) == "2026-08-03"
+    assert fill.hour == 12 and fill.minute == 4
+
+    later_mark = paper_lots_start_from_state(
+        {
+            "last_trade_date": "2026-08-03",
+            "updated_at_utc": "2026-08-18T20:30:00+00:00",
+        }
+    )
+    assert later_mark is not None
+    assert str(later_mark.date()) == "2026-08-03"
+    assert later_mark.hour == 9 and later_mark.minute == 30

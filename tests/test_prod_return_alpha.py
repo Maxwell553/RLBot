@@ -48,3 +48,17 @@ def test_week_and_month_end_masks() -> None:
     assert wk.dtype == np.bool_
     assert me.any()
     assert wk.any()
+
+
+def test_session_rebalance_flags_live_tip() -> None:
+    from rlbot.prod_return_alpha import session_rebalance_flags
+
+    days = [date(2026, 8, 13), date(2026, 8, 14), date(2026, 8, 17), date(2026, 8, 18)]
+    # Thursday → Friday same week
+    assert session_rebalance_flags(days, 0) == (False, False)
+    # Friday Aug 14 is week-end (next bar is Monday)
+    assert session_rebalance_flags(days, 1) == (True, False)
+    # Tuesday live tip is not week/month end
+    assert session_rebalance_flags(days, 3) == (False, False)
+    friday_month_end = [date(2026, 7, 30), date(2026, 7, 31)]
+    assert session_rebalance_flags(friday_month_end, 1) == (True, True)

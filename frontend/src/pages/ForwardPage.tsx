@@ -15,7 +15,6 @@ import { useAutoRefresh } from '../lib/use-auto-refresh'
 const SERIES = [
   { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
-  { key: 'crypto' as const, label: 'CrestDay', color: '#6b4f9a' },
   { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#5c6b7a' },
   { key: 'spy' as const, label: 'S&P (SPY)', color: '#c45c3e' },
 ]
@@ -32,7 +31,7 @@ const RANGE_OPTIONS = [
 type RangeId = (typeof RANGE_OPTIONS)[number]['id']
 type SeriesKey = (typeof SERIES)[number]['key']
 
-/** UI poll; soft loads hit the live lite API and kick a Yahoo rewrite in the background. */
+/** UI poll; 5m marks and paper/shadow logs are written by the headless collector. */
 const FORWARD_POLL_MS = 20_000
 const BARS_PER_YEAR_5M = 78 * 252
 /** Hide annualized Sharpe until we have ~1 trading month of daily closes. */
@@ -357,14 +356,15 @@ function cashSessionEndIndex(stamps: string[]): number | null {
   return null
 }
 
-function shortDate(iso: string, opts: { timeOnly?: boolean } = {}): string {
+function shortDate(iso: string, opts: { timeOnly?: boolean; dateOnly?: boolean } = {}): string {
   const d = parseTs(iso)
   if (Number.isNaN(d.getTime())) return iso.slice(5, 16)
   const hasTime = iso.includes('T') || iso.length > 10
   if (hasTime && opts.timeOnly) {
     return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
   }
-  if (hasTime) {
+  // Weekly/monthly (and longer) axes: date only. Times belong on the 1D chart.
+  if (hasTime && !opts.dateOnly) {
     return d.toLocaleString(undefined, {
       month: 'short',
       day: 'numeric',
@@ -387,7 +387,6 @@ type HoverPoint = {
   date: string
   model: number | null
   live_model: number | null
-  crypto: number | null
   equal_weight: number | null
   spy: number | null
 }
@@ -434,7 +433,8 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
 
   const width = 760
   const height = 320
-  const margin = { top: 16, right: 28, bottom: 44, left: 64 }
+  // Left gutter must clear "$104,000"-style ticks; the card title already says NAV.
+  const margin = { top: 16, right: 28, bottom: 44, left: 76 }
   const innerW = width - margin.left - margin.right
   const innerH = height - margin.top - margin.bottom
 
@@ -473,7 +473,6 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       date: plot.stamps[idx] ?? `bar ${idx + 1}`,
       model: at('model'),
       live_model: at('live_model'),
-      crypto: at('crypto'),
       equal_weight: at('equal_weight'),
       spy: at('spy'),
     })
@@ -562,16 +561,6 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
         />
 
         <text
-          x={14}
-          y={margin.top + innerH / 2}
-          textAnchor="middle"
-          transform={`rotate(-90 14 ${margin.top + innerH / 2})`}
-          className="fill-ink/45"
-          style={{ fontSize: 10, fontFamily: 'var(--font-sans), sans-serif' }}
-        >
-          NAV ($)
-        </text>
-        <text
           x={margin.left + innerW / 2}
           y={height - 6}
           textAnchor="middle"
@@ -584,7 +573,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
         {xTicks.map((i) => {
           const x = xAt(i)
           const label = plot.stamps[i]
-            ? shortDate(plot.stamps[i], { timeOnly: plot.timeOnly })
+            ? shortDate(plot.stamps[i], plot.timeOnly ? { timeOnly: true } : { dateOnly: true })
             : String(i + 1)
           const anchor = i === 0 ? 'start' : i === plot.n - 1 ? 'end' : 'middle'
           return (
@@ -731,7 +720,6 @@ function StatsCard({
 const ALLOCATION_TABS = [
   { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
-  { key: 'crypto' as const, label: 'CrestDay', color: '#6b4f9a' },
 ]
 
 function WeightsPanel({ mark }: { mark: ApiForwardMark }) {
@@ -962,7 +950,8 @@ export function ForwardPage() {
   const [range, setRange] = useState<RangeId>('1d')
 
   const reload = useCallback(async (mode: 'soft' | 'poll' | 'force' = 'soft') => {
-    // Only explicit user refresh hits Yahoo via force_refresh; soft/poll use /data.
+    // Soft/poll hit /api/forward (clock touch + background Yahoo when prices are
+    // stale). Only the explicit refresh button sends force_refresh=1.
     const force = mode === 'force'
     if (mode === 'soft') {
       setState((current) => (current.kind === 'live' ? current : { kind: 'loading' }))
@@ -1016,9 +1005,10 @@ export function ForwardPage() {
           <p className="font-mono text-[11px] uppercase tracking-[.2em] text-ink/55">Forward test</p>
           <h1 className="mt-2 font-display text-3xl text-ink">Live book vs benchmarks</h1>
           <p className="mt-2 max-w-2xl text-sm text-ink/60">
-            Five-minute NAV marks from the live paper book (GENERAL_EQUITY1 / GeneralEquity1,
-            CrestDay, or a LIVE_* RL deploy) vs equal-weight and SPY. Soft loads hit the live
-            API; Refresh forces a Yahoo rewrite.
+            Five-minute NAV marks from the live paper book (GENERAL_EQUITY1 / GeneralEquity1
+            or a LIVE_* RL deploy) vs equal-weight and SPY. A backend collector writes
+            prices and trades to execution/ even when this page is closed. Refresh still
+            forces a Yahoo rewrite.
           </p>
           {state.kind === 'live' && refreshing && (
             <p className="mt-2 text-[11px] text-ink/55">Refreshing forward mark…</p>
@@ -1049,15 +1039,15 @@ export function ForwardPage() {
           <Badge tone="warning">No forward mark</Badge>
           <p className="mt-3 text-sm text-ink/70">{emptyMessage}</p>
           <pre className="mt-4 overflow-x-auto rounded-xl bg-ink/[.04] p-4 text-[11px] leading-5 text-ink/80">
-{`# Locked GeneralEquity1 pack (TQQQ+QQQ hybrid + GLD/TLT dual)
-python scripts/paper_prod_return_alpha.py run-day --refresh-data
-# or: bash scripts/daily_paper_prod_return_alpha.sh
+{`# Headless collector (5m marks + paper/shadow caches, no UI required)
+python scripts/live_forward_loop.py --once
+bash scripts/install_live_forward_launchd.sh
 
-# CrestDay companion (pack NAV, $100k):
-python scripts/paper_crest_day.py run-day
+# Locked GeneralEquity1 pack (TQQQ+QQQ hybrid + GLD/TLT dual)
+python scripts/paper_prod_return_alpha.py run-day --refresh-data
 
 # Companion RL LIVE deploy mark:
-python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data`}
+python scripts/forward_mark.py --run-id RLModel --refresh-data`}
           </pre>
         </Card>
       )}
@@ -1066,6 +1056,14 @@ python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data`}
         <>
           <div className="mt-6 flex flex-wrap items-center gap-3 text-[11px] text-ink/60">
             <Badge tone="success">{mark.bar_interval ? `${mark.bar_interval} marks` : 'Live MTM'}</Badge>
+            {mark.live?.collector?.running ? (
+              <Badge tone="success">collector live</Badge>
+            ) : null}
+            {mark.live?.prices_stale ? (
+              <Badge tone="warning">
+                Prices stale{mark.live.last_price_bar ? ` since ${mark.live.last_price_bar}` : ''}
+              </Badge>
+            ) : null}
             <span className="font-mono text-ink/80">{mark.run_id}</span>
             <span>· checkpoint {mark.checkpoint_label}</span>
             <span>· as of {asOf}</span>

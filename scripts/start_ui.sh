@@ -34,4 +34,6 @@ if [[ ! -e node_modules ]]; then
   echo "[start_ui] Installing frontend dependencies…"
   npm install
 fi
+# 5m forward collector (survives closing the browser; needs this shell's Desktop TCC).
+bash "$ROOT/scripts/start_forward_collector.sh" || true
 exec npm run dev "$@"

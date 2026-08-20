@@ -60,8 +60,10 @@ def test_research_retry_passes_overwrite_run() -> None:
     import scripts.research as research
 
     entry = {"config_path": "c.yaml", "run_id": "r", "seed": 1, "window": {}}
-    spec = research.load_spec(PROJECT_ROOT / "specs" / "feature_split_ab.yaml")
-    assert "--overwrite-run" not in research._train_cmd(entry, spec)
+    spec = research.ExperimentSpec(id="811", evaluation_tier=3, timesteps=1_000_000)
+    cmd = research._train_cmd(entry, spec)
+    assert "--overwrite-run" not in cmd
+    assert "--no-post-backtest" in cmd
     assert "--overwrite-run" in research._train_cmd(entry, spec, overwrite_run=True)
     src = (PROJECT_ROOT / "scripts" / "research.py").read_text(encoding="utf-8")
     assert "overwrite_run=stale_run_dir" in src, (

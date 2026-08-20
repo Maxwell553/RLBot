@@ -27,7 +27,8 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext as _nullcontext
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -52,12 +53,13 @@ from rlbot.run_artifacts import (
     RUNS_ROOT,
     RunPaths,
     config_sha256,
-    discover_run_ids_with_models,
+    discover_ensemble_run_ids,
     git_provenance,
     read_run_manifest,
     resolve_data_cache,
     resolve_run_data_cache,
     sha256_file,
+    walk_forward_group_ids,
 )
 from rlbot.baselines import (
     balanced_6040_nav,
@@ -74,6 +76,15 @@ from rlbot.inference_load import (
     load_recurrent_ppo_inference,
     load_vec_normalize_for_inference,
     swap_recurrent_ppo_weights,
+)
+from rlbot.inference_overlay import (
+    InferenceOverlay,
+    OverlaySpec,
+    default_overlay_grid,
+    overlay_kill_reasons,
+    overlay_spec_to_dict,
+    parse_overlay_names,
+    spec_from_cli,
 )
 from rlbot.rl_config import get_config, load_config, observation_dim_for_universe, set_config
 from rlbot.stats import (
@@ -285,6 +296,8 @@ class BacktestResult:
     ret_skew: float = float("nan")
     ret_kurt: float = float("nan")
     portfolio_diagnostics: dict | None = None
+    weight_panel: np.ndarray | None = field(default=None, repr=False, compare=False)
+    nav_path: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 def _resolve_model_path_for_run(
@@ -313,28 +326,15 @@ def _resolve_model_path_for_run(
     )
 
 
-def discover_ensemble_run_ids(prefix: str, seeds: list[int] | None = None) -> list[str]:
-    """``Runs/<prefix>_seed_<n>/`` (or legacy ``models/``), sorted by seed then name."""
-    if not prefix:
-        return []
-    found: list[tuple[int, str]] = []
-    pat = re.compile(rf"^{re.escape(prefix)}_seed_(\d+)$")
-    for rid in discover_run_ids_with_models():
-        m = pat.match(rid)
-        if not m:
-            continue
-        seed = int(m.group(1))
-        if seeds is not None and seed not in seeds:
-            continue
-        found.append((seed, rid))
-    found.sort(key=lambda x: x[0])
-    return [name for _, name in found]
-
-
 def _seed_from_run_id(run_id: str, prefix: str) -> str:
     m = re.search(r"_seed_(\d+)$", run_id)
     if m:
         return m.group(1)
+    m = re.search(r"_s(\d+)$", run_id)
+    if m:
+        return m.group(1)
+    if prefix and run_id == prefix:
+        return "0"
     return run_id.removeprefix(prefix + "_seed_") if run_id.startswith(prefix + "_seed_") else run_id
 
 
@@ -780,8 +780,79 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
     )
     _bt_log(f"[backtest] Rollout done ({time.perf_counter() - t_roll:.1f}s).")
 
+    baseline_navs = navs
+    baseline_weights = w_opt
+    overlay_spec = _overlay_spec_from_args(args)
+    if overlay_spec is not None and w_opt is not None and w_opt.size > 0:
+        _bt_log(f"[backtest] Replaying 809 weights with overlay {overlay_spec.name}...")
+        navs, start_bar, n_rew, w_opt = _replay_weight_panel_on_slice(
+            args,
+            weights=w_opt,
+            overlay=overlay_spec,
+            test_idx=test_idx,
+            test_ohlcv=test_ohlcv,
+            test_rsi=test_rsi,
+            test_macd=test_macd,
+            test_macro=test_macro,
+            test_fd=test_fd,
+            test_fdm=test_fdm,
+            test_trend=test_trend,
+            test_asset_vol=test_avol,
+            test_macro_vol=test_mvol,
+            test_asset_live=test_live,
+            obs_lag=obs_lag,
+            progress=progress,
+            progress_label=f"overlay {overlay_spec.name}",
+            include_final_close=bool(getattr(args, "export_forward_mark", False)),
+        )
+        _bt_log(f"[backtest] Overlay {overlay_spec.name} replay done.")
+
+    if bool(getattr(args, "overlay_grid", False)) and baseline_weights is not None and baseline_weights.size > 0:
+        _run_overlay_grid(
+            args,
+            run_id=run_id,
+            baseline_navs=baseline_navs,
+            baseline_weights=baseline_weights,
+            test_idx=test_idx,
+            test_ohlcv=test_ohlcv,
+            test_rsi=test_rsi,
+            test_macd=test_macd,
+            test_macro=test_macro,
+            test_fd=test_fd,
+            test_fdm=test_fdm,
+            test_trend=test_trend,
+            test_asset_vol=test_avol,
+            test_macro_vol=test_mvol,
+            test_asset_live=test_live,
+            obs_lag=obs_lag,
+            panel_tickers=panel_tickers,
+            progress=progress,
+            include_final_close=bool(getattr(args, "export_forward_mark", False)),
+        )
+
+    if getattr(args, "_keep_replay_ctx", False):
+        args._replay_ctx = {  # type: ignore[attr-defined]
+            "test_idx": test_idx,
+            "test_ohlcv": test_ohlcv,
+            "test_rsi": test_rsi,
+            "test_macd": test_macd,
+            "test_macro": test_macro,
+            "test_fd": test_fd,
+            "test_fdm": test_fdm,
+            "test_trend": test_trend,
+            "test_asset_vol": test_avol,
+            "test_macro_vol": test_mvol,
+            "test_asset_live": test_live,
+            "obs_lag": obs_lag,
+            "include_final_close": bool(getattr(args, "export_forward_mark", False)),
+            "panel_tickers": list(panel_tickers),
+        }
+
     nav_ensemble: np.ndarray | None = None
-    n_stoch = int(args.stochastic_paths)
+    overlay_active = overlay_spec is not None or bool(getattr(args, "overlay_grid", False))
+    n_stoch = 0 if overlay_active else int(args.stochastic_paths)
+    if overlay_active and int(args.stochastic_paths) > 0:
+        _bt_log("[backtest] Skipping stochastic paths (overlay replay is the scored book).")
     if n_stoch > 0 and not getattr(args, "_ensemble_mode", False):
         _bt_log(
             f"[backtest] Stochastic ensemble: {n_stoch} paths "
@@ -849,6 +920,8 @@ def run_oos_backtest(args: argparse.Namespace) -> BacktestResult:
         ret_skew=ret_skew,
         ret_kurt=ret_kurt,
         portfolio_diagnostics=portfolio_diagnostics,
+        weight_panel=w_opt if w_opt is not None and w_opt.size > 0 else None,
+        nav_path=navs,
     )
 
     if not args.no_viz and not getattr(args, "_ensemble_mode", False):
@@ -1275,6 +1348,188 @@ def _deflated_sharpe_for_result(result: BacktestResult, n_trials: int) -> float 
     return dsr if np.isfinite(dsr) else None
 
 
+def _overlay_spec_from_args(args: argparse.Namespace) -> OverlaySpec | None:
+    raw = str(getattr(args, "overlay", "") or "").strip()
+    if not raw:
+        return None
+    names = parse_overlay_names(raw)
+    cap = float(get_config().environment.max_single_asset_weight)
+    return spec_from_cli(
+        names=names,
+        vol_target=float(getattr(args, "overlay_vol_target", 0.11)),
+        trend_fast=int(getattr(args, "overlay_trend_fast", 65)),
+        trend_slow=int(getattr(args, "overlay_trend_slow", 200)),
+        ew_alpha=float(getattr(args, "overlay_ew_alpha", 0.25)),
+        max_single_asset_weight=cap,
+    )
+
+
+def _result_public_dict(result: BacktestResult) -> dict:
+    d = asdict(result)
+    d.pop("weight_panel", None)
+    d.pop("nav_path", None)
+    d["model_path"] = str(result.model_path)
+    return d
+
+
+def _metrics_from_navs(navs: np.ndarray) -> tuple[float, float, float]:
+    navs = np.asarray(navs, dtype=np.float64)
+    log_rets = np.diff(np.log(np.maximum(navs, 1e-12)))
+    total_return = float(navs[-1] / max(navs[0], 1e-12) - 1.0)
+    sharpe = _sharpe_ann_from_log_rets(log_rets)
+    return total_return, float(sharpe), _max_drawdown(navs)
+
+
+def _replay_weight_panel_on_slice(
+    args: argparse.Namespace,
+    *,
+    weights: np.ndarray,
+    overlay: OverlaySpec | None,
+    test_idx: pd.DatetimeIndex,
+    test_ohlcv: np.ndarray,
+    test_rsi: np.ndarray,
+    test_macd: np.ndarray,
+    test_macro: np.ndarray,
+    test_fd: np.ndarray,
+    test_fdm: np.ndarray,
+    test_trend: np.ndarray,
+    test_asset_vol: np.ndarray,
+    test_macro_vol: np.ndarray,
+    test_asset_live: np.ndarray,
+    obs_lag: int,
+    progress: bool,
+    progress_label: str,
+    include_final_close: bool,
+) -> tuple[np.ndarray, int, int, np.ndarray | None]:
+    ensure_backtest_dependencies()
+    dummy_vn = Path(".")
+    return rollout_policy_on_slice(
+        None,
+        test_idx=test_idx,
+        test_ohlcv=test_ohlcv,
+        test_rsi=test_rsi,
+        test_macd=test_macd,
+        test_macro=test_macro,
+        test_fd=test_fd,
+        test_fdm=test_fdm,
+        test_trend=test_trend,
+        test_asset_vol=test_asset_vol,
+        test_macro_vol=test_macro_vol,
+        test_asset_live=test_asset_live,
+        obs_lag=obs_lag,
+        vec_norm_path=dummy_vn,
+        use_vec_norm=False,
+        collect_weights=True,
+        progress=progress,
+        progress_label=progress_label,
+        min_bars=10,
+        include_final_close=include_final_close,
+        overlay=overlay,
+        weight_override_panel=weights,
+    )
+
+
+def _run_overlay_grid(
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    baseline_navs: np.ndarray,
+    baseline_weights: np.ndarray,
+    test_idx: pd.DatetimeIndex,
+    test_ohlcv: np.ndarray,
+    test_rsi: np.ndarray,
+    test_macd: np.ndarray,
+    test_macro: np.ndarray,
+    test_fd: np.ndarray,
+    test_fdm: np.ndarray,
+    test_trend: np.ndarray,
+    test_asset_vol: np.ndarray,
+    test_macro_vol: np.ndarray,
+    test_asset_live: np.ndarray,
+    obs_lag: int,
+    panel_tickers: list[str],
+    progress: bool,
+    include_final_close: bool,
+) -> list[dict]:
+    from rlbot.portfolio_metrics import summarize_weight_panel
+
+    cap = float(get_config().environment.max_single_asset_weight)
+    base_ret, base_sharpe, base_dd = _metrics_from_navs(baseline_navs)
+    rows: list[dict] = []
+    print(f"\n=== Overlay grid vs {run_id} (kill if mean cash ≥ 25% or return < 90% of 809) ===")
+    print(
+        f"{'overlay':<22} {'return %':>10} {'Sharpe':>8} {'max DD %':>10} "
+        f"{'mean cash':>10}  verdict"
+    )
+    print(
+        f"{'809 (raw)':<22} {base_ret * 100:>10.2f} {base_sharpe:>8.2f} "
+        f"{base_dd * 100:>10.2f} {'—':>10}  keep"
+    )
+    for spec in default_overlay_grid(max_single_asset_weight=cap):
+        navs, _, _, w_arr = _replay_weight_panel_on_slice(
+            args,
+            weights=baseline_weights,
+            overlay=spec,
+            test_idx=test_idx,
+            test_ohlcv=test_ohlcv,
+            test_rsi=test_rsi,
+            test_macd=test_macd,
+            test_macro=test_macro,
+            test_fd=test_fd,
+            test_fdm=test_fdm,
+            test_trend=test_trend,
+            test_asset_vol=test_asset_vol,
+            test_macro_vol=test_macro_vol,
+            test_asset_live=test_asset_live,
+            obs_lag=obs_lag,
+            progress=progress,
+            progress_label=f"overlay {spec.name}",
+            include_final_close=include_final_close,
+        )
+        ret, sharpe, dd = _metrics_from_navs(navs)
+        diag = (
+            summarize_weight_panel(w_arr, tickers=panel_tickers, max_single_asset_weight=cap)
+            if w_arr is not None and w_arr.size > 0
+            else {}
+        )
+        mean_cash = float(diag.get("mean_cash_frac", float("nan")))
+        kills = overlay_kill_reasons(
+            baseline_return=base_ret, overlay_return=ret, mean_cash=mean_cash
+        )
+        verdict = "KILL: " + "; ".join(kills) if kills else "keep"
+        print(
+            f"{spec.name:<22} {ret * 100:>10.2f} {sharpe:>8.2f} {dd * 100:>10.2f} "
+            f"{mean_cash * 100:>9.1f}%  {verdict}"
+        )
+        rows.append(
+            {
+                "name": spec.name,
+                "spec": overlay_spec_to_dict(spec),
+                "total_return": ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "mean_cash_frac": mean_cash,
+                "kill_reasons": kills,
+                "keep": not kills,
+                "portfolio_diagnostics": diag,
+            }
+        )
+    out = RunPaths(run_id).plots_dir / "overlay_grid.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "baseline": {
+            "total_return": base_ret,
+            "sharpe": base_sharpe,
+            "max_drawdown": base_dd,
+        },
+        "cells": rows,
+    }
+    out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    print(f"Wrote {out}")
+    return rows
+
+
 def _print_ensemble_summary(prefix: str, checkpoint_label: str, results: list[BacktestResult]) -> None:
     print(f"\n=== Ensemble OOS summary ({prefix}, checkpoint={checkpoint_label}) ===")
     print(f"{'seed':>8}  {'return %':>10}  {'Sharpe':>8}  {'max DD %':>10}")
@@ -1313,7 +1568,8 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     run_ids = discover_ensemble_run_ids(prefix, seeds)
     if not run_ids:
         raise SystemExit(
-            f"No runs found under Runs/ (or legacy models/) matching '{prefix}_seed_*'. "
+            f"No runs found under Runs/ matching '{prefix}' "
+            f"(research: {prefix} + {prefix}_sN, or legacy {prefix}_seed_N). "
             f"Train with scripts/run_seed_ensemble.sh --cohort {prefix}"
         )
     print(f"Discovered {len(run_ids)} runs: {', '.join(run_ids)}")
@@ -1323,12 +1579,15 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     if ck in ("best", "both"):
         modes.append(("best", False))
     if ck in ("latest", "both"):
-        # Ensemble 'latest' resolves ppo_portfolio_final.zip (run-level final weights),
-        # not the newest step checkpoint like single-run --checkpoint latest — label
-        # the rows by what is actually evaluated.
         print("[backtest] NOTE: ensemble 'latest' evaluates each run's FINAL model "
               "(end-of-run weights); rows are labeled 'final'.")
         modes.append(("final", True))
+
+    blend_mode = str(getattr(args, "ensemble_blend", "") or "none").strip().lower()
+    if blend_mode in ("", "none", "off"):
+        blend_mode = "none"
+    if blend_mode not in ("none", "weights", "nav"):
+        raise SystemExit("--ensemble-blend must be weights, nav, or none")
 
     args._ensemble_mode = True  # type: ignore[attr-defined]
     args._multi_run_summary = True  # type: ignore[attr-defined]
@@ -1337,24 +1596,44 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
         _bt_log("[backtest] Ensemble mode: per-run plots are skipped (μ±σ table + ensemble_summary.json).")
     args.no_viz = True
 
-    summary_root: dict[str, object] = {"prefix": prefix, "checkpoints": {}}
+    summary_root: dict[str, object] = {"prefix": prefix, "blend": blend_mode, "checkpoints": {}}
     for label, allow_latest in modes:
         sub_results: list[BacktestResult] = []
+        replay_ctx = None
         for rid in run_ids:
             print(f"\n--- {rid} ({label}) ---")
             sub = copy.copy(args)
             sub.run_id = rid
             sub.allow_latest_checkpoint = allow_latest
             sub._ensemble_mode = True  # type: ignore[attr-defined]
+            sub._keep_replay_ctx = blend_mode != "none"  # type: ignore[attr-defined]
+            # Overlay the *blend*, not each seed (existing 809 rollouts).
+            sub.overlay = ""
+            sub.overlay_grid = False
             try:
                 sub_results.append(run_oos_backtest(sub))
+                replay_ctx = getattr(sub, "_replay_ctx", replay_ctx)
             except FileNotFoundError as e:
                 print(f"SKIP {rid}: {e}")
         if not sub_results:
             print(f"No successful backtests for checkpoint={label}")
             continue
         _print_ensemble_summary(prefix, label, sub_results)
-        summary_root["checkpoints"][label] = [asdict(r) for r in sub_results]
+        ck_payload: dict[str, object] = {
+            "seeds": [_result_public_dict(r) for r in sub_results],
+        }
+        if blend_mode != "none":
+            blend_row = _blend_ensemble_results(
+                args,
+                prefix=prefix,
+                checkpoint_label=label,
+                results=sub_results,
+                mode=blend_mode,
+                replay_ctx=replay_ctx,
+            )
+            if blend_row is not None:
+                ck_payload["blend"] = blend_row
+        summary_root["checkpoints"][label] = ck_payload
 
     out_dir = RUNS_ROOT / prefix / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1362,6 +1641,183 @@ def run_ensemble_backtests(args: argparse.Namespace) -> None:
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(summary_root, f, indent=2, default=str)
     print(f"Wrote {out_json}")
+
+
+def _blend_ensemble_results(
+    args: argparse.Namespace,
+    *,
+    prefix: str,
+    checkpoint_label: str,
+    results: list[BacktestResult],
+    mode: str,
+    replay_ctx: dict | None,
+) -> dict | None:
+    """Equal-weight seed blend: average NAV paths, or average weights and replay."""
+    if len(results) < 2:
+        print("[backtest] Blend skipped (need ≥2 seeds).")
+        return None
+    if mode == "nav":
+        paths = [r.nav_path for r in results if r.nav_path is not None and len(r.nav_path) >= 2]
+        if len(paths) < 2:
+            print("[backtest] NAV blend skipped (missing nav paths).")
+            return None
+        n = min(len(p) for p in paths)
+        stacked = np.stack([p[:n] / max(p[0], 1e-12) for p in paths], axis=0)
+        # Capital-split: equal NAV in each seed, start at the mean initial NAV.
+        start = float(np.mean([p[0] for p in paths]))
+        navs = start * np.mean(stacked, axis=0)
+        ret, sharpe, dd = _metrics_from_navs(navs)
+        print(
+            f"\n=== Seed blend (NAV / capital-split) {prefix} {checkpoint_label} ===\n"
+            f"  return {ret * 100:.2f}%  Sharpe {sharpe:.2f}  max DD {dd * 100:.2f}%"
+        )
+        return {
+            "mode": "nav",
+            "n_seeds": len(paths),
+            "total_return": ret,
+            "sharpe": sharpe,
+            "max_drawdown": dd,
+        }
+
+    panels = [r.weight_panel for r in results if r.weight_panel is not None and r.weight_panel.size > 0]
+    if len(panels) < 2:
+        print("[backtest] Weight blend skipped (missing weight panels).")
+        return None
+    n = min(p.shape[0] for p in panels)
+    k = min(p.shape[1] for p in panels)
+    stacked = np.stack([p[:n, :k] for p in panels], axis=0)
+    blended = np.mean(stacked, axis=0)
+    blended = np.maximum(blended, 0.0)
+    row_sums = blended.sum(axis=1, keepdims=True)
+    blended = np.divide(blended, np.maximum(row_sums, 1e-12))
+    overlay_spec = _overlay_spec_from_args(args)
+    navs = None
+    w_out = blended
+    diag = None
+    raw_navs = None
+    if replay_ctx is not None:
+        raw_navs, _, _, _ = _replay_weight_panel_on_slice(
+            args,
+            weights=blended,
+            overlay=None,
+            test_idx=replay_ctx["test_idx"],
+            test_ohlcv=replay_ctx["test_ohlcv"],
+            test_rsi=replay_ctx["test_rsi"],
+            test_macd=replay_ctx["test_macd"],
+            test_macro=replay_ctx["test_macro"],
+            test_fd=replay_ctx["test_fd"],
+            test_fdm=replay_ctx["test_fdm"],
+            test_trend=replay_ctx["test_trend"],
+            test_asset_vol=replay_ctx["test_asset_vol"],
+            test_macro_vol=replay_ctx["test_macro_vol"],
+            test_asset_live=replay_ctx["test_asset_live"],
+            obs_lag=int(replay_ctx["obs_lag"]),
+            progress=not bool(getattr(args, "no_progress", False)),
+            progress_label="seed-weight blend",
+            include_final_close=bool(replay_ctx.get("include_final_close")),
+        )
+        navs = raw_navs
+        if overlay_spec is not None:
+            navs, _, _, w_out = _replay_weight_panel_on_slice(
+                args,
+                weights=blended,
+                overlay=overlay_spec,
+                test_idx=replay_ctx["test_idx"],
+                test_ohlcv=replay_ctx["test_ohlcv"],
+                test_rsi=replay_ctx["test_rsi"],
+                test_macd=replay_ctx["test_macd"],
+                test_macro=replay_ctx["test_macro"],
+                test_fd=replay_ctx["test_fd"],
+                test_fdm=replay_ctx["test_fdm"],
+                test_trend=replay_ctx["test_trend"],
+                test_asset_vol=replay_ctx["test_asset_vol"],
+                test_macro_vol=replay_ctx["test_macro_vol"],
+                test_asset_live=replay_ctx["test_asset_live"],
+                obs_lag=int(replay_ctx["obs_lag"]),
+                progress=not bool(getattr(args, "no_progress", False)),
+                progress_label=f"blend overlay {overlay_spec.name}",
+                include_final_close=bool(replay_ctx.get("include_final_close")),
+            )
+        from rlbot.portfolio_metrics import summarize_weight_panel
+
+        if w_out is not None and np.asarray(w_out).size > 0:
+            diag = summarize_weight_panel(
+                np.asarray(w_out),
+                tickers=list(replay_ctx.get("panel_tickers") or []),
+                max_single_asset_weight=get_config().environment.max_single_asset_weight,
+            )
+        if bool(getattr(args, "overlay_grid", False)):
+            _run_overlay_grid(
+                args,
+                run_id=prefix,
+                baseline_navs=raw_navs,
+                baseline_weights=blended,
+                test_idx=replay_ctx["test_idx"],
+                test_ohlcv=replay_ctx["test_ohlcv"],
+                test_rsi=replay_ctx["test_rsi"],
+                test_macd=replay_ctx["test_macd"],
+                test_macro=replay_ctx["test_macro"],
+                test_fd=replay_ctx["test_fd"],
+                test_fdm=replay_ctx["test_fdm"],
+                test_trend=replay_ctx["test_trend"],
+                test_asset_vol=replay_ctx["test_asset_vol"],
+                test_macro_vol=replay_ctx["test_macro_vol"],
+                test_asset_live=replay_ctx["test_asset_live"],
+                obs_lag=int(replay_ctx["obs_lag"]),
+                panel_tickers=list(replay_ctx.get("panel_tickers") or []),
+                progress=not bool(getattr(args, "no_progress", False)),
+                include_final_close=bool(replay_ctx.get("include_final_close")),
+            )
+    if navs is None:
+        print("[backtest] Weight blend averaged the panels but could not replay fills (no slice ctx).")
+        return {"mode": "weights", "n_seeds": len(panels), "replayed": False}
+    ret, sharpe, dd = _metrics_from_navs(navs)
+    mean_cash = float((diag or {}).get("mean_cash_frac", float("nan")))
+    tag = overlay_spec.name if overlay_spec is not None else "raw"
+    print(
+        f"\n=== Seed blend (equal-weight of target weights, overlay={tag}) "
+        f"{prefix} {checkpoint_label} ===\n"
+        f"  return {ret * 100:.2f}%  Sharpe {sharpe:.2f}  max DD {dd * 100:.2f}%  "
+        f"mean cash {mean_cash * 100:.1f}%"
+    )
+    return {
+        "mode": "weights",
+        "n_seeds": len(panels),
+        "overlay": overlay_spec.name if overlay_spec is not None else None,
+        "total_return": ret,
+        "sharpe": sharpe,
+        "max_drawdown": dd,
+        "mean_cash_frac": mean_cash,
+        "portfolio_diagnostics": diag,
+        "replayed": True,
+    }
+
+
+def run_cohort_ensembles(args: argparse.Namespace) -> None:
+    """Seed-ensemble each W1–W5 group of a research cohort (e.g. 809)."""
+    cohort = str(args.ensemble_cohort).strip()
+    seeds: list[int] | None = None
+    if str(getattr(args, "ensemble_seeds", "") or "").strip():
+        seeds = [int(s.strip()) for s in args.ensemble_seeds.split(",") if s.strip()]
+    groups = walk_forward_group_ids(cohort)
+    print(f"[backtest] Cohort {cohort} seed ensembles: {', '.join(groups)}")
+    combined: dict[str, object] = {"cohort": cohort, "windows": {}}
+    for prefix in groups:
+        ids = discover_ensemble_run_ids(prefix, seeds)
+        if not ids:
+            print(f"[backtest] SKIP {prefix}: no matching runs")
+            continue
+        sub = copy.copy(args)
+        sub.ensemble_prefix = prefix
+        sub.ensemble_cohort = ""
+        run_ensemble_backtests(sub)
+        summary_path = RUNS_ROOT / prefix / "plots" / "ensemble_summary.json"
+        if summary_path.is_file():
+            combined["windows"][prefix] = json.loads(summary_path.read_text(encoding="utf-8"))
+    out = RUNS_ROOT / cohort / "plots" / "ensemble_summary.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(combined, indent=2, default=str), encoding="utf-8")
+    print(f"Wrote {out}")
 
 
 def _latest_checkpoint_vecnormalize(ckpt_dir: Path) -> Path | None:
@@ -1430,7 +1886,7 @@ def _max_drawdown(equity: np.ndarray) -> float:
 
 
 def rollout_policy_on_slice(
-    model: RecurrentPPO,
+    model: RecurrentPPO | None,
     *,
     test_idx: pd.DatetimeIndex,
     test_ohlcv: np.ndarray,
@@ -1454,6 +1910,8 @@ def rollout_policy_on_slice(
     obs_sink: list | None = None,
     min_bars: int = 10,
     include_final_close: bool = False,
+    overlay: OverlaySpec | InferenceOverlay | None = None,
+    weight_override_panel: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int, int, np.ndarray | None]:
     """
     One full episode on a contiguous date slice. Returns
@@ -1467,6 +1925,10 @@ def rollout_policy_on_slice(
     ``include_final_close``: when True, allow MTM through the last panel bar
     (needed for short live forward-mark tails; default OOS backtests keep the
     stricter ``_max_t = n-2`` guard).
+
+    ``overlay``: optional written inference overlay (vol-target / trend / EW blend).
+    ``weight_override_panel``: replay stored target weights (seed-ensemble blend);
+    skips the policy. ``model`` may be None in that case.
     """
     n_bars = len(test_idx)
     min_bars = max(2, int(min_bars))
@@ -1490,6 +1952,17 @@ def rollout_policy_on_slice(
         domain_randomize=False,
         asset_live=test_asset_live,
     )
+    overlay_state: InferenceOverlay | None = None
+    if overlay is not None:
+        overlay_state = overlay if isinstance(overlay, InferenceOverlay) else InferenceOverlay(overlay)
+        raw_env._inference_overlay = overlay_state
+    override = None
+    if weight_override_panel is not None:
+        override = np.asarray(weight_override_panel, dtype=np.float64)
+        if override.ndim != 2:
+            raise ValueError(f"weight_override_panel must be 2-d, got {override.shape}")
+        if model is None:
+            use_vec_norm = False
     # Forward-mark live tails are short; default _max_t=n-2 drops the final close.
     # Allow MTM through the last panel bar (step still only reads open/close[t+1]).
     if include_final_close:
@@ -1531,17 +2004,23 @@ def rollout_policy_on_slice(
     log_every = max(n_bars // 10, 50) if progress else 0
     step_i = 0
 
-    with th.inference_mode():
+    with th.inference_mode() if model is not None else _nullcontext():
         while not (done or truncated):
-            obs_model = obs.reshape(1, -1) if getattr(obs, "ndim", 1) == 1 else obs
-            action, lstm_states = model.predict(
-                obs_model,
-                state=lstm_states,
-                episode_start=episode_starts,
-                deterministic=deterministic,
-            )
-            episode_starts = np.zeros((1,), dtype=bool)
-            obs, _, done, truncated, info = raw_env.step(action)
+            if override is not None:
+                row = min(step_i, override.shape[0] - 1)
+                raw_env._weight_override = override[row].copy()
+                dummy = np.zeros((raw_env.n_actions,), dtype=np.float64)
+                obs, _, done, truncated, info = raw_env.step(dummy)
+            else:
+                obs_model = obs.reshape(1, -1) if getattr(obs, "ndim", 1) == 1 else obs
+                action, lstm_states = model.predict(
+                    obs_model,
+                    state=lstm_states,
+                    episode_start=episode_starts,
+                    deterministic=deterministic,
+                )
+                episode_starts = np.zeros((1,), dtype=bool)
+                obs, _, done, truncated, info = raw_env.step(action)
             if collect_weights:
                 tw = info.get("target_weights")
                 if tw is not None:
@@ -1927,7 +2406,7 @@ def main() -> None:
         "--run-id",
         default="",
         metavar="ID",
-        help="Run id (required unless --run-ids or --ensemble-prefix). Dates from Runs/<ID>/manifest.json.",
+        help="Run id (required unless --run-ids, --ensemble-prefix, or --ensemble-cohort). Dates from Runs/<ID>/manifest.json.",
     )
     parser.add_argument(
         "--device",
@@ -2053,7 +2532,14 @@ def main() -> None:
         "--ensemble-prefix",
         default="",
         metavar="PREFIX",
-        help="Aggregate OOS metrics over Runs/<PREFIX>_seed_* runs (μ±σ table).",
+        help="Aggregate OOS metrics over seed runs matching PREFIX (research: "
+        "PREFIX + PREFIX_sN, or legacy PREFIX_seed_N). Writes ensemble_summary.json.",
+    )
+    parser.add_argument(
+        "--ensemble-cohort",
+        default="",
+        metavar="ID",
+        help="Seed-ensemble W1–W5 of a research cohort (e.g. 809 → W1_809 / W1_809_s42 / …).",
     )
     parser.add_argument(
         "--ensemble-checkpoint",
@@ -2065,7 +2551,51 @@ def main() -> None:
         "--ensemble-seeds",
         default="",
         metavar="LIST",
-        help="Comma-separated seeds to include (default: all matching PREFIX_seed_* dirs).",
+        help="Comma-separated seeds to include (default: all matching). Research seed 0 is PREFIX itself.",
+    )
+    parser.add_argument(
+        "--ensemble-blend",
+        default="none",
+        choices=("none", "weights", "nav"),
+        help="Equal-weight seed blend: average daily target weights and replay fills "
+        "(weights, tradable book) or average NAV paths (nav, capital-split). Default none = μ±σ table only.",
+    )
+    parser.add_argument(
+        "--overlay",
+        default="",
+        metavar="LIST",
+        help="Written inference overlay on 809 weights (no new train): comma-separated "
+        "vol_target, trend, ew_blend. Applied by replaying the rollout's target weights.",
+    )
+    parser.add_argument(
+        "--overlay-vol-target",
+        type=float,
+        default=0.11,
+        help="Annualized vol cap for --overlay vol_target (default 0.11 = 11%%).",
+    )
+    parser.add_argument(
+        "--overlay-trend-fast",
+        type=int,
+        default=65,
+        help="Fast SMA bars for --overlay trend (default 65 = 13 weeks).",
+    )
+    parser.add_argument(
+        "--overlay-trend-slow",
+        type=int,
+        default=200,
+        help="Slow SMA bars for --overlay trend (default 200d).",
+    )
+    parser.add_argument(
+        "--overlay-ew-alpha",
+        type=float,
+        default=0.25,
+        help="EW blend weight α for --overlay ew_blend (try 0.25 and 0.5).",
+    )
+    parser.add_argument(
+        "--overlay-grid",
+        action="store_true",
+        help="Score the 809 overlay cells (vol-target, 13w/200d trend, EW 0.25/0.5, combos) "
+        "on this rollout. Kill if mean cash ≥ 25%% or return < 90%% of 809.",
     )
     args = parser.parse_args()
 
@@ -2098,6 +2628,10 @@ def main() -> None:
             "[backtest] --fast: stochastic-paths=0, "
             f"bootstrap-resamples={args.bootstrap_resamples}"
         )
+
+    if str(getattr(args, "ensemble_cohort", "") or "").strip():
+        run_cohort_ensembles(args)
+        return
 
     if args.ensemble_prefix.strip():
         run_ensemble_backtests(args)

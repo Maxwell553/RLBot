@@ -17,6 +17,7 @@ import pandas as pd
 
 from rlbot.forward_mark import (
     build_forward_mark_payload,
+    load_forward_mark,
     set_active_forward_run,
     write_forward_mark,
 )
@@ -179,59 +180,76 @@ def run_paper_day(
         state["equity"] = float(initial_cash)
         state["cash"] = float(initial_cash)
 
-    book_start = str(date.today())
-    state["book_start"] = book_start
+    book_start = str(state["book_start"])
     # Warm pack NAV cache for soft companion overlays (not written as chart history).
-    if force_refresh:
+    try:
         simulate_nav_series(
-            force_refresh=True,
+            force_refresh=bool(force_refresh),
             initial_cash=float(initial_cash),
             since=book_start,
         )
+    except Exception:  # noqa: BLE001
+        pass
 
     intents = latest_intents(aum=float(initial_cash), equity=float(initial_cash))
     weights = _weights_from_intents(intents)
+    asof = str(intents.get("asof") or "")
+    already = bool(asof) and str(state.get("last_signal_date") or "") == asof
     tip_nav = float(initial_cash)
     state["equity"] = tip_nav
     state["cash"] = tip_nav * float(weights.get("CASH", 1.0))
     state["target_weights"] = weights
-    state["last_signal_date"] = str(intents.get("asof"))
+    state["last_signal_date"] = asof or str(state.get("last_signal_date") or "")
     state["positions"] = {
         k: float(v) for k, v in weights.items() if str(k).upper() != "CASH" and float(v) > 0
     }
 
+    actions = ["crestday_pack"]
+    if already:
+        actions.append("already_logged")
+
     if not dry_run:
         save_state(state)
-        _append_jsonl(
-            ledger_path(),
-            {
-                "run_id": PAPER_RUN_ID,
-                "strategy_id": STRATEGY_ID,
-                "decision_bar": intents.get("asof"),
-                "trade_date": str(intents.get("asof") or "")[:10],
-                "as_of": intents.get("asof"),
-                "target_weights": {
-                    ("Cash" if k.upper() == "CASH" else k): float(v)
-                    for k, v in weights.items()
+        if not already:
+            _append_jsonl(
+                ledger_path(),
+                {
+                    "run_id": PAPER_RUN_ID,
+                    "strategy_id": STRATEGY_ID,
+                    "decision_bar": intents.get("asof"),
+                    "trade_date": str(intents.get("asof") or "")[:10],
+                    "as_of": intents.get("asof"),
+                    "target_weights": {
+                        ("Cash" if k.upper() == "CASH" else k): float(v)
+                        for k, v in weights.items()
+                    },
+                    "sleeve_meta": {
+                        "n_intents": len(intents.get("intents") or []),
+                        "venue": intents.get("venue"),
+                        "note": intents.get("note"),
+                    },
+                    "recorded_at_utc": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                    "bar_interval": "5m",
+                    "pack": "CrestDay",
                 },
-                "sleeve_meta": {
-                    "n_intents": len(intents.get("intents") or []),
-                    "venue": intents.get("venue"),
-                    "note": intents.get("note"),
-                },
-                "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "bar_interval": "5m",
-                "pack": "CrestDay",
-            },
-        )
-        _append_jsonl(ORDERS_PATH, {"as_of": intents.get("asof"), "intents": intents.get("intents")})
-        payload = build_tip_forward_mark(
-            book_start=book_start,
-            weights=weights,
-            intents_meta=intents,
-            initial_cash=float(initial_cash),
-        )
-        write_forward_mark(payload)
+            )
+            _append_jsonl(
+                ORDERS_PATH,
+                {"as_of": intents.get("asof"), "intents": intents.get("intents")},
+            )
+        existing = load_forward_mark(PAPER_RUN_ID)
+        n_existing = int((existing or {}).get("n_bars") or 0)
+        # Do not clobber a live 5m overlay with a single-bar tip mark.
+        if n_existing <= 1:
+            payload = build_tip_forward_mark(
+                book_start=book_start,
+                weights=weights,
+                intents_meta=intents,
+                initial_cash=float(initial_cash),
+            )
+            write_forward_mark(payload)
         if set_active:
             set_active_forward_run(PAPER_RUN_ID)
 
@@ -239,7 +257,7 @@ def run_paper_day(
         "strategy_id": STRATEGY_ID,
         "run_id": PAPER_RUN_ID,
         "as_of": intents.get("asof"),
-        "actions": ["crestday_pack"],
+        "actions": actions,
         "target_weights": weights,
         "equity": tip_nav,
         "n_bars": 1,

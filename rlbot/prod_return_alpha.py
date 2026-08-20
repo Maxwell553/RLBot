@@ -49,6 +49,24 @@ def month_end_mask(dates: list[date]) -> np.ndarray:
     return m
 
 
+def session_rebalance_flags(dates: list[date], i: int) -> tuple[bool, bool]:
+    """Live week-end / month-end. Unlike the backtest masks, does not force the tip True."""
+    n = len(dates)
+    if i < 0 or i >= n:
+        return False, False
+    d = dates[i]
+    if i + 1 < n:
+        week_end = dates[i].isocalendar()[1] != dates[i + 1].isocalendar()[1]
+        month_end = dates[i].month != dates[i + 1].month
+        return bool(week_end), bool(month_end)
+    week_end = d.weekday() == 4
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    month_end = nxt.month != d.month
+    return week_end, month_end
+
+
 def fetch_daily_ohlc(
     symbols: list[str] | None = None,
     *,

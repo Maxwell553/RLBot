@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 import rlbot.rl_config as rl_config
 from rlbot.data_utils import train_test_split_alternating
 from rlbot.rl_config import get_config, observation_dim_for_universe
@@ -31,6 +33,18 @@ def test_obs_dim_for_default_universe() -> None:
 
 def test_default_cap_is_020() -> None:
     assert get_config().environment.max_single_asset_weight == 0.20
+
+
+def test_live_config_is_frozen_809() -> None:
+    """Live default is 809_720_plus: LSTM 64, inactivity tax, fee_ramp 0.45, no residual."""
+    cfg = get_config()
+    assert cfg.policy.lstm_hidden_size == 64
+    assert cfg.reward.inactivity_penalty_over_50 == pytest.approx(0.35)
+    assert cfg.reward.inactivity_penalty_over_90 == pytest.approx(0.15)
+    assert cfg.curriculum.fee_ramp_fraction == pytest.approx(0.45)
+    assert cfg.environment.residual_actions is False
+    assert cfg.environment.dd_exposure_taper is False
+    assert cfg.environment.max_single_asset_weight == 0.20
 
 
 def test_split_supports_feature_split_mode() -> None:

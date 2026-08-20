@@ -100,6 +100,12 @@ class EnvironmentConfig:
     dd_exposure_taper_start: float = 0.06
     dd_exposure_taper_end: float = 0.12
     dd_exposure_taper_min_gross: float = 0.30
+    # Residual policy (cohort 816): lock an equal-weight (or reward-benchmark)
+    # core sleeve and map action[1:] to ±clip tilts. Parser default False
+    # preserves 809 / two-head snapshots. Takes precedence over two_head_actions.
+    residual_actions: bool = False
+    residual_clip: float = 0.08
+    residual_core: str = "equal_weight"  # equal_weight | reward_benchmark
 
 
 @dataclass(frozen=True)
@@ -600,6 +606,23 @@ def _feature_split_mode(value: Any) -> str:
     return mode
 
 
+def _residual_core(env: dict[str, Any]) -> str:
+    core = str(env.get("residual_core", "equal_weight")).strip().lower()
+    allowed = ("equal_weight", "reward_benchmark")
+    if core not in allowed:
+        raise ValueError(
+            f"environment.residual_core must be one of {allowed}, got {core!r}"
+        )
+    return core
+
+
+def _residual_clip(env: dict[str, Any]) -> float:
+    clip = float(env.get("residual_clip", 0.08))
+    if clip < 0.0 or clip > 1.0:
+        raise ValueError(f"environment.residual_clip must be in [0, 1], got {clip}")
+    return clip
+
+
 def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
     universe = _parse_universe(_req(data, "universe", "root"))
     env = _req(data, "environment", "root")
@@ -638,6 +661,9 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             dd_exposure_taper_start=float(env.get("dd_exposure_taper_start", 0.06)),
             dd_exposure_taper_end=float(env.get("dd_exposure_taper_end", 0.12)),
             dd_exposure_taper_min_gross=float(env.get("dd_exposure_taper_min_gross", 0.30)),
+            residual_actions=bool(env.get("residual_actions", False)),
+            residual_clip=_residual_clip(env),
+            residual_core=_residual_core(env),
         ),
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),

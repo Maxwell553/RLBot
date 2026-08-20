@@ -151,15 +151,17 @@ def write_report(records: Iterable[Mapping], path: str | Path, *, title: str = "
 
 
 _SEED_PART = re.compile(r"__seed\d+")
+_S_SUFFIX = re.compile(r"_s\d+$")
 
 
 def _group_key(r: Mapping) -> str:
     """Cross-seed aggregation key: explicit group_id, else variant_id minus its
-    __seedN component (legacy records predate group_id)."""
+    seed component (legacy ``__seedN`` or ``W3_811_s42``)."""
     gid = r.get("group_id")
     if gid:
         return str(gid)
-    return _SEED_PART.sub("", str(r.get("variant_id")))
+    vid = _SEED_PART.sub("", str(r.get("variant_id")))
+    return _S_SUFFIX.sub("", vid)
 
 
 def _group(records: Iterable[Mapping]) -> dict[str, list[Mapping]]:

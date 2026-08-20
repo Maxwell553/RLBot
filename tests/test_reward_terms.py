@@ -167,16 +167,17 @@ def test_participation_vix_relief_parse_and_validation() -> None:
 
     from rlbot.rl_config import _parse_config, _validate_reward_config
 
-    # Active config omits inactivity/participation/concentration (parser default 0).
-    # Coupling stays partial (0.5) so invested-underwater still pays a level tax.
-    assert get_config().reward.participation_vix_relief == pytest.approx(0.0)
+    # Frozen 809: cash-park tax + light participation; concentration 0.75;
+    # level penalty is raw units (not × reward_scale); coupling off.
+    assert get_config().reward.participation_vix_relief == pytest.approx(1.0)
     assert get_config().reward.participation_drawdown_relief == pytest.approx(0.0)
     assert get_config().reward.inactivity_drawdown_relief == pytest.approx(0.0)
-    assert get_config().reward.inactivity_penalty_over_50 == pytest.approx(0.0)
-    assert get_config().reward.participation_bonus == pytest.approx(0.0)
-    assert get_config().reward.concentration_penalty == pytest.approx(1.25)
-    assert get_config().reward.drawdown_level_exposure_coupling == pytest.approx(0.5)
-    assert get_config().reward.drawdown_level_times_reward_scale is True
+    assert get_config().reward.inactivity_penalty_over_50 == pytest.approx(0.35)
+    assert get_config().reward.inactivity_penalty_over_90 == pytest.approx(0.15)
+    assert get_config().reward.participation_bonus == pytest.approx(0.02)
+    assert get_config().reward.concentration_penalty == pytest.approx(0.75)
+    assert get_config().reward.drawdown_level_exposure_coupling == pytest.approx(0.0)
+    assert get_config().reward.drawdown_level_times_reward_scale is False
 
     # Legacy run snapshots without the keys still parse to 0.
     raw = copy.deepcopy(get_config().raw)
@@ -209,10 +210,9 @@ def test_participation_vix_relief_parse_and_validation() -> None:
 
 
 def test_drawdown_dominates_inactivity_at_config_scales() -> None:
-    """Dimensional check: underwater-and-invested DD level >> any residual inactivity."""
+    """809 keeps inactivity as the cash-park tax; DD level is raw units (not × scale)."""
     rwd = get_config().reward
     max_inactivity = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    # 10% underwater (floor 0 → dd_excess 0.10).
     dd_excess = 0.10
     level_coef = float(rwd.drawdown_level_penalty)
     if bool(getattr(rwd, "drawdown_level_times_reward_scale", False)):
@@ -222,11 +222,9 @@ def test_drawdown_dominates_inactivity_at_config_scales() -> None:
         * level_coef
         * drawdown_level_exposure_factor(1.0, rwd.drawdown_level_exposure_coupling)
     )
-    # Inactivity stays off; level (× reward_scale in 731+) is the cash-vs-invested lever.
-    assert max_inactivity == pytest.approx(0.0, abs=1e-12)
-    assert level_at_full_gross > 1.0
-    # Material vs return-scale terms even with coupling < 1.
-    assert level_at_full_gross >= 0.4 * level_coef * dd_excess
+    assert max_inactivity == pytest.approx(0.50, abs=1e-12)
+    assert rwd.drawdown_level_times_reward_scale is False
+    assert level_at_full_gross == pytest.approx(0.30, abs=1e-12)
 
 
 def test_drawdown_level_times_reward_scale_matches_increase_units() -> None:

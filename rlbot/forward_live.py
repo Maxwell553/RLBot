@@ -29,7 +29,7 @@ from rlbot.run_artifacts import PROJECT_ROOT
 
 LIVE_STAMP_NAME = "forward_live_stamp.json"
 # Companion RL deploy shown alongside GENERAL_EQUITY1 on /ops/forward.
-RL_LIVE_RUN_ID = "LIVE_MODEL"
+RL_LIVE_RUN_ID = "RLModel"
 # Locked GeneralEquity1 pack paper book (TQQQ+QQQ hybrid weekly + GLD/TLT dual).
 ALGO_LIVE_RUN_ID = "GENERAL_EQUITY1"
 # Soft companion CrestDay series (pack NAV; never blocks equity forward).
@@ -44,8 +44,11 @@ DEFAULT_MIN_REFRESH_SECONDS = 300
 BAR_INTERVAL = "5m"
 # Approx US cash-session 5-minute bars (09:30–16:00 ET → 78).
 BARS_PER_TRADING_DAY = 78
-# yfinance 5m history is capped (~60d); fetch this much lookback.
+# Yahoo 5m history is capped (~60d); fetch this much lookback so a multi-day
+# outage can still backfill the gap instead of pulling a trailing 5d window
+# that no longer overlaps the local NPZ cache.
 INTRADAY_LOOKBACK_DAYS = 59
+YAHOO_INTRADAY_RANGES: tuple[str, ...] = ("1mo", "5d")
 
 
 def _session_date_today() -> str:
@@ -148,7 +151,7 @@ def seed_flat_forward_baseline(
         note=(
             f"Flat baseline reset at {cash:,.0f} on {book_start} "
             f"(no session bars yet). Live 5m MTM resumes at the next cash open. "
-            f"GENERAL_EQUITY1 + CrestDay + LIVE_MODEL companion."
+            f"GENERAL_EQUITY1 + CrestDay + RLModel companion."
         ),
         bar_interval=BAR_INTERVAL,
         timestamps=[ts.isoformat(timespec="minutes")],
@@ -180,6 +183,8 @@ def seed_flat_forward_baseline(
         "book_start": book_start,
         "session_start": book_start,
         "reset_book": True,
+        "last_price_bar": ts.isoformat(timespec="minutes"),
+        "prices_stale": False,
     }
     # Wipe intraday caches so soft polls cannot rebuild Friday's path.
     for path in (
@@ -302,6 +307,25 @@ def _merge_price_history(
         _combine_1d(np.asarray(cached_sl), sl),
         _combine_1d(np.asarray(cached_sc), sc),
     )
+
+
+def _fill_ohlc_nans(*arrays: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Forward/back-fill remaining NaNs after a partial Yahoo pull + cache merge.
+
+    A fully-empty column (symbol never seen) becomes 1.0 so MTM returns are 0
+    for that name instead of aborting the whole book.
+    """
+    out: list[np.ndarray] = []
+    for arr in arrays:
+        df = pd.DataFrame(np.asarray(arr, dtype=np.float64))
+        filled = df.ffill().bfill()
+        if filled.isna().to_numpy().any():
+            filled = filled.fillna(1.0)
+        result = filled.to_numpy(dtype=np.float64)
+        if np.asarray(arr).ndim == 1:
+            result = result.reshape(-1)
+        out.append(result)
+    return tuple(out)
 
 
 def _nav_series_from_ohlc(ohlc: np.ndarray, *, initial_cash: float) -> np.ndarray:
@@ -484,8 +508,13 @@ def _soft_durable_nav_on_grid(
     )
 
 
-def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
-    path = PROJECT_ROOT / "execution" / f"shadow_ledger_{run_id}.jsonl"
+def _shadow_row_is_reset(rec: dict[str, Any]) -> bool:
+    note = str(rec.get("note") or "").lower()
+    return "reset to 100k" in note or "flat paper book" in note
+
+
+def last_invested_shadow_weights(path: Path) -> dict[str, float] | None:
+    """Last target_weights in a shadow ledger, skipping cash-reset stubs."""
     if not path.is_file():
         return None
     last: dict[str, float] | None = None
@@ -495,12 +524,154 @@ def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
             if not line:
                 continue
             rec = json.loads(line)
+            if not isinstance(rec, dict) or _shadow_row_is_reset(rec):
+                continue
             tw = rec.get("target_weights")
             if isinstance(tw, dict) and tw:
                 last = {str(k): float(v) for k, v in tw.items()}
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return last
     return last
+
+
+def _latest_shadow_weights(run_id: str) -> dict[str, float] | None:
+    return last_invested_shadow_weights(
+        PROJECT_ROOT / "execution" / f"shadow_ledger_{run_id}.jsonl"
+    )
+
+
+def ledger_effective_ts(rec: dict[str, Any]) -> pd.Timestamp | None:
+    """When a shadow/paper row should hit the 5m book (naive ET)."""
+    for key in ("recorded_at_utc", "recorded_at", "trade_date", "decision_bar", "as_of"):
+        raw = rec.get(key)
+        if not raw:
+            continue
+        text = str(raw).strip()
+        try:
+            ts = pd.Timestamp(text)
+        except (TypeError, ValueError):
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York").tz_localize(None)
+        date_only = "T" not in text and " " not in text
+        if date_only:
+            ts = pd.Timestamp(ts.date()) + pd.Timedelta(hours=9, minutes=30)
+        return ts
+    return None
+
+
+def load_shadow_weight_events(path: Path) -> list[tuple[pd.Timestamp, dict[str, float]]]:
+    """Invested target_weights in ledger order (cash-reset stubs skipped)."""
+    events: list[tuple[pd.Timestamp, dict[str, float]]] = []
+    if not path.is_file():
+        return events
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return events
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or _shadow_row_is_reset(rec):
+            continue
+        tw = rec.get("target_weights")
+        ts = ledger_effective_ts(rec)
+        if not isinstance(tw, dict) or not tw or ts is None:
+            continue
+        try:
+            weights = {str(k): float(v) for k, v in tw.items()}
+        except (TypeError, ValueError):
+            continue
+        events.append((ts, weights))
+    events.sort(key=lambda item: item[0])
+    return events
+
+
+def weight_matrix_from_events(
+    times: pd.DatetimeIndex,
+    events: list[tuple[pd.Timestamp, dict[str, float]]],
+    labels: list[str],
+    *,
+    start: pd.Timestamp | None = None,
+) -> np.ndarray:
+    """Piecewise-constant books on a 5m clock. Bars before ``start`` stay 100% cash.
+
+    Events apply at their own timestamps (when the shadow/paper book actually
+    changed). Bars after ``start`` but before the first event stay cash.
+    """
+    idx = pd.DatetimeIndex(times).tz_localize(None)
+    cash = _weight_vector({"CASH": 1.0}, labels)
+    n = len(idx)
+    out = np.repeat(cash.reshape(1, -1), max(n, 0), axis=0)
+    if n == 0:
+        return out
+    start_t = pd.Timestamp(start).tz_localize(None) if start is not None else None
+    ev: list[tuple[pd.Timestamp, dict[str, float]]] = []
+    for ts, weights in events:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is not None:
+            t = t.tz_convert("America/New_York").tz_localize(None)
+        if start_t is not None and t < start_t:
+            continue
+        ev.append((t, weights))
+    ev.sort(key=lambda item: item[0])
+    j = -1
+    cur = cash
+    for i, bar in enumerate(idx):
+        bar_t = pd.Timestamp(bar)
+        if start_t is not None and bar_t < start_t:
+            out[i] = cash
+            continue
+        while j + 1 < len(ev) and ev[j + 1][0] <= bar_t:
+            j += 1
+            cur = _weight_vector(ev[j][1], labels)
+        out[i] = cur
+    return out
+
+
+def resolve_live_model_start(
+    existing: dict[str, Any] | None = None,
+    stamp: dict[str, Any] | None = None,
+) -> pd.Timestamp:
+    """First US cash bar after RLModel training finished (naive ET)."""
+    for src in (existing, stamp):
+        if not isinstance(src, dict):
+            continue
+        live = src.get("live") if isinstance(src.get("live"), dict) else {}
+        for raw in (src.get("live_model_start"), live.get("live_model_start")):
+            if not raw:
+                continue
+            try:
+                ts = pd.Timestamp(str(raw))
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("America/New_York").tz_localize(None)
+            if ts.hour == 0 and ts.minute == 0 and len(str(raw).strip()) <= 10:
+                ts = ts + pd.Timedelta(hours=9, minutes=30)
+            return ts
+    finished = None
+    try:
+        from rlbot.run_artifacts import read_run_manifest
+
+        man = read_run_manifest(RL_LIVE_RUN_ID) or {}
+        finished = man.get("finished_at_utc")
+    except Exception:  # noqa: BLE001
+        finished = None
+    if finished:
+        ts = pd.Timestamp(str(finished))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        et = ts.tz_convert("America/New_York").tz_localize(None)
+        if _is_equity_rth_timestamp(et):
+            return et.floor("5min") + pd.Timedelta(minutes=5)
+        return _next_equity_rth_open_after(et)
+    return pd.Timestamp("2026-08-17 09:30:00")
 
 
 def _is_external_weight_book(
@@ -598,6 +769,42 @@ def _spy_nav(spy_close: np.ndarray, initial_cash: float) -> np.ndarray:
     return (np.asarray(spy_close, dtype=np.float64) / s0) * float(initial_cash)
 
 
+def _weight_matrix(
+    weight: np.ndarray,
+    *,
+    t_bars: int,
+    n_assets: int,
+) -> np.ndarray:
+    """Broadcast a 1-d book or validate a ``[T, N+1]`` schedule onto the bar grid."""
+    w = np.asarray(weight, dtype=np.float64)
+    width = n_assets + 1
+    if w.ndim == 1:
+        row = w.reshape(-1)
+        if row.shape[0] != width:
+            ww = np.zeros(width, dtype=np.float64)
+            m = min(row.shape[0], width)
+            ww[:m] = row[:m]
+            s = float(ww.sum())
+            row = ww / s if s > 1e-12 else np.array([1.0] + [0.0] * n_assets, dtype=np.float64)
+        return np.repeat(row.reshape(1, -1), max(t_bars, 0), axis=0)
+    if w.ndim != 2:
+        raise ValueError("weight must be [N+1] or [T, N+1]")
+    out = np.zeros((t_bars, width), dtype=np.float64)
+    rows = min(t_bars, w.shape[0])
+    cols = min(width, w.shape[1])
+    if rows:
+        out[:rows, :cols] = w[:rows, :cols]
+        if rows < t_bars:
+            out[rows:] = out[rows - 1]
+    for t in range(t_bars):
+        s = float(out[t].sum())
+        if s <= 1e-12:
+            out[t, 0] = 1.0
+        else:
+            out[t] = out[t] / s
+    return out
+
+
 def portfolio_ohlc_candles(
     open_: np.ndarray,
     high: np.ndarray,
@@ -608,11 +815,13 @@ def portfolio_ohlc_candles(
     initial_cash: float,
     cash_yield_per_bar: float = 0.0,
 ) -> np.ndarray:
-    """Build NAV OHLC candles from aligned asset OHLC and a fixed weight vector.
+    """Build NAV OHLC candles from aligned asset OHLC and a weight book.
 
-    ``weight`` is Cash + N risky (sums to 1). Within each bar, O/H/L/C returns are
-    taken vs the previous bar's asset closes (bar 0 vs that bar's opens). Highs/lows
-    are simultaneous-price approximations (standard for multi-asset candles).
+    ``weight`` is Cash + N risky (sums to 1), either a single vector (held for
+    the whole window) or ``[T, N+1]`` so rebalances follow the live ledger.
+    Within each bar, O/H/L/C returns are taken vs the previous bar's asset
+    closes (bar 0 vs that bar's opens). Highs/lows are simultaneous-price
+    approximations (standard for multi-asset candles).
     Returns ``[T, 4]`` with columns open, high, low, close.
     """
     open_ = np.asarray(open_, dtype=np.float64)
@@ -622,15 +831,7 @@ def portfolio_ohlc_candles(
     if open_.ndim != 2:
         raise ValueError("open/high/low/close must be [T, N]")
     t_bars, n_assets = close.shape
-    w = np.asarray(weight, dtype=np.float64).reshape(-1)
-    if w.shape[0] != n_assets + 1:
-        ww = np.zeros(n_assets + 1, dtype=np.float64)
-        m = min(w.shape[0], ww.shape[0])
-        ww[:m] = w[:m]
-        s = float(ww.sum())
-        w = ww / s if s > 1e-12 else np.array([1.0] + [0.0] * n_assets)
-    cash_w = float(w[0])
-    risky = w[1:]
+    W = _weight_matrix(weight, t_bars=t_bars, n_assets=n_assets)
     out = np.empty((t_bars, 4), dtype=np.float64)
     if t_bars < 1:
         return out
@@ -640,6 +841,8 @@ def portfolio_ohlc_candles(
     y = float(cash_yield_per_bar)
 
     for t in range(t_bars):
+        cash_w = float(W[t, 0])
+        risky = W[t, 1:]
         # Cash yield accrues once per bar (on H/L/C); open is mark-to-market only.
         if t == 0:
             base = np.maximum(open_[t], 1e-12)
@@ -666,6 +869,137 @@ def portfolio_ohlc_candles(
         nav_close = c_nav
         prev_px = close[t]
     return out
+
+
+def lots_ohlc_candles(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    *,
+    cash: float,
+    quantities: np.ndarray,
+    times: pd.DatetimeIndex,
+    start: pd.Timestamp | None,
+    initial_cash: float,
+) -> np.ndarray:
+    """Mark a held share lot (no intra-bar rebalance) on a 5m grid.
+
+    ``quantities`` aligns with the N asset columns. Bars before ``start`` stay
+    at ``initial_cash`` (the paper book has not traded yet).
+    """
+    open_ = np.asarray(open_, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    low = np.asarray(low, dtype=np.float64)
+    close = np.asarray(close, dtype=np.float64)
+    if close.ndim != 2:
+        raise ValueError("open/high/low/close must be [T, N]")
+    t_bars, n_assets = close.shape
+    qty = np.asarray(quantities, dtype=np.float64).reshape(-1)
+    if qty.shape[0] != n_assets:
+        q = np.zeros(n_assets, dtype=np.float64)
+        m = min(n_assets, qty.shape[0])
+        q[:m] = qty[:m]
+        qty = q
+    idx = pd.DatetimeIndex(times).tz_localize(None)
+    start_t = None
+    if start is not None:
+        start_t = pd.Timestamp(start)
+        if start_t.tzinfo is not None:
+            start_t = start_t.tz_convert("America/New_York").tz_localize(None)
+    out = np.empty((t_bars, 4), dtype=np.float64)
+    cash_f = float(cash)
+    init = float(initial_cash)
+    for t in range(t_bars):
+        if start_t is not None and pd.Timestamp(idx[t]) < start_t:
+            out[t] = (init, init, init, init)
+            continue
+        o_nav = cash_f + float(np.dot(qty, open_[t]))
+        h_nav = cash_f + float(np.dot(qty, high[t]))
+        l_nav = cash_f + float(np.dot(qty, low[t]))
+        c_nav = cash_f + float(np.dot(qty, close[t]))
+        out[t] = (o_nav, max(o_nav, h_nav, l_nav, c_nav), min(o_nav, h_nav, l_nav, c_nav), c_nav)
+    return out
+
+
+def paper_lots_start_from_state(st: dict[str, Any] | None) -> pd.Timestamp | None:
+    """When the current share lots were opened — not the last daily mark time.
+
+    ``save_state`` rewrites ``updated_at_utc`` on hold days. Using that stamp as
+    the lot start would flatten NAV until "now". Prefer the fill timestamp only
+    when it falls on ``last_trade_date``.
+    """
+    if not isinstance(st, dict):
+        return None
+    trade = str(st.get("last_trade_date") or "").strip()
+    updated = str(st.get("updated_at_utc") or "").strip()
+    rec: dict[str, Any] = {"trade_date": trade or None}
+    if updated and trade and updated[:10] == trade[:10]:
+        rec["recorded_at_utc"] = updated
+    return ledger_effective_ts(rec)
+
+
+def load_paper_share_book(run_id: str) -> tuple[float, dict[str, float], pd.Timestamp | None]:
+    """Cash + share lots from the live paper state (GeneralEquity1 / CrestDay)."""
+    path = _PAPER_STATE_BY_RUN.get(str(run_id).upper())
+    if path is None:
+        return 0.0, {}, None
+    st = _read_json_file(path)
+    try:
+        cash = float(st.get("cash") or 0.0)
+    except (TypeError, ValueError):
+        cash = 0.0
+    pos: dict[str, float] = {}
+    raw = st.get("positions") if isinstance(st.get("positions"), dict) else {}
+    for key, val in raw.items():
+        try:
+            qty = float(val)
+        except (TypeError, ValueError):
+            continue
+        if abs(qty) <= 1e-12:
+            continue
+        pos[str(key).strip().upper()] = qty
+    return cash, pos, paper_lots_start_from_state(st)
+
+
+def mtm_ohlc_from_start(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    weight: np.ndarray,
+    *,
+    times: pd.DatetimeIndex,
+    start: pd.Timestamp,
+    initial_cash: float,
+    cash_yield_per_bar: float = 0.0,
+) -> np.ndarray:
+    """Flat ``initial_cash`` until ``start``, then live MTM (no pre-start yield)."""
+    idx = pd.DatetimeIndex(times).tz_localize(None)
+    start_t = pd.Timestamp(start)
+    if start_t.tzinfo is not None:
+        start_t = start_t.tz_convert("America/New_York").tz_localize(None)
+    t_bars = len(idx)
+    if t_bars < 1:
+        return np.zeros((0, 4), dtype=np.float64)
+    mask = idx >= start_t
+    start_i = int(np.flatnonzero(mask)[0]) if bool(mask.any()) else t_bars
+    prefix = np.full((start_i, 4), float(initial_cash), dtype=np.float64)
+    if start_i >= t_bars:
+        return prefix
+    w = np.asarray(weight, dtype=np.float64)
+    if w.ndim == 2:
+        w = w[start_i:]
+    suffix = portfolio_ohlc_candles(
+        open_[start_i:],
+        high[start_i:],
+        low[start_i:],
+        close[start_i:],
+        w,
+        initial_cash=initial_cash,
+        cash_yield_per_bar=cash_yield_per_bar,
+    )
+    return np.vstack([prefix, suffix])
 
 
 def equal_weight_ohlc_candles(
@@ -774,10 +1108,65 @@ _PAPER_STATE_BY_RUN: dict[str, Path] = {
 def _equity_rth_open_now() -> bool:
     """True during Mon–Fri US cash session (09:30–16:00 America/New_York)."""
     now = pd.Timestamp.now(tz="America/New_York")
-    if int(now.dayofweek) >= 5:
+    return _is_equity_rth_timestamp(now.tz_localize(None))
+
+
+def _is_equity_rth_timestamp(ts: pd.Timestamp) -> bool:
+    """True for a naive ET timestamp inside Mon–Fri 09:30–16:00."""
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_convert("America/New_York").tz_localize(None)
+    if int(t.dayofweek) >= 5:
         return False
-    minutes = int(now.hour) * 60 + int(now.minute)
+    minutes = int(t.hour) * 60 + int(t.minute)
     return (9 * 60 + 30) <= minutes < (16 * 60)
+
+
+def _next_equity_rth_open_after(ts: pd.Timestamp) -> pd.Timestamp:
+    """First 5m US cash bar strictly after ``ts`` (naive ET)."""
+    cursor = pd.Timestamp(ts).tz_localize(None).floor("5min") + pd.Timedelta(minutes=5)
+    for _ in range(8 * 24 * 12):
+        if _is_equity_rth_timestamp(cursor):
+            return cursor
+        cursor = cursor + pd.Timedelta(minutes=5)
+    return pd.Timestamp(ts).tz_localize(None) + pd.Timedelta(days=5)
+
+
+def offhours_extend_until(
+    last: pd.Timestamp,
+    now: pd.Timestamp,
+) -> pd.Timestamp | None:
+    """Latest 5m stamp we may invent after ``last`` without faking a cash session.
+
+    Returns None when ``now`` is inside RTH (wait for Yahoo) or when the next
+    cash bar after ``last`` is already in the past — that means a session was
+    missed and extending would paint a flat equity line across real trading.
+    Otherwise cap at ``min(now, next_rth_open - 5m)`` so overnight / weekend
+    CrestDay clocks can still advance up to the next cash open.
+    """
+    last_t = pd.Timestamp(last).tz_localize(None).floor("5min")
+    now_t = pd.Timestamp(now).tz_localize(None).floor("5min")
+    if now_t <= last_t:
+        return None
+    if _is_equity_rth_timestamp(now_t):
+        return None
+    nxt = _next_equity_rth_open_after(last_t)
+    cap = min(now_t, nxt - pd.Timedelta(minutes=5))
+    if cap <= last_t:
+        return None
+    return cap
+
+
+def prices_are_stale(last_price_bar: pd.Timestamp, now: pd.Timestamp) -> bool:
+    """True when a cash session has opened (or is open) after the last real print."""
+    last_t = pd.Timestamp(last_price_bar).tz_localize(None).floor("5min")
+    now_t = pd.Timestamp(now).tz_localize(None).floor("5min")
+    if now_t <= last_t:
+        return False
+    if _is_equity_rth_timestamp(now_t):
+        return (now_t - last_t) > pd.Timedelta(minutes=10)
+    nxt = _next_equity_rth_open_after(last_t)
+    return nxt <= now_t
 
 
 def _now_et_floor_5m() -> pd.Timestamp:
@@ -962,27 +1351,70 @@ def _extend_nav_series(series: list[Any] | None, n_add: int) -> list[float]:
 
 
 def _extend_payload_clock_24_7(mark: dict[str, Any]) -> dict[str, Any]:
-    """Append 5m bars past the last equity print so crypto sleeves keep updating.
+    """Append off-hours 5m bars so CrestDay can tick after the cash close.
 
-    Only extends outside the US cash session. During RTH, inventing flat equity
-    bars after a failed Yahoo pull made the chart look live while NAV was frozen.
+    Never invents bars that land inside a US cash session, and refuses to
+    extend across a missed RTH window. A failed Yahoo pull used to keep
+    appending flat equity NAV through subsequent trading days, which made
+    every sleeve look live while prices were frozen.
     """
     times = _payload_times(mark)
     if len(times) < 1:
         return mark
     now = _now_et_floor_5m()
     last = pd.Timestamp(times[-1])
-    if now <= last:
+    live_in = dict(mark.get("live") or {})
+    last_price = live_in.get("last_price_bar")
+    if not last_price:
+        stamp = _read_stamp()
+        last_price = stamp.get("last_bar") or last
+    try:
+        last_price_ts = pd.Timestamp(last_price)
+        if last_price_ts.tzinfo is not None:
+            last_price_ts = last_price_ts.tz_convert("America/New_York").tz_localize(None)
+        else:
+            last_price_ts = last_price_ts.tz_localize(None)
+    except (TypeError, ValueError):
+        last_price_ts = last
+    if last_price_ts < last:
+        mask = times <= last_price_ts
+        if bool(mask.any()) and int(mask.sum()) < len(times):
+            n_keep = int(mask.sum())
+            mark = dict(mark)
+            iso_keep = [pd.Timestamp(t).isoformat(timespec="minutes") for t in times[mask]]
+            mark["timestamps"] = iso_keep
+            mark["dates"] = iso_keep
+            mark["n_bars"] = n_keep
+            nav = dict(mark.get("nav") or {})
+            for key, series in list(nav.items()):
+                if isinstance(series, list) and series:
+                    nav[key] = series[:n_keep]
+            mark["nav"] = nav
+            candles = mark.get("candles")
+            if isinstance(candles, dict):
+                trimmed_c = dict(candles)
+                for key, rows in list(trimmed_c.items()):
+                    if isinstance(rows, list):
+                        trimmed_c[key] = rows[:n_keep]
+                mark["candles"] = trimmed_c
+            times = times[mask]
+            last = pd.Timestamp(times[-1])
+    until = offhours_extend_until(last_price_ts, now)
+    live_in["last_price_bar"] = pd.Timestamp(last_price_ts).isoformat(timespec="minutes")
+    live_in["prices_stale"] = bool(prices_are_stale(last_price_ts, now))
+    if until is None:
+        mark = dict(mark)
+        mark["live"] = live_in
         return mark
-    # During RTH wait for real Yahoo bars — do not ffill invent.
-    if _equity_rth_open_now():
-        return mark
-    extra = pd.date_range(last + pd.Timedelta(minutes=5), now, freq="5min")
+    extra = pd.date_range(last + pd.Timedelta(minutes=5), until, freq="5min")
+    extra = extra[[not _is_equity_rth_timestamp(t) for t in extra]]
     # Cap weekend growth (~3 calendar days of 5m bars).
     max_extra = 3 * 24 * 12
     if len(extra) > max_extra:
         extra = extra[-max_extra:]
     if len(extra) < 1:
+        mark = dict(mark)
+        mark["live"] = live_in
         return mark
 
     n_add = int(len(extra))
@@ -1021,9 +1453,11 @@ def _extend_payload_clock_24_7(mark: dict[str, Any]) -> dict[str, Any]:
             new_candles[key] = _candles_to_payload(new_times, ohlc)
         mark["candles"] = new_candles
 
-    live = dict(mark.get("live") or {})
+    live = {**live_in, **dict(mark.get("live") or {})}
     live["as_of_bar"] = iso[-1]
     live["as_of_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    live["last_price_bar"] = live_in["last_price_bar"]
+    live["prices_stale"] = live_in["prices_stale"]
     live["crypto_clock"] = "24_7"
     if not _equity_rth_open_now():
         live["equity_session"] = "closed"
@@ -1137,7 +1571,7 @@ def _finalize_forward_mark(
 def _yahoo_chart_ohlc(
     symbol: str,
     *,
-    range_key: str = "5d",
+    range_key: str = "1mo",
     interval: str = BAR_INTERVAL,
     timeout_s: float = 12.0,
 ) -> pd.DataFrame:
@@ -1240,25 +1674,31 @@ def _fetch_intraday_ohlc(
 
     labels = list(symbols.keys())
     ticker_list = list(dict.fromkeys([*symbols.values(), spy_symbol]))
-    # 5d of 5m bars covers the live forward window without the monthly
-    # downgrade Yahoo applies to range=max.
-    range_key = "5d"
     since_ts = pd.Timestamp(since)
 
     frames_by_sym: dict[str, pd.DataFrame] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(ticker_list))) as pool:
-        futs = {
-            pool.submit(_yahoo_chart_ohlc, sym, range_key=range_key, interval=BAR_INTERVAL): sym
-            for sym in ticker_list
-        }
-        for fut in as_completed(futs):
-            sym = futs[fut]
-            try:
-                frames_by_sym[sym] = fut.result()
-            except Exception:  # noqa: BLE001
-                frames_by_sym[sym] = pd.DataFrame()
+    spy_df = pd.DataFrame()
+    # 1mo of 5m bars covers a missed-session gap; 5d is the fallback if Yahoo
+    # refuses the longer range. range=max downgrades 5m to daily — never use it.
+    for range_key in YAHOO_INTRADAY_RANGES:
+        frames_by_sym = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(ticker_list))) as pool:
+            futs = {
+                pool.submit(
+                    _yahoo_chart_ohlc, sym, range_key=range_key, interval=BAR_INTERVAL
+                ): sym
+                for sym in ticker_list
+            }
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    frames_by_sym[sym] = fut.result()
+                except Exception:  # noqa: BLE001
+                    frames_by_sym[sym] = pd.DataFrame()
+        spy_df = frames_by_sym.get(spy_symbol, pd.DataFrame())
+        if not spy_df.empty:
+            break
 
-    spy_df = frames_by_sym.get(spy_symbol, pd.DataFrame())
     if spy_df.empty:
         raise RuntimeError(f"Yahoo chart returned no {BAR_INTERVAL} SPY rows ({spy_symbol})")
     spy_df = spy_df[spy_df.index >= since_ts]
@@ -1271,22 +1711,25 @@ def _fetch_intraday_ohlc(
     frames: dict[str, pd.DataFrame] = {}
     for lab, sym in symbols.items():
         df = frames_by_sym.get(sym, pd.DataFrame())
+        aligned = pd.DataFrame(index=clock, dtype=np.float64)
         if df.empty:
-            raise RuntimeError(f"missing {BAR_INTERVAL} history for {lab} ({sym})")
+            # Do not abort the whole book — NaNs are filled from the NPZ cache
+            # (or flattened to last close) after merge. One missing FX/index
+            # ticker previously froze every sleeve.
+            aligned["Open"] = np.nan
+            aligned["High"] = np.nan
+            aligned["Low"] = np.nan
+            aligned["Close"] = np.nan
+            frames[lab] = aligned
+            continue
         df = df[df.index >= since_ts] if len(df) else df
         close_ff = df["Close"].reindex(clock, method="ffill")
-        # Prepend a short bfill only at the head if the asset lists after SPY open.
         if close_ff.isna().any():
             close_ff = close_ff.bfill()
         native = df.reindex(clock)
-        aligned = pd.DataFrame(index=clock)
         aligned["Close"] = close_ff
         for col in ("Open", "High", "Low"):
             aligned[col] = native[col].where(native[col].notna(), close_ff)
-        if aligned["Close"].isna().any():
-            raise RuntimeError(
-                f"could not align {BAR_INTERVAL} bars for {lab} ({sym}) onto SPY clock"
-            )
         frames[lab] = aligned
 
     o = np.column_stack([frames[lab]["Open"].to_numpy(dtype=np.float64) for lab in labels])
@@ -1387,15 +1830,40 @@ def refresh_forward_mark_live(
     latest_w = _latest_shadow_weights(rid) or (existing or {}).get("latest_weights")
     if not isinstance(latest_w, dict) or not latest_w:
         latest_w = {"Cash": 1.0}
+    ge_events = load_shadow_weight_events(exec_root / f"shadow_ledger_{rid}.jsonl")
+    paper_w = _weights_from_paper_state(rid)
+    if paper_w:
+        paper_st = _read_json_file(_PAPER_STATE_BY_RUN.get(str(rid).upper(), Path()))
+        extra_ts = ledger_effective_ts(
+            {
+                "recorded_at_utc": paper_st.get("updated_at_utc"),
+                "trade_date": paper_st.get("last_trade_date"),
+            }
+        )
+        ge_events.append(
+            (extra_ts or pd.Timestamp.now(tz="America/New_York").tz_localize(None), paper_w)
+        )
+        ge_events.sort(key=lambda item: item[0])
+        latest_w = dict(paper_w)
+    elif ge_events:
+        latest_w = dict(ge_events[-1][1])
 
     rl_symbols = dict(cfg.universe.assets)
     rl_labels = list(rl_symbols.keys())
     stock_book = _is_external_weight_book(
         latest_w, run_id=rid, cfg_asset_keys=rl_labels
     )
+    paper_cash, paper_lots, lots_start = load_paper_share_book(rid)
     stock_symbols: dict[str, str] = {}
     if stock_book:
-        stock_symbols = _stock_symbols_from_weights(latest_w)
+        merged_w = dict(latest_w)
+        for _, book in ge_events:
+            merged_w.update(
+                {k: v for k, v in book.items() if str(k).upper() not in {"CASH", "USD"} and abs(float(v)) > 1e-12}
+            )
+        for lab in paper_lots:
+            merged_w.setdefault(lab, 1.0)
+        stock_symbols = _stock_symbols_from_weights(merged_w)
         if not stock_symbols:
             stock_symbols = {"SPY": "SPY"}
         tickers = list(stock_symbols.keys())
@@ -1406,22 +1874,13 @@ def refresh_forward_mark_live(
         tickers = list(cfg.universe.tickers)
         labels = ["Cash"] + rl_labels
 
-    # Fetch RL sleeve always (EW-10 + LIVE_MODEL); add external book symbols when needed.
+    # Fetch RL sleeve always (EW-10 + RLModel); add external book symbols when needed.
     symbols: dict[str, str] = dict(rl_symbols)
     symbols.update(stock_symbols)
     live_vec = _weight_vector(latest_w, labels)
-    rl_live_w = _latest_shadow_weights(RL_LIVE_RUN_ID)
-    if not isinstance(rl_live_w, dict) or not rl_live_w:
-        rl_mark = load_forward_mark(RL_LIVE_RUN_ID)
-        rl_live_w = (rl_mark or {}).get("latest_weights") if rl_mark else None
-    if not isinstance(rl_live_w, dict) or not rl_live_w:
-        rl_live_w = None
+    rl_events = load_shadow_weight_events(exec_root / f"shadow_ledger_{RL_LIVE_RUN_ID}.jsonl")
     rl_labels_full = ["Cash"] + rl_labels
-    rl_vec = (
-        _weight_vector(rl_live_w, rl_labels_full)
-        if rl_live_w is not None
-        else None
-    )
+    live_model_start = resolve_live_model_start(existing, stamp)
 
     fetched = False
     times: pd.DatetimeIndex
@@ -1521,12 +1980,12 @@ def refresh_forward_mark_live(
             },
             root,
         )
-        # Yahoo 5m tops out near 5 trading days per request; local NPZ keeps
-        # older bars so the book can grow past a single session. On reset, pull
-        # only from book_start (today). Otherwise pull the trailing ~5d and merge.
+        # Yahoo 5m tops out near 60 calendar days; local NPZ keeps older bars.
+        # Pull a trailing ~1mo (not 5d) so a multi-day outage still overlaps cache.
         book_ts = pd.Timestamp(book_start).date()
         yahoo_floor = (
-            pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=5)
+            pd.Timestamp.now(tz="America/New_York")
+            - pd.Timedelta(days=INTRADAY_LOOKBACK_DAYS)
         ).date()
         since = str(book_ts if reset_book or book_ts >= yahoo_floor else yahoo_floor)
         from rlbot.forward_mark import call_with_timeout
@@ -1535,7 +1994,7 @@ def refresh_forward_mark_live(
         fetch_ok = False
         try:
             # Stock book + RL sleeve can be ~40 symbols; allow a longer pull.
-            fetch_timeout = 45.0 if (force_price_refresh or stock_book or reset_book) else 15.0
+            fetch_timeout = 45.0 if (force_price_refresh or stock_book or reset_book) else 25.0
             times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
                 _fetch_intraday_ohlc,
                 fetch_timeout,
@@ -1671,14 +2130,15 @@ def refresh_forward_mark_live(
         # Cold start / stale label set — fetch once.
         book_ts = pd.Timestamp(book_start).date()
         yahoo_floor = (
-            pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=5)
+            pd.Timestamp.now(tz="America/New_York")
+            - pd.Timedelta(days=INTRADAY_LOOKBACK_DAYS)
         ).date()
         since = str(book_ts if reset_book or book_ts >= yahoo_floor else yahoo_floor)
         from rlbot.forward_mark import call_with_timeout
 
         times, o, h, l, c, so, sh, sl, sc = call_with_timeout(
             _fetch_intraday_ohlc,
-            45.0 if (force_price_refresh or stock_book or reset_book) else 20.0,
+            45.0 if (force_price_refresh or stock_book or reset_book) else 30.0,
             symbols,
             since=since,
         )
@@ -1755,6 +2215,8 @@ def refresh_forward_mark_live(
     if o is None or len(times) < 1:
         return _finalize_forward_mark(existing) if isinstance(existing, dict) else existing
 
+    o, h, l, c, so, sh, sl, sc = _fill_ohlc_nans(o, h, l, c, so, sh, sl, sc)
+
     lab_index = {lab: i for i, lab in enumerate(fetch_labels)}
 
     def _cols(labs: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1764,22 +2226,48 @@ def refresh_forward_mark_live(
             return empty, empty, empty, empty
         return o[:, idx], h[:, idx], l[:, idx], c[:, idx]
 
+    ge_W = weight_matrix_from_events(times, ge_events, labels)
+    if ge_W.shape[0]:
+        live_vec = ge_W[-1]
     if stock_book:
         book_labs = list(stock_symbols.keys())
         o_book, h_book, l_book, c_book = _cols(book_labs)
-        model_ohlc = portfolio_ohlc_candles(
-            o_book,
-            h_book,
-            l_book,
-            c_book,
-            live_vec,
-            initial_cash=initial_cash,
-            cash_yield_per_bar=cash_yield_bar,
-        )
+        if paper_lots and c_book.shape[1]:
+            qty = np.asarray([float(paper_lots.get(lab, 0.0)) for lab in book_labs], dtype=np.float64)
+            model_ohlc = lots_ohlc_candles(
+                o_book,
+                h_book,
+                l_book,
+                c_book,
+                cash=paper_cash,
+                quantities=qty,
+                times=times,
+                start=lots_start,
+                initial_cash=initial_cash,
+            )
+            last_nav = float(model_ohlc[-1, 3]) if len(model_ohlc) else float(initial_cash)
+            last_px = c_book[-1]
+            lot_w = {"CASH": float(paper_cash)}
+            for i, lab in enumerate(book_labs):
+                lot_w[lab] = float(qty[i]) * float(last_px[i]) if i < last_px.shape[0] else 0.0
+            if last_nav > 1e-12:
+                lot_w = {k: v / last_nav for k, v in lot_w.items()}
+            latest_w = lot_w
+            live_vec = _weight_vector(latest_w, labels)
+        else:
+            model_ohlc = portfolio_ohlc_candles(
+                o_book,
+                h_book,
+                l_book,
+                c_book,
+                ge_W,
+                initial_cash=initial_cash,
+                cash_yield_per_bar=cash_yield_bar,
+            )
         last_closes_book = c_book[-1] if c_book.shape[1] else None
     else:
         model_ohlc = portfolio_ohlc_candles(
-            o, h, l, c, live_vec, initial_cash=initial_cash, cash_yield_per_bar=cash_yield_bar
+            o, h, l, c, ge_W, initial_cash=initial_cash, cash_yield_per_bar=cash_yield_bar
         )
         last_closes_book = c[-1]
 
@@ -1789,13 +2277,18 @@ def refresh_forward_mark_live(
     spy_ohlc = spy_ohlc_candles(so, sh, sl, sc, initial_cash=initial_cash)
 
     live_model_ohlc = None
-    if rl_vec is not None and o_rl.shape[1] == len(rl_labels):
-        live_model_ohlc = portfolio_ohlc_candles(
+    if o_rl.shape[1] == len(rl_labels):
+        rl_W = weight_matrix_from_events(
+            times, rl_events, rl_labels_full, start=live_model_start
+        )
+        live_model_ohlc = mtm_ohlc_from_start(
             o_rl,
             h_rl,
             l_rl,
             c_rl,
-            rl_vec,
+            rl_W,
+            times=times,
+            start=live_model_start,
             initial_cash=initial_cash,
             cash_yield_per_bar=rl_cash_yield_bar,
         )
@@ -1809,7 +2302,7 @@ def refresh_forward_mark_live(
         else None
     )
 
-    w_mat = np.tile(live_vec, (len(times), 1))
+    w_mat = ge_W
     candles_payload: dict[str, Any] = {
         "model": _candles_to_payload(times, model_ohlc),
         "equal_weight": _candles_to_payload(times, ew_ohlc),
@@ -1819,14 +2312,16 @@ def refresh_forward_mark_live(
         candles_payload["live_model"] = _candles_to_payload(times, live_model_ohlc)
 
     note = (
-        f"GENERAL_EQUITY1 (GeneralEquity1) + LIVE_MODEL RL sleeve since {book_start}. "
+        f"GENERAL_EQUITY1 (GeneralEquity1) since {book_start} marked from paper share lots "
+        f"(last trade {lots_start.date() if lots_start is not None else 'n/a'}); "
+        f"RLModel from {live_model_start.date()} at $100k, then shadow-ledger books as recorded. "
         "Equal-weight is the original 10-asset research universe (not algo ETF weights). "
         if stock_book
         else f"Live 5-minute NAV candles on the SPY session clock since {book_start} "
-        "from latest target weights + Yahoo OHLC (model / EW / SPY). "
+        "from the shadow-ledger weight path + Yahoo OHLC (model / EW / SPY). "
         "Foreign-session assets carry the last print forward. "
     ) + (
-        f"History accumulates in execution/ (Yahoo 5m lookback ~5d per pull). "
+        f"History accumulates in execution/ (Yahoo 5m lookback ~{INTRADAY_LOOKBACK_DAYS}d per pull). "
         f"Prices refresh about every {max(min_refresh_seconds, 60) // 60} min."
     )
 
@@ -1853,6 +2348,7 @@ def refresh_forward_mark_live(
         nav_live_model=nav_live,
     )
     payload["book_start"] = str(book_start)
+    payload["live_model_start"] = pd.Timestamp(live_model_start).isoformat(timespec="minutes")
     positions = _positions_snapshot(
         latest_w,
         nav=float(nav_model[-1]),
@@ -1862,16 +2358,20 @@ def refresh_forward_mark_live(
     )
     payload["positions"] = positions
     payload["companion_run_id"] = RL_LIVE_RUN_ID if nav_live is not None else None
+    last_bar_iso = pd.Timestamp(times[-1]).isoformat(timespec="minutes")
     payload["live"] = {
         "prices_refreshed": fetched,
-        "as_of_bar": pd.Timestamp(times[-1]).isoformat(timespec="minutes"),
+        "as_of_bar": last_bar_iso,
         "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "min_refresh_seconds": int(min_refresh_seconds),
         "bar_interval": BAR_INTERVAL,
         "source": "yfinance_5m",
         "book_start": str(book_start),
         "session_start": str(book_start),
+        "live_model_start": pd.Timestamp(live_model_start).isoformat(timespec="minutes"),
         "reset_book": bool(reset_book),
+        "last_price_bar": last_bar_iso,
+        "prices_stale": False,
     }
     payload["latest_weights"] = {
         labels[i]: float(live_vec[i]) for i in range(len(labels))

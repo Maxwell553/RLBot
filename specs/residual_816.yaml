@@ -1,0 +1,25 @@
+id: "816"
+hypothesis: >
+  Residual policy on frozen 809. Lock equal-weight as the core sleeve; the
+  policy outputs per-name tilts clipped to ±8 pp and projected back to the
+  simplex. PPO stops relearning "don't go to cash" and only learns tilts.
+  One change vs 809_720_plus (LSTM 64, inactivity 0.35/0.15, fee_ramp 0.45).
+  Do not train hotter DD/vol, crash taper, cash-centered selection, LSTM 128,
+  faster EMA, fee_ramp 0.30, QQQ, or cap 0.60.
+parent: "809"
+base_config: config/config.yaml
+patch:
+  environment.residual_actions: true
+  environment.residual_clip: 0.08
+  environment.residual_core: equal_weight
+seeds: [0, 42]
+windows:
+  - name: W1
+  - name: W2
+  - name: W3
+  - name: W4
+  - name: W5
+timesteps: 50000000
+evaluation_tier: 3
+success_gates:
+  min_seeds: 2

@@ -30,8 +30,7 @@ from rlbot.pack_general_equity1 import (
 )
 from rlbot.prod_return_alpha import (
     fetch_daily_ohlc,
-    month_end_mask,
-    week_end_mask,
+    session_rebalance_flags,
     weights_with_cash,
 )
 from rlbot.run_artifacts import PROJECT_ROOT
@@ -91,7 +90,12 @@ def load_state(initial_cash: float = DEFAULT_INITIAL_CASH) -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
-    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    trade = str(state.get("last_trade_date") or "").strip()
+    today = datetime.now(timezone.utc).date().isoformat()
+    # Keep the fill timestamp on later hold-only marks so 5m lot MTM still
+    # starts at the actual trade, not "now".
+    if not state.get("updated_at_utc") or trade == today:
+        state["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _write_json(STATE_PATH, state)
 
 
@@ -308,7 +312,7 @@ def build_daily_forward_mark(
         note=(
             f"{STRATEGY_ID} (GeneralEquity1 pack): weekly TQQQ+QQQ hybrid + month-end "
             "dual momentum. Live 5m MTM via /api/forward; EW-10 = research sleeve; "
-            "LIVE_MODEL companion."
+            "RLModel companion."
         ),
     )
     eq = float(state.get("equity") or initial)
@@ -374,9 +378,25 @@ def run_paper_day(
     )
     flat = _update_cool_state(state, float(state["equity"]), params)
 
-    # Signals from locked GeneralEquity1 pack (bars.db) — not the Yahoo fork.
-    plan = pack_paper_plan(aum=float(state["equity"] or initial_cash))
-    targets = latest_portfolio_weights(aum=float(state["equity"] or initial_cash))
+    # Locked rules on the live Yahoo daily panel (not frozen pack bars.db).
+    panel_dates = dates[: i + 1]
+    panel_closes = {k: np.asarray(v[: i + 1], dtype=np.float64) for k, v in closes.items()}
+    panel_ohlc = {
+        k: tuple(np.asarray(x[: i + 1], dtype=np.float64) for x in tup)
+        for k, tup in _ohlc.items()
+    }
+    plan = pack_paper_plan(
+        aum=float(state["equity"] or initial_cash),
+        dates=panel_dates,
+        closes=panel_closes,
+        ohlc=panel_ohlc,
+    )
+    targets = latest_portfolio_weights(
+        aum=float(state["equity"] or initial_cash),
+        dates=panel_dates,
+        closes=panel_closes,
+        ohlc=panel_ohlc,
+    )
     if flat:
         # Cool-down: park sleeve A (risky ETFs except dual/GLD stay if already dual-only).
         dual_keys = {str(plan.get("targets", {}).get("dual_asset") or "GLD").upper()}
@@ -391,34 +411,34 @@ def run_paper_day(
         actions_note = "flat_a"
     else:
         actions_note = "pack_signal"
+    # Live calendar only. Pack week_end_mask always flags the series tip.
+    wk_live, me_live = session_rebalance_flags(dates, i)
     meta = {
         "source": "GeneralEquity1",
         "pack_asof": plan.get("asof"),
-        "equity_rebalance_due": plan.get("equity_rebalance_due"),
-        "dual_rebalance_due": plan.get("dual_rebalance_due"),
+        "equity_rebalance_due": wk_live,
+        "dual_rebalance_due": me_live,
         "portfolio_targets": plan.get("portfolio_targets"),
         "flat_a": flat,
         "actions_note": actions_note,
+        "data_source": plan.get("data_source"),
     }
-    # Rebalance when pack says week/month-end due or book empty.
-    wk = week_end_mask(dates)
-    me = month_end_mask(dates)
     rebal = bool(
-        plan.get("equity_rebalance_due")
-        or plan.get("dual_rebalance_due")
-        or wk[i]
-        or me[i]
-        or not (state.get("positions") or {})
+        wk_live or me_live or not (state.get("positions") or {})
     )
     actions: list[str] = [f"signal:{day}", actions_note]
     orders: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
+    already_traded = str(state.get("last_trade_date") or "") == str(day)
+    if rebal and already_traded:
+        actions.append("already_traded")
+        rebal = False
 
     if rebal:
         actions.append("rebalance")
-        if wk[i] or plan.get("equity_rebalance_due"):
+        if wk_live:
             actions.append("week_end")
-        if me[i] or plan.get("dual_rebalance_due"):
+        if me_live:
             actions.append("month_end")
         orders = orders_to_targets(
             float(state["equity"]),

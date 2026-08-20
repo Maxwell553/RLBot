@@ -23,6 +23,7 @@ import numpy as np  # noqa: E402
 from rlbot.data_utils import clip_index_until, load_cache, resolve_panel_tickers  # noqa: E402
 from rlbot.inference_load import load_recurrent_ppo_inference  # noqa: E402
 from rlbot.inference_output import build_weights_payload  # noqa: E402
+from rlbot.inference_overlay import parse_overlay_names, spec_from_cli  # noqa: E402
 from rlbot.rl_config import get_config, load_config, set_config  # noqa: E402
 from rlbot.research import oos_ledger  # noqa: E402
 from rlbot.run_artifacts import (  # noqa: E402
@@ -97,6 +98,17 @@ def main() -> None:
         help="Include the final VecNormalize-normalized observation in the payload "
         "(z-scores vs frozen training stats; consumed by shadow_trade's drift alarm).",
     )
+    parser.add_argument(
+        "--overlay",
+        default="",
+        metavar="LIST",
+        help="Written overlay on 809 weights: comma-separated vol_target, trend, ew_blend. "
+        "Keep off until an overlay beats 809 s0 on W2–W4 without parking W5.",
+    )
+    parser.add_argument("--overlay-vol-target", type=float, default=0.11)
+    parser.add_argument("--overlay-trend-fast", type=int, default=65)
+    parser.add_argument("--overlay-trend-slow", type=int, default=200)
+    parser.add_argument("--overlay-ew-alpha", type=float, default=0.25)
     args = parser.parse_args()
 
     run_id = args.run_id.strip()
@@ -171,6 +183,20 @@ def main() -> None:
         context="infer_weights",
     )
 
+    overlay_spec = None
+    overlay_raw = str(getattr(args, "overlay", "") or "").strip()
+    if overlay_raw:
+        overlay_spec = spec_from_cli(
+            names=parse_overlay_names(overlay_raw),
+            vol_target=float(args.overlay_vol_target),
+            trend_fast=int(args.overlay_trend_fast),
+            trend_slow=int(args.overlay_trend_slow),
+            ew_alpha=float(args.overlay_ew_alpha),
+            max_single_asset_weight=float(cfg.environment.max_single_asset_weight),
+        )
+        if overlay_spec is not None:
+            print(f"[infer] overlay {overlay_spec.name}")
+
     print(f"[infer] warming recurrent state over {warm} bars ending {as_of} ...")
     t0 = time.perf_counter()
     final_obs: list = []
@@ -193,6 +219,7 @@ def main() -> None:
         deterministic=True,
         collect_weights=True,
         obs_sink=final_obs,
+        overlay=overlay_spec,
     )
     if weights is None or len(weights) == 0:
         raise RuntimeError("rollout produced no weights")
@@ -225,6 +252,7 @@ def main() -> None:
         "feature_split_mode": cfg.data.feature_split_mode,
         "warmup_bars": warm,
         "obs_lag": obs_lag,
+        "overlay": overlay_spec.name if overlay_spec is not None else None,
         **git_provenance(),
     }
     obs_norm = final_obs[0].tolist() if final_obs else None

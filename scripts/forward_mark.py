@@ -9,9 +9,9 @@ Wraps ``scripts/backtest.py --export-forward-mark`` so a daily cron can:
 
 Example::
 
-    python scripts/forward_mark.py --run-id LIVE_MODEL --refresh-data
+    python scripts/forward_mark.py --run-id RLModel --refresh-data
     # or the daily wrapper (shadow record + reconcile + mark):
-    bash scripts/daily_live_forward.sh --run-id LIVE_MODEL
+    bash scripts/daily_live_forward.sh --run-id RLModel
 """
 
 from __future__ import annotations

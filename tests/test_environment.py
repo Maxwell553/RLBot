@@ -81,7 +81,13 @@ def test_simplex_uniform_logits() -> None:
 
 def test_simplex_all_cash_preference() -> None:
     action = np.full(_N_ACTIONS, -10.0)
-    action[0] = 20.0
+    env_cfg = get_config().environment
+    if bool(getattr(env_cfg, "residual_actions", False)):
+        pytest.skip("residual policy locks an invested core; cash is not a free logit")
+    if bool(getattr(env_cfg, "two_head_actions", False)):
+        action[0] = -20.0  # exposure logit → ~0 gross
+    else:
+        action[0] = 20.0  # softmax cash logit
     w = portfolio_weights_from_action(action, n_actions=_N_ACTIONS)
     _assert_valid_weights(w)
     assert w[0] > 0.5
@@ -408,7 +414,11 @@ def test_volatility_penalty_logged_after_min_steps() -> None:
             _, _, _, _, info = env.step(action)
             vols.append(float(info["rew_decomp/volatility"]))
         assert vols[0] == pytest.approx(0.0)
-        assert min(vols[3:]) < 0.0
+        if str(get_config().reward.vol_penalty_mode) == "absolute":
+            assert min(vols[3:]) < 0.0
+        else:
+            # excess mode (809): tax only vs the passive book — may be ~0 here
+            assert all(v <= 1e-12 for v in vols)
     finally:
         set_config(base)
 
@@ -473,7 +483,9 @@ def test_inactivity_penalty_bounded_at_full_cash() -> None:
     """
     rwd = get_config().reward
     expected = rwd.inactivity_penalty_over_50 + rwd.inactivity_penalty_over_90
-    assert expected == pytest.approx(0.0, abs=1e-12)
+    # Frozen 809 restores the cash-park tax (0.35 + 0.15). Parser default 0
+    # preserves 729+/810–814 snapshots that omitted the knobs.
+    assert expected == pytest.approx(0.50, abs=1e-12)
 
 
 def test_turnover_penalty_ramps_with_churn_curriculum() -> None:

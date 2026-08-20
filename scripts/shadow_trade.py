@@ -84,6 +84,12 @@ def _append_jsonl(path: Path, rec: dict) -> None:
         f.write(json.dumps(rec, default=str) + "\n")
 
 
+def _is_reset_stub(rec: dict) -> bool:
+    """Cash-flatten rows must not occupy the (decision_bar, checkpoint) dedupe key."""
+    note = str(rec.get("note") or "").lower()
+    return "reset to 100k" in note or "flat paper book" in note
+
+
 def _bind_run_config(run_id: str, use_current: bool) -> None:
     snap = RunPaths(run_id).config_snapshot
     if snap.is_file() and not use_current:
@@ -181,6 +187,7 @@ def cmd_record(args: argparse.Namespace) -> None:
     existing = {
         (str(r.get("decision_bar") or r.get("as_of")), str(r.get("checkpoint")))
         for r in _read_jsonl(ledger_path(run_id))
+        if not _is_reset_stub(r)
     }
     if dedupe_key in existing:
         print(f"[shadow] {run_id}: decision bar {decision_bar} ({args.checkpoint}) "

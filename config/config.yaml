@@ -42,6 +42,10 @@ environment:
   # so the policy has an explicit gross-exposure head instead of burying cash in a
   # joint softmax (726 stayed ~fully invested OOS on W2–W5).
   two_head_actions: true
+  # Residual policy (cohort 816 only): lock EW core, learn ±clip tilts. Off for 809.
+  residual_actions: false
+  residual_clip: 0.08
+  residual_core: equal_weight  # equal_weight | reward_benchmark
   # Cohort 809 / 806_720_plus: no mechanical crash floor (807–808 parked cash).
   dd_exposure_taper: false
   dd_exposure_taper_start: 0.04
@@ -97,6 +101,11 @@ reward:
   concentration_penalty: 0.75
   concentration_target_eff_assets: 6.0
   cash_daily_yield: 0.00015
+  # Cohort 809: cash-park tax (omitted in later yaml; 810–814 trained without it).
+  inactivity_penalty_over_50: 0.35
+  inactivity_penalty_over_90: 0.15
+  inactivity_vix_relief: 1.0
+  eval_inactivity_penalty_scale: 1.0
   participation_bonus: 0.02
   participation_reward_scale: 10.0
   participation_vix_relief: 1.0
@@ -117,8 +126,8 @@ transaction_costs:
 hyperparameters:
   learning_rate: 3.0e-4
   learning_rate_floor: 1.0e-6
-  # phase_aware: hold 3e-4 until DR widening completes (~27.5M on the cohort-802
-  # 50M schedule), then cosine → floor over the settled remainder. The legacy global
+  # phase_aware: hold 3e-4 until DR widening completes (~35M on the 809 50M
+  # schedule), then cosine → floor over the settled remainder. The legacy global
   # cosine had LR at ~1e-4 by the best-model gate and ~2e-5 at full DR — adaptation
   # was frozen exactly while fee/lag conditions were still changing (723/724 evidence:
   # post-gate eval scores declined monotonically and never recovered).
@@ -137,6 +146,7 @@ hyperparameters:
   weight_decay: 1.0e-3
 
 policy:
+  # Frozen 809 / 809_720_plus: LSTM 64. Do not train 128 (that was 815).
   lstm_hidden_size: 64
   n_lstm_layers: 2
   net_arch_pi: [128, 128]
@@ -202,20 +212,20 @@ entropy_schedule:
   early_floor: 0.01
   early_floor_high: 0.02
   warmup_improvements: 5  # logged only (eval NAV); does not gate decay
-  decay_start_fraction: 0.30  # cosine decay starts after fee_ramp_fraction (0.30)
+  decay_start_fraction: 0.45  # cosine decay starts after fee_ramp_fraction (0.45)
   dr_lock_fraction: 0.10
-  early_floor_fraction: 0.30  # exploration floors through fee ramp (same milestone as decay start)
+  early_floor_fraction: 0.45  # exploration floors through fee ramp (same milestone as decay start)
 
 # Smoothed curriculum track: spread fee / churn / DR shifts across the 50M run (avoids mid-run cliffs).
 curriculum:
   budget_short: 50000000
   budget_long: 120000000
-  # ≤ budget_short: fraction-of-run schedule. Cohort 802 keeps 801's earlier gate
-  # (0.10/0.30): full fees ~15M, DR widen → ~27.5M, ~22.5M settled full-DR.
+  # ≤ budget_short: 809 schedule (0.10/0.45): full fees ~22.5M, DR widen → ~35M,
+  # ~15M settled full-DR (patience-12 stop ~41–49M). 810–814 used 0.30 by mistake.
   fee_free_fraction: 0.10   # ~5M
-  fee_ramp_fraction: 0.30   # ~15M
+  fee_ramp_fraction: 0.45   # ~22.5M
   churn_ramp_floor: 0.10  # churn scale at fee-ramp start; ramps to 1.0 by fee_ramp_end
-  # 0.25 → DR widen ends ~27.5M (fee_ramp 15M + 12.5M), leaving ~22.5M stationary full-DR.
+  # 0.25 → DR widen ends ~35M (fee_ramp 22.5M + 12.5M), leaving ~15M stationary full-DR.
   dr_widen_span_fraction: 0.25
   # Long-run anchors (≥ budget_long)
   fee_free_long: 13300000

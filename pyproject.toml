@@ -37,6 +37,7 @@ market-trainer-workflow-api = "scripts.workflow_api:main"
 dev = ["pytest>=7.0.0"]
 modal = ["modal>=0.66.0", "fastapi>=0.100.0"]
 api = ["fastapi>=0.100.0", "uvicorn>=0.23.0", "curl-cffi>=0.15.0"]
+live = ["ib_insync>=0.9.86"]
 
 [tool.pytest.ini_options]
 # Only collect from tests/ — Runs/<id>/provenance/untracked/ archives untracked

@@ -167,11 +167,24 @@ def portfolio_weights_from_action(
     Cash competes for probability mass with every asset. Risky legs are long-only with a
     per-asset cap; overflow is redistributed across other active risky assets before cash.
 
-    When ``environment.two_head_actions`` is enabled, delegates to
-    :func:`rlbot.two_head_actions.portfolio_weights_two_head` (exposure head + allocation
-    head). That path changes the policy class — keep it off for reward/curriculum A/Bs.
+    When ``environment.residual_actions`` is enabled, delegates to
+    :func:`rlbot.residual_actions.portfolio_weights_residual` (locked core + clipped
+    tilts). That mapping takes precedence over two-head / softmax-over-cash so PPO
+    only learns allocation tilts.
+
+    When ``environment.two_head_actions`` is enabled (and residual is off), delegates
+    to :func:`rlbot.two_head_actions.portfolio_weights_two_head` (exposure head +
+    allocation head). That path changes the policy class — keep it off for
+    reward/curriculum A/Bs.
     """
-    if bool(getattr(get_config().environment, "two_head_actions", False)):
+    env_cfg = get_config().environment
+    if bool(getattr(env_cfg, "residual_actions", False)):
+        from rlbot.residual_actions import portfolio_weights_residual
+
+        return portfolio_weights_residual(
+            action, n_actions=n_actions, asset_live=asset_live
+        )
+    if bool(getattr(env_cfg, "two_head_actions", False)):
         from rlbot.two_head_actions import portfolio_weights_two_head
 
         return portfolio_weights_two_head(
@@ -537,6 +550,11 @@ class MultiAssetPortfolioEnv(gym.Env):
         )
         self._action_smoothing_alpha = float(np.clip(alpha, 0.0, 1.0))
         self._smoothed_action: np.ndarray | None = None
+        # Inference-only written overlay (vol-target / NAV trend / EW blend). Training
+        # never attaches one. ``_weight_override`` replays a stored target-weight row
+        # (seed-ensemble blend) and skips action mapping for that step.
+        self._inference_overlay = None
+        self._weight_override: np.ndarray | None = None
 
         n_live = self.n_assets
         n_port = self.n_actions
@@ -997,6 +1015,9 @@ class MultiAssetPortfolioEnv(gym.Env):
         self._prev_target_w = np.zeros(self.n_actions, dtype=np.float64)
         self._prev_target_w[0] = 1.0
         self._smoothed_action = None
+        if self._inference_overlay is not None:
+            self._inference_overlay.reset()
+        self._weight_override = None
 
         if self.domain_randomize and self.random_start:
             self.obs_lag = self._sample_dr_obs_lag()
@@ -1067,7 +1088,7 @@ class MultiAssetPortfolioEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         action = np.asarray(action, dtype=np.float64).reshape(-1)
-        if self._action_smoothing_alpha > 0.0:
+        if self._weight_override is None and self._action_smoothing_alpha > 0.0:
             if self._smoothed_action is None or self._steps == 0:
                 self._smoothed_action = action.copy()
             else:
@@ -1082,11 +1103,19 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         open_next = self.ohlcv[self._t + 1, :, 0]
         live_t = self.asset_live[max(self._t - self.obs_lag, 0)]
-        w = portfolio_weights_from_action(
-            action_for_weights,
-            n_actions=self.n_actions,
-            asset_live=live_t,
-        )
+        if self._weight_override is not None:
+            w = np.asarray(self._weight_override, dtype=np.float64).reshape(-1).copy()
+            self._weight_override = None
+            if w.shape[0] != self.n_actions:
+                raise ValueError(
+                    f"weight override length {w.shape[0]} != n_actions {self.n_actions}"
+                )
+        else:
+            w = portfolio_weights_from_action(
+                action_for_weights,
+                n_actions=self.n_actions,
+                asset_live=live_t,
+            )
         # Soft DD exposure taper (728+): de-risk toward cash as episode drawdown deepens.
         # Applied before rebalance so fills and reward see the tapered target.
         peak_before = self._episode_peak_nav
@@ -1101,6 +1130,8 @@ class MultiAssetPortfolioEnv(gym.Env):
                 end=float(self._env_cfg.dd_exposure_taper_end),
                 min_gross=float(self._env_cfg.dd_exposure_taper_min_gross),
             )
+        if self._inference_overlay is not None:
+            w = self._inference_overlay.apply(w, nav=v_pre, asset_live=live_t)
         rwd = self._reward_cfg
         # Scale churn with live VIX, read at the same obs_lag the observation uses
         # (undifferenced close) so churn shaping is causally consistent with policy input.

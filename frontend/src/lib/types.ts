@@ -218,7 +218,13 @@ export type ApiForwardLiveMeta = {
   source?: string
   crypto_clock?: string
   equity_session?: string
-}
+  last_price_bar?: string
+  prices_stale?: boolean
+  collector?: {
+    running?: boolean
+    last_tick_utc?: string
+    interval_s?: number
+  }
 
 export type ApiForwardCandle = {
   t: string
@@ -245,7 +251,7 @@ export type ApiForwardMark = {
     model: number[]
     spy: number[]
     equal_weight: number[]
-    /** Optional companion RL deploy (LIVE_MODEL) alongside GeneralEquity1. */
+    /** Optional companion RL deploy (RLModel) alongside GeneralEquity1. */
     live_model?: number[]
     /** Optional CrestDay pack mark (soft; may be absent). */
     crypto?: number[]
