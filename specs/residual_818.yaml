@@ -1,0 +1,36 @@
+id: "818"
+hypothesis: >
+  Residual policy on frozen 809, 817 tilts × 809 exposure head.
+  816 leaked cash through leftover underweights (~22–31% selected cash).
+  817 demeaned the sleeve and forced 100% invest, which deleted 809's
+  two-head gross lever (selected cash 0% vs 809 ~46%) and lost 6/10
+  matched cells on best_eval_score (median 0.27 vs 0.39). This cohort
+  keeps 817's sum-zero live tilts and scales that sleeve by the two-head
+  sigmoid on action[0], so cash is a first-class decision again. Same
+  ±8 pp EW-core clip. First gate: selected cash is learned (not stuck
+  at 0% and not a leftover >40%). Then median best_eval_score must beat
+  809's matched-cell median (~0.39) on the same 10 cells. Do not widen
+  clip, heat DD/vol, crash taper, LSTM 128, faster EMA, fee_ramp 0.30,
+  QQQ, or cap 0.60. DSR ≥ 0.95 is not a W1–W5 collect gate: those
+  windows already have ~40–52 distinct model reads; 809's best cell
+  (W1 s42, Sharpe 2.45) only reaches DSR ~0.87. Promote later on chained
+  multi-window + seed-median vs 809, not a single-window DSR print.
+parent: "809"
+base_config: config/config.yaml
+patch:
+  environment.residual_actions: true
+  environment.residual_fully_invested: true
+  environment.residual_keep_exposure: true
+  environment.residual_clip: 0.08
+  environment.residual_core: equal_weight
+seeds: [0, 42]
+windows:
+  - name: W1
+  - name: W2
+  - name: W3
+  - name: W4
+  - name: W5
+timesteps: 50000000
+evaluation_tier: 3
+success_gates:
+  min_seeds: 2

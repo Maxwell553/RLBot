@@ -350,3 +350,13 @@ def test_paper_lots_start_ignores_later_mark_timestamp() -> None:
     assert later_mark is not None
     assert str(later_mark.date()) == "2026-08-03"
     assert later_mark.hour == 9 and later_mark.minute == 30
+
+    after_hours_same_day = paper_lots_start_from_state(
+        {
+            "last_trade_date": "2026-08-20",
+            "updated_at_utc": "2026-08-20T21:24:00+00:00",
+        }
+    )
+    assert after_hours_same_day is not None
+    assert str(after_hours_same_day.date()) == "2026-08-20"
+    assert after_hours_same_day.hour == 9 and after_hours_same_day.minute == 30

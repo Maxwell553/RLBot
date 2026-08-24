@@ -1,0 +1,27 @@
+id: "817"
+hypothesis: >
+  Residual policy on frozen 809, fully invested. Same ±8 pp EW-core tilts as
+  816, but demean the live delta vector (sum-zero) and renormalize the live
+  sleeve so leftover underweights cannot sit in cash. 816's mapper leaked a
+  stealth de-gross (selected checkpoints still ~11–27% cash). First gate is
+  median selected-checkpoint cash ≲ 3–5%; then compare best_eval_score to 809
+  on the same 10 cells. Do not widen clip, heat DD/vol, crash taper, LSTM 128,
+  faster EMA, fee_ramp 0.30, QQQ, or cap 0.60 in this cohort.
+parent: "809"
+base_config: config/config.yaml
+patch:
+  environment.residual_actions: true
+  environment.residual_fully_invested: true
+  environment.residual_clip: 0.08
+  environment.residual_core: equal_weight
+seeds: [0, 42]
+windows:
+  - name: W1
+  - name: W2
+  - name: W3
+  - name: W4
+  - name: W5
+timesteps: 50000000
+evaluation_tier: 3
+success_gates:
+  min_seeds: 2

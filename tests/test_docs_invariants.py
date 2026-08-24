@@ -43,6 +43,8 @@ def test_live_config_is_frozen_809() -> None:
     assert cfg.reward.inactivity_penalty_over_90 == pytest.approx(0.15)
     assert cfg.curriculum.fee_ramp_fraction == pytest.approx(0.45)
     assert cfg.environment.residual_actions is False
+    assert cfg.environment.residual_fully_invested is False
+    assert cfg.environment.residual_keep_exposure is False
     assert cfg.environment.dd_exposure_taper is False
     assert cfg.environment.max_single_asset_weight == 0.20
 

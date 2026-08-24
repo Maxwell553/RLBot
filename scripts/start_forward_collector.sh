@@ -52,7 +52,7 @@ PY
 sleep 0.3
 pid="$(cat "$PIDFILE" 2>/dev/null || true)"
 if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-  echo "[forward-collector] started pid=$pid (5m Yahoo + GE1/Crest paper + RLModel shadow)"
+  echo "[forward-collector] started pid=$pid (5m Yahoo + GE1/CoreEquity/Crest paper + RLModel shadow)"
 else
   echo "[forward-collector] failed to start; see $ERR" >&2
   exit 1

@@ -63,7 +63,9 @@ function normalizeMandate(mandate: WorkflowMandate): WorkflowMandate {
 
 /**
  * Research data source:
- * - ``static`` (default) → Vite ``/data/*.json`` snapshots (milliseconds)
+ * - ``static`` (default) → Vite ``/data/*.json`` snapshots, with a live
+ *   ``/api/runs`` probe so OOS Sharpe/DSR from ``backtest_summary.json``
+ *   show on first paint (falls back to the snapshot if :8787 is down)
  * - ``api`` → live research API on :8787 (slow on iCloud Desktop)
  * - ``offline`` → labeled synthetic sandbox (no Runs/)
  *
@@ -211,24 +213,41 @@ export type RunQuery = {
   limit?: number
 }
 
+/** Prefer live research API in static mode (falls back to /data/*.json). */
+const SOFT_LIVE_RUNS_TIMEOUT_MS = 12_000
+
+async function tryLiveResearch<T>(path: string, signal?: AbortSignal, timeoutMs = SOFT_LIVE_RUNS_TIMEOUT_MS): Promise<T> {
+  return STATIC_DATA_MODE || API_URL === undefined
+    ? coordinator.request<T>(path, {}, signal, timeoutMs)
+    : request<T>(path, { signal }, timeoutMs)
+}
+
+function runsQueryParams(query: RunQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  if (query.prefix) params.set('prefix', query.prefix)
+  if (query.search) params.set('search', query.search)
+  if (query.status) params.set('status', query.status)
+  params.set('offset', String(query.offset ?? 0))
+  params.set('limit', String(query.limit ?? 50))
+  return params
+}
+
 export function fetchRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<DataState<ApiRunsPage>> {
   return toState(async () => {
-    if (STATIC_DATA_MODE) {
-      const data = await loadStaticRuns(query, signal)
+    const params = runsQueryParams(query)
+    const parsePage = (data: ApiRunsPage): ApiRunsPage => {
       assertShape(Array.isArray(data.runs), 'runs is not an array')
       assertShape(typeof data.total === 'number' && typeof data.counts?.all === 'number', 'runs pagination missing')
-      return data
+      return { ...data, runs: data.runs.map(normalizeRun) }
     }
-    const params = new URLSearchParams()
-    if (query.prefix) params.set('prefix', query.prefix)
-    if (query.search) params.set('search', query.search)
-    if (query.status) params.set('status', query.status)
-    params.set('offset', String(query.offset ?? 0))
-    params.set('limit', String(query.limit ?? 50))
-    const data = await request<ApiRunsPage>(`/api/runs?${params}`, { signal })
-    assertShape(Array.isArray(data.runs), 'runs is not an array')
-    assertShape(typeof data.total === 'number' && typeof data.counts?.all === 'number', 'runs pagination missing')
-    return { ...data, runs: data.runs.map(normalizeRun) }
+    if (STATIC_DATA_MODE) {
+      try {
+        return parsePage(await tryLiveResearch<ApiRunsPage>(`/api/runs?${params}`, signal))
+      } catch {
+        return parsePage(await loadStaticRuns(query, signal))
+      }
+    }
+    return parsePage(await request<ApiRunsPage>(`/api/runs?${params}`, { signal }))
   })
 }
 
@@ -251,17 +270,23 @@ export function fetchDashboard(signal?: AbortSignal): Promise<DataState<ApiDashb
 
 export function fetchRunDetail(runId: string, signal?: AbortSignal): Promise<DataState<ApiRunDetail>> {
   return toState(async () => {
-    if (STATIC_DATA_MODE) {
-      const data = await loadStaticRunDetail(runId, signal)
+    const parseDetail = (data: ApiRunDetail): ApiRunDetail => {
       assertShape(typeof data.run_id === 'string', 'run detail missing run_id')
-      return data
+      return {
+        ...data,
+        audit: data.audit ? normalizeRun(data.audit) : null,
+      }
     }
-    const data = await request<ApiRunDetail>(`/api/runs/${encodeURIComponent(runId)}`, { signal })
-    assertShape(typeof data.run_id === 'string', 'run detail missing run_id')
-    return {
-      ...data,
-      audit: data.audit ? normalizeRun(data.audit) : null,
+    if (STATIC_DATA_MODE) {
+      try {
+        return parseDetail(
+          await tryLiveResearch<ApiRunDetail>(`/api/runs/${encodeURIComponent(runId)}`, signal),
+        )
+      } catch {
+        return parseDetail(await loadStaticRunDetail(runId, signal))
+      }
     }
+    return parseDetail(await request<ApiRunDetail>(`/api/runs/${encodeURIComponent(runId)}`, { signal }))
   })
 }
 

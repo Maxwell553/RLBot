@@ -251,6 +251,8 @@ export type ApiForwardMark = {
     model: number[]
     spy: number[]
     equal_weight: number[]
+    /** Optional companion CoreEquity pack (QQQ/GLD/TLT/BIL; no TQQQ). */
+    core_equity?: number[]
     /** Optional companion RL deploy (RLModel) alongside GeneralEquity1. */
     live_model?: number[]
     /** Optional CrestDay pack mark (soft; may be absent). */
@@ -260,6 +262,7 @@ export type ApiForwardMark = {
     model: ApiForwardCandle[]
     spy: ApiForwardCandle[]
     equal_weight: ApiForwardCandle[]
+    core_equity?: ApiForwardCandle[]
     live_model?: ApiForwardCandle[]
     crypto?: ApiForwardCandle[]
   } | null
@@ -267,6 +270,7 @@ export type ApiForwardMark = {
     model: ApiForwardStats
     spy: ApiForwardStats
     equal_weight: ApiForwardStats
+    core_equity?: ApiForwardStats
     live_model?: ApiForwardStats
     crypto?: ApiForwardStats
   }
@@ -274,14 +278,14 @@ export type ApiForwardMark = {
   weights: Record<string, number>[] | null
   asset_labels: string[]
   positions?: ApiForwardPosition[] | null
-  /** Per-strategy allocation snapshots (GeneralEquity1, RL, CrestDay). */
+  /** Per-strategy allocation snapshots (GeneralEquity1, CoreEquity, RL, CrestDay). */
   allocations?: Partial<Record<SeriesAllocKey, ApiForwardAllocationBook>> | null
   live?: ApiForwardLiveMeta | null
   companion_run_id?: string | null
   note?: string
 }
 
-type SeriesAllocKey = 'model' | 'live_model' | 'crypto'
+type SeriesAllocKey = 'model' | 'core_equity' | 'live_model' | 'crypto'
 
 export type ApiForward = {
   generated_at_utc: string

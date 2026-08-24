@@ -49,7 +49,12 @@ def month_end_mask(dates: list[date]) -> np.ndarray:
     return m
 
 
-def session_rebalance_flags(dates: list[date], i: int) -> tuple[bool, bool]:
+def session_rebalance_flags(
+    dates: list[date],
+    i: int,
+    *,
+    calendar_today: date | None = None,
+) -> tuple[bool, bool]:
     """Live week-end / month-end. Unlike the backtest masks, does not force the tip True."""
     n = len(dates)
     if i < 0 or i >= n:
@@ -64,7 +69,23 @@ def session_rebalance_flags(dates: list[date], i: int) -> tuple[bool, bool]:
     while nxt.weekday() >= 5:
         nxt += timedelta(days=1)
     month_end = nxt.month != d.month
-    return week_end, month_end
+    if calendar_today is None or calendar_today <= d:
+        return bool(week_end), bool(month_end)
+    lag = (calendar_today - d).days
+    if lag <= 0 or lag > 3 or calendar_today.weekday() >= 5:
+        return bool(week_end), bool(month_end)
+    same_week = (
+        d.isocalendar()[0] == calendar_today.isocalendar()[0]
+        and d.isocalendar()[1] == calendar_today.isocalendar()[1]
+    )
+    if same_week and calendar_today.weekday() == 4:
+        week_end = True
+    nxt2 = calendar_today + timedelta(days=1)
+    while nxt2.weekday() >= 5:
+        nxt2 += timedelta(days=1)
+    if nxt2.month != calendar_today.month:
+        month_end = True
+    return bool(week_end), bool(month_end)
 
 
 def fetch_daily_ohlc(

@@ -1,0 +1,133 @@
+{
+  "name": "CoreEquity",
+  "created": "2026-08-20",
+  "mandate": "no 2x/3x ETFs; QQQ cash-financed cap \u22641.5; beat costed SPY under retail friction",
+  "params": {
+    "ma": 252,
+    "vt": 0.3,
+    "atr_max": 0.12,
+    "es": 0.18,
+    "cool": 15,
+    "w_a": 0.58,
+    "dual_lb": 231,
+    "dual_vt": 0.14,
+    "dual_b": "TLT",
+    "rebal": "wk",
+    "vol_lb": 21,
+    "eq_sym": "QQQ",
+    "w_hot": 1.0,
+    "q_vt": 0.3,
+    "q_atr_max": 0.12,
+    "q_cap": 1.4,
+    "vol_spike": 9.0,
+    "atr_hyst": 0.05,
+    "trend_sym": "QQQ",
+    "trend_mode": "abs_or_sma",
+    "crash_lb": 42
+  },
+  "retail": {
+    "train": {
+      "total_return": 1.8217716775945063,
+      "cagr": 0.13875712876477064,
+      "sharpe_ratio": 1.1556973939819257,
+      "max_drawdown": -0.14260756830545274
+    },
+    "mid": {
+      "total_return": 1.458207573981836,
+      "cagr": 0.16208273529050343,
+      "sharpe_ratio": 1.1063305386419355,
+      "max_drawdown": -0.11839522087321241
+    },
+    "hold": {
+      "total_return": 0.8249899321378764,
+      "cagr": 0.2636432478175781,
+      "sharpe_ratio": 1.5337707739514144,
+      "max_drawdown": -0.13078288740666189
+    },
+    "full": {
+      "total_return": 11.589424869835156,
+      "cagr": 0.16522406803759737,
+      "sharpe_ratio": 1.1938757334196797,
+      "max_drawdown": -0.14260756830545274
+    }
+  },
+  "spy": {
+    "train": {
+      "total_return": 1.7699422778726288,
+      "cagr": 0.1361159162624812,
+      "sharpe_ratio": 0.9460309558208227,
+      "max_drawdown": -0.18605487525533881
+    },
+    "mid": {
+      "total_return": 0.955426779189692,
+      "cagr": 0.11851068398568265,
+      "sharpe_ratio": 0.6523817677684476,
+      "max_drawdown": -0.3371726930123551
+    },
+    "hold": {
+      "total_return": 0.5898982996237709,
+      "cagr": 0.19764518194660874,
+      "sharpe_ratio": 1.226151034561526,
+      "max_drawdown": -0.1875522942522181
+    },
+    "full": {
+      "total_return": 7.624653184639435,
+      "cagr": 0.1389181172249916,
+      "sharpe_ratio": 0.8481005549426452,
+      "max_drawdown": -0.3371726930123551
+    }
+  },
+  "ann_one_way_turnover": 4.085116560922578,
+  "stress": {
+    "x1_5_beat_spy_and_full_sharpe": true,
+    "x2_0_beat_spy_and_full_sharpe": true,
+    "x1_5_full_sharpe": 1.1883111265530313,
+    "x2_0_full_sharpe": 1.1827410207860012
+  },
+  "capacity_5m": {
+    "mid_sharpe": 1.1051503259955608,
+    "full_max_drawdown": -0.14293626808542892,
+    "pass": true
+  },
+  "gates": {
+    "frozen_select": true,
+    "raised_select": true,
+    "raised_holdout": true,
+    "stress_1_5": true,
+    "stress_2_0": true,
+    "cap5": true,
+    "plateau": 0.625
+  },
+  "production_ready": true,
+  "prod_viable_research": true,
+  "vs_GeneralEquity": {
+    "mid_sharpe_gt_ge": true,
+    "full_sharpe_gt_ge": true,
+    "dd_better_than_ge": false,
+    "cagr_excess_gt_ge": true,
+    "cagr_excess": 0.026305950812605783
+  },
+  "vs_prior_CoreEquity_lock": {
+    "mid_sharpe_gt": true,
+    "full_sharpe_gt": false,
+    "dd_better": false,
+    "cagr_excess_gt": true,
+    "note": "prior lock was research analog (mid 1.030, DD -11.7%, excess +1.63pp). This lock clears raised gates; it does not beat that analog on DD or full Sharpe."
+  },
+  "beats_both_GeneralEquity_and_prior_CoreEquity": false,
+  "notes": {
+    "trend": "QQQ 12m abs OR SMA(42) re-entry. Not SMA(151) primary, not SMH-on-SMH. Short SMA recovers 2023 while 12m lag; 12m abs stays long in the 2010s bull.",
+    "q_cap": "QQQ sleeve only at 1.4x cash-financed; hot/dual cap 1.0; no 2x/3x ETFs",
+    "selection": "tuned on train+mid only; holdout 2024-26 is one-shot",
+    "book": "QQQ-only sleeve A 58% + GLD/TLT dual 42%",
+    "spy": "shared dividend-adjusted SPY with GeneralEquity (2010-01-04 $84.58)",
+    "kill_resolved": "plain 12m abs sat at mid 1.03; SMA(151) lost 2010-17 vs SPY. abs_or_sma + q_cap 1.4 jointly clears mid 1.05, DD 15%, and train beat-SPY."
+  },
+  "broker_paper": {
+    "n_fills": 1091,
+    "drift_terminal_rel": 0.0,
+    "max_abs_log_equity_gap": 0.0,
+    "paper_path_ok": true,
+    "script": "scripts/broker_paper_prod_alpha.py"
+  }
+}

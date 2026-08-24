@@ -58,3 +58,99 @@ def test_residual_takes_precedence_over_two_head(monkeypatch) -> None:
         assert np.allclose(w[1:], 1.0 / n, atol=1e-6)
     finally:
         set_config(load_config())
+
+
+def test_leaky_residual_all_underweights_create_cash() -> None:
+    """816 mapper: net-negative tilts leave leftover mass in cash."""
+    action = np.array([0.0, -3.0, -3.0, -3.0, -3.0], dtype=np.float64)
+    w = portfolio_weights_residual(
+        action,
+        n_actions=5,
+        residual_clip=0.08,
+        residual_core="equal_weight",
+        residual_fully_invested=False,
+        max_single_asset_weight=0.50,
+    )
+    assert w.sum() == pytest.approx(1.0)
+    assert w[0] == pytest.approx(0.32, abs=1e-6)
+
+
+def test_fully_invested_residual_demeans_and_locks_gross() -> None:
+    """817 mapper: equal underweights demean to the core; cash stays ~0."""
+    action = np.array([0.0, -3.0, -3.0, -3.0, -3.0], dtype=np.float64)
+    w = portfolio_weights_residual(
+        action,
+        n_actions=5,
+        residual_clip=0.08,
+        residual_core="equal_weight",
+        residual_fully_invested=True,
+        max_single_asset_weight=0.50,
+    )
+    assert w.sum() == pytest.approx(1.0)
+    assert w[0] == pytest.approx(0.0, abs=1e-9)
+    assert np.allclose(w[1:], 0.25)
+    assert float(np.max(np.abs(w[1:] - 0.25))) <= 0.08 + 1e-9
+
+
+def test_keep_exposure_scales_817_sleeve_by_two_head_gross() -> None:
+    """818 mapper: 817 sleeve direction × sigmoid(action[0])."""
+    zero_tilt = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    mid = portfolio_weights_residual(
+        zero_tilt,
+        n_actions=5,
+        residual_clip=0.08,
+        residual_core="equal_weight",
+        residual_fully_invested=True,
+        residual_keep_exposure=True,
+        max_single_asset_weight=0.50,
+    )
+    assert mid.sum() == pytest.approx(1.0)
+    assert mid[0] == pytest.approx(0.5, abs=1e-6)
+    assert np.allclose(mid[1:], 0.125)
+
+    risk_on = portfolio_weights_residual(
+        np.array([20.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        n_actions=5,
+        residual_clip=0.08,
+        residual_core="equal_weight",
+        residual_fully_invested=True,
+        residual_keep_exposure=True,
+        max_single_asset_weight=0.50,
+    )
+    assert risk_on[0] == pytest.approx(0.0, abs=1e-6)
+    assert np.allclose(risk_on[1:], 0.25)
+
+    risk_off = portfolio_weights_residual(
+        np.array([-20.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        n_actions=5,
+        residual_clip=0.08,
+        residual_core="equal_weight",
+        residual_fully_invested=True,
+        residual_keep_exposure=True,
+        max_single_asset_weight=0.50,
+    )
+    assert risk_off[0] == pytest.approx(1.0, abs=1e-6)
+    assert np.allclose(risk_off[1:], 0.0)
+
+
+def test_keep_exposure_via_portfolio_weights_from_action(monkeypatch) -> None:
+    cfg = load_config()
+    env = replace(
+        cfg.environment,
+        residual_actions=True,
+        residual_fully_invested=True,
+        residual_keep_exposure=True,
+        two_head_actions=True,
+        residual_clip=0.08,
+    )
+    set_config(replace(cfg, environment=env))
+    try:
+        n = get_config().universe.n_assets
+        action = np.zeros(n + 1, dtype=np.float64)
+        action[0] = 20.0
+        w = portfolio_weights_from_action(action)
+        assert w[0] == pytest.approx(0.0, abs=1e-6)
+        assert np.allclose(w[1:], 1.0 / n, atol=1e-6)
+    finally:
+        set_config(load_config())
+

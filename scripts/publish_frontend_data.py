@@ -290,7 +290,17 @@ def _patch_missing_oos(rows: list[dict[str, Any]], *, budget_s: float = 60.0) ->
     """Fill completed rows that still lack OOS from Runs/*/backtest_summary*.json."""
     t0 = time.time()
     patched = 0
-    for row in rows:
+    # Newest completed holes first — otherwise a 20s budget dies on old missing files
+    # and never reaches a just-scored 817 cell.
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            0 if r.get("oos_sharpe") is None else 1,
+            0 if r.get("training_status") == "completed" else 1,
+            _run_sort_key(str(r.get("run_id") or "")),
+        ),
+    )
+    for row in ordered:
         if time.time() - t0 > budget_s:
             break
         if row.get("oos_sharpe") is not None:

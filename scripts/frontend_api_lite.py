@@ -4,6 +4,8 @@
 Serves health / runs / summary / forward from ``execution/`` plus bounded reads
 of ``Runs/*/backtest_summary*.json`` (subprocess + timeout) so the UI keeps
 OOS metrics even when the full FastAPI app cannot import under iCloud load.
+``/api/runs`` disk-fills the visible page from those summaries on the request
+thread so a just-written backtest shows Sharpe/DSR without waiting for enrich.
 
     python3 scripts/frontend_api_lite.py --port 8787
 """
@@ -239,7 +241,7 @@ def _active_run_id() -> str | None:
     if isinstance(data, dict):
         rid = str(data.get("run_id") or "").strip()
         if rid:
-            return rid
+            return _canonical_forward_run_id(rid)
     marks = sorted(
         EXEC.glob("forward_mark_LIVE_*.json"),
         key=lambda p: p.stat().st_mtime,
@@ -248,6 +250,13 @@ def _active_run_id() -> str | None:
     if marks:
         return marks[0].name.removeprefix("forward_mark_").removesuffix(".json")
     return None
+
+
+def _canonical_forward_run_id(run_id: str) -> str:
+    rid = str(run_id or "").strip()
+    if rid.upper() in {"CORE_EQUITY", "GENERAL_EQUITY"}:
+        return "GENERAL_EQUITY1"
+    return rid
 
 
 def _load_mark(run_id: str) -> dict[str, Any] | None:
@@ -855,18 +864,29 @@ def _build_enriched_rows(budget_s: float = 25.0) -> list[dict[str, Any]]:
 
 
 def _fill_rows_oos(rows: list[dict[str, Any]], *, budget_s: float = 8.0) -> list[dict[str, Any]]:
-    """Synchronously refresh the visible page (OOS + progress/status) with a budget."""
+    """Synchronously refresh the visible page (OOS + progress/status) with a budget.
+
+    Missing-OOS completed rows are read first so a fresh ``backtest_summary.json``
+    shows up on the first ``/api/runs`` paint instead of waiting for background enrich.
+    """
     global _rows_cache, _rows_at
     t0 = time.time()
-    out: list[dict[str, Any]] = []
+    indexed = list(enumerate(rows))
+
+    def _fill_priority(item: tuple[int, dict[str, Any]]) -> tuple[int, tuple[Any, ...]]:
+        _i, row = item
+        missing = 0 if row.get("oos_sharpe") is None else 1
+        completed = 0 if row.get("training_status") == "completed" else 1
+        return (missing, completed, _run_sort_key(str(row.get("run_id") or "")))
+
+    filled_by_index: dict[int, dict[str, Any]] = {}
     changed = False
-    for row in rows:
+    gained_oos = False
+    for idx, row in sorted(indexed, key=_fill_priority):
         if time.time() - t0 > budget_s:
-            out.append(row)
-            continue
+            break
         rid = str(row.get("run_id") or "")
         if not rid:
-            out.append(row)
             continue
         needs_refresh = (
             row.get("oos_sharpe") is None
@@ -875,19 +895,103 @@ def _fill_rows_oos(rows: list[dict[str, Any]], *, budget_s: float = 8.0) -> list
             or row.get("training_status") in (None, "", "active")
         )
         if not needs_refresh:
-            out.append(row)
             continue
-        filled = _row_from_disk(rid)
+        filled = _merge_run_row(row, _row_from_disk(rid))
         changed = True
-        out.append(filled)
+        if row.get("oos_sharpe") is None and filled.get("oos_sharpe") is not None:
+            gained_oos = True
+        filled_by_index[idx] = filled
+    out = [filled_by_index.get(i, row) for i, row in indexed]
     if changed:
         with _rows_lock:
             by_id = {str(r.get("run_id")): r for r in (_rows_cache or [])}
             for r in out:
-                by_id[str(r.get("run_id"))] = r
+                rid = str(r.get("run_id") or "")
+                if rid:
+                    by_id[rid] = r
             _rows_cache = _sort_run_rows(list(by_id.values()))
             _rows_at = time.monotonic()
+            snapshot = list(_rows_cache)
+        if gained_oos:
+            try:
+                _atomic_write_json(
+                    RUNS_CACHE,
+                    {
+                        "generated_at_utc": _now(),
+                        "n": len(snapshot),
+                        "records": snapshot,
+                        "note": "lite filled visible-page OOS from backtest_summary",
+                    },
+                )
+            except OSError:
+                pass
     return out
+
+
+def _filter_run_rows(
+    rows: list[dict[str, Any]],
+    *,
+    prefix: str = "",
+    search: str = "",
+    status: str = "",
+) -> list[dict[str, Any]]:
+    filtered = rows
+    if prefix:
+        filtered = [r for r in filtered if str(r.get("run_id", "")).startswith(prefix)]
+    if search:
+        needle = search.casefold()
+        filtered = [r for r in filtered if needle in str(r.get("run_id", "")).casefold()]
+    if status == "completed":
+        filtered = [r for r in filtered if r.get("training_status") == "completed"]
+    elif status == "interrupted":
+        filtered = [r for r in filtered if r.get("training_status") == "interrupted"]
+    elif status == "active":
+        filtered = [
+            r
+            for r in filtered
+            if r.get("training_status") not in ("completed", "interrupted")
+        ]
+    return filtered
+
+
+def _runs_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "all": len(rows),
+        "completed": sum(r.get("training_status") == "completed" for r in rows),
+        "active": sum(
+            r.get("training_status") not in ("completed", "interrupted") for r in rows
+        ),
+        "interrupted": sum(r.get("training_status") == "interrupted" for r in rows),
+        "with_backtest": sum(
+            bool(r.get("has_backtest")) or r.get("oos_sharpe") is not None for r in rows
+        ),
+    }
+
+
+def _runs_page(
+    *,
+    offset: int = 0,
+    limit: int = 50,
+    prefix: str = "",
+    search: str = "",
+    status: str = "",
+) -> dict[str, Any]:
+    """List payload: cache first, then disk-fill OOS for the visible slice."""
+    rows = _run_rows()
+    filtered = _filter_run_rows(rows, prefix=prefix, search=search, status=status)
+    page = _fill_rows_oos(filtered[offset : offset + limit], budget_s=6.0)
+    with _rows_lock:
+        all_rows = list(_rows_cache or rows)
+    # Status may flip to completed once a backtest is discovered — re-filter totals.
+    filtered = _filter_run_rows(all_rows, prefix=prefix, search=search, status=status)
+    return {
+        "generated_at_utc": _now(),
+        "runs": [_normalize_run_row(r) for r in page],
+        "total": len(filtered),
+        "offset": offset,
+        "limit": limit,
+        "counts": _runs_counts(all_rows),
+    }
 
 
 def _publish_frontend_snapshots(*, enrich: bool = False) -> None:
@@ -939,6 +1043,11 @@ def _run_rows() -> list[dict[str, Any]]:
         cached = _rows_cache
         age = now - _rows_at
     if cached is not None and age <= _CACHE_TTL_S:
+        if any(
+            r.get("training_status") == "completed" and r.get("oos_sharpe") is None
+            for r in cached
+        ):
+            _kick_enrich()
         return _sort_run_rows(list(cached))
 
     # Prefer disk cache immediately (may be stale lightweight index).
@@ -1415,6 +1524,7 @@ def _paper_state_event(run_id: str) -> tuple[datetime, dict[str, float]] | None:
     if not w:
         return None
     names = {
+        "CORE_EQUITY": EXEC / "paper_core_equity" / "state.json",
         "GENERAL_EQUITY1": EXEC / "paper_general_equity1" / "state.json",
         "CREST_DAY": EXEC / "paper_crest_day" / "state.json",
     }
@@ -1430,6 +1540,7 @@ def _paper_state_event(run_id: str) -> tuple[datetime, dict[str, float]] | None:
 
 def _paper_state_weights(run_id: str) -> dict[str, float] | None:
     names = {
+        "CORE_EQUITY": EXEC / "paper_core_equity" / "state.json",
         "GENERAL_EQUITY1": EXEC / "paper_general_equity1" / "state.json",
         "CREST_DAY": EXEC / "paper_crest_day" / "state.json",
     }
@@ -1447,6 +1558,7 @@ def _paper_state_weights(run_id: str) -> dict[str, float] | None:
 
 def _paper_share_book(run_id: str) -> tuple[float, dict[str, float], datetime | None]:
     names = {
+        "CORE_EQUITY": EXEC / "paper_core_equity" / "state.json",
         "GENERAL_EQUITY1": EXEC / "paper_general_equity1" / "state.json",
         "CREST_DAY": EXEC / "paper_crest_day" / "state.json",
     }
@@ -1471,7 +1583,11 @@ def _paper_share_book(run_id: str) -> tuple[float, dict[str, float], datetime | 
     updated = str(st.get("updated_at_utc") or "").strip()
     rec: dict[str, Any] = {"trade_date": trade or None}
     if updated and trade and updated[:10] == trade[:10]:
-        rec["recorded_at_utc"] = updated
+        ts = _ledger_event_ts({"recorded_at_utc": updated})
+        if ts is not None:
+            minutes = int(ts.hour) * 60 + int(ts.minute)
+            if (9 * 60 + 30) <= minutes < (16 * 60):
+                rec["recorded_at_utc"] = updated
     return cash, pos, _ledger_event_ts(rec)
 
 
@@ -1568,6 +1684,98 @@ def _positions_from_weights_lite(
     return rows
 
 
+def _ensure_core_equity_nav(payload: dict[str, Any]) -> dict[str, Any]:
+    """Always attach a CoreEquity NAV series so /ops/forward can chart it.
+
+    Soft polls used to rebuild allocation stubs without ``nav.core_equity``, so
+    the companion sleeve never appeared next to GeneralEquity1. Prefer a held
+    paper-equity path; fall back to a $initial_cash line of the same length.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    nav = dict(payload.get("nav") or {})
+    model = nav.get("model") if isinstance(nav.get("model"), list) else []
+    n = len(model)
+    if n < 1:
+        stamps = payload.get("timestamps") or payload.get("dates") or []
+        n = len(stamps) if isinstance(stamps, list) else 0
+    existing = nav.get("core_equity")
+    if isinstance(existing, list) and existing:
+        if n > 0 and len(existing) == n:
+            payload["nav"] = nav
+            return payload
+        if n > 0:
+            last = float(existing[-1])
+            if len(existing) < n:
+                series = [float(x) for x in existing] + [last] * (n - len(existing))
+            else:
+                series = [float(x) for x in existing[:n]]
+            nav["core_equity"] = series
+            payload["nav"] = nav
+            stats = dict(payload.get("stats") or {})
+            stats["core_equity"] = _series_tip_stats(series)
+            payload["stats"] = stats
+            return payload
+    initial_cash = float(payload.get("initial_cash") or 100_000.0)
+    stamps = payload.get("timestamps") or payload.get("dates") or []
+    cash, lots, start = _paper_share_book("CORE_EQUITY")
+    st = _read_json(EXEC / "paper_core_equity" / "state.json")
+    equity = None
+    if isinstance(st, dict) and st.get("equity") is not None:
+        try:
+            equity = float(st["equity"])
+        except (TypeError, ValueError):
+            equity = None
+    ge_price: dict[str, float] = {}
+    for row in payload.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        ticker = _norm_weight_key(str(row.get("ticker") or row.get("label") or ""))
+        if ticker == "CASH" or row.get("price") is None:
+            continue
+        try:
+            ge_price[ticker] = float(row["price"])
+        except (TypeError, ValueError):
+            pass
+    tip = equity
+    if lots:
+        mtm = float(cash)
+        priced = False
+        for lab, qty in lots.items():
+            px = ge_price.get(_norm_weight_key(lab))
+            if px is None:
+                continue
+            mtm += float(qty) * float(px)
+            priced = True
+        if priced:
+            tip = mtm
+    if tip is None:
+        tip = initial_cash
+    series = [float(initial_cash)] * n
+    if start is None:
+        series = [float(tip)] * n
+    else:
+        for i, ts in enumerate(stamps[:n]):
+            parsed = _parse_mark_ts(str(ts))
+            if parsed is not None and parsed >= start:
+                series[i] = float(tip)
+    if n > 0:
+        nav["core_equity"] = series
+        payload["nav"] = nav
+        stats = dict(payload.get("stats") or {})
+        stats["core_equity"] = _series_tip_stats(series)
+        payload["stats"] = stats
+        candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else {}
+        candles = dict(candles)
+        candles["core_equity"] = [
+            {"t": str(stamps[i]) if i < len(stamps) else "", "o": series[i], "h": series[i], "l": series[i], "c": series[i]}
+            for i in range(n)
+        ]
+        payload["candles"] = candles
+    payload["companion_core_equity_run_id"] = "CORE_EQUITY"
+    return payload
+
+
 def _tip_nav(payload: dict[str, Any], key: str, fallback: float) -> float:
     stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
     st = stats.get(key) if isinstance(stats.get(key), dict) else None
@@ -1590,6 +1798,7 @@ def _attach_live_allocations(payload: dict[str, Any]) -> dict[str, Any]:
     """Rebuild allocation books from live ledgers so the panel tracks the chart."""
     if not isinstance(payload, dict):
         return payload
+    payload = _ensure_core_equity_nav(payload)
     initial_cash = float(payload.get("initial_cash") or 100_000.0)
     as_of = (
         (payload.get("live") or {}).get("as_of_utc")
@@ -1614,6 +1823,41 @@ def _attach_live_allocations(payload: dict[str, Any]) -> dict[str, Any]:
             except (TypeError, ValueError):
                 pass
     ge_positions = payload.get("positions") if isinstance(payload.get("positions"), list) and payload.get("positions") else None
+    ce_w_payload = payload.get("core_equity_weights") if isinstance(payload.get("core_equity_weights"), dict) else None
+    ce_w = (
+        {str(k): float(v) for k, v in ce_w_payload.items()}
+        if ce_w_payload
+        else _strategy_weights("CORE_EQUITY", None)
+    )
+    ce_nav = _tip_nav(payload, "core_equity", initial_cash)
+    ce_positions = (
+        payload.get("core_equity_positions")
+        if isinstance(payload.get("core_equity_positions"), list) and payload.get("core_equity_positions")
+        else None
+    )
+    ce_price = dict(ge_price)
+    for row in ce_positions or []:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or row.get("label") or "")
+        if ticker and row.get("price") is not None:
+            try:
+                ce_price[_norm_weight_key(ticker)] = float(row["price"])
+            except (TypeError, ValueError):
+                pass
+    ce_cash, ce_lots, _ce_start = _paper_share_book("CORE_EQUITY")
+    if ce_lots and not ce_positions:
+        lot_abs: dict[str, float] = {"CASH": float(ce_cash)}
+        for lab, qty in ce_lots.items():
+            px = ce_price.get(_norm_weight_key(lab))
+            if px is None:
+                continue
+            lot_abs[_norm_weight_key(lab)] = float(qty) * float(px)
+        tot = sum(lot_abs.values())
+        if tot > 1e-12:
+            ce_w = {k: v / tot for k, v in lot_abs.items()}
+            ce_nav = tot
+            ce_positions = _positions_from_weights_lite(ce_w, nav=ce_nav, price_by_ticker=ce_price)
     rl_w = _strategy_weights("RLModel", None)
     rl_nav = _tip_nav(payload, "live_model", initial_cash)
     crypto_w = _strategy_weights("CREST_DAY", None)
@@ -1630,6 +1874,16 @@ def _attach_live_allocations(payload: dict[str, Any]) -> dict[str, Any]:
             "price_source": "yahoo",
             "positions": ge_positions or _positions_from_weights_lite(ge_w, nav=ge_nav, price_by_ticker=ge_price),
             "latest_weights": {str(k): float(v) for k, v in ge_w.items()},
+        },
+        "core_equity": {
+            "key": "core_equity",
+            "label": "CoreEquity",
+            "run_id": "CORE_EQUITY",
+            "nav": ce_nav,
+            "as_of": as_of,
+            "price_source": "yahoo",
+            "positions": ce_positions or _positions_from_weights_lite(ce_w, nav=ce_nav, price_by_ticker=ce_price),
+            "latest_weights": {str(k): float(v) for k, v in ce_w.items()},
         },
         "live_model": {
             "key": "live_model",
@@ -1671,7 +1925,7 @@ def _cols(labels: list[str], frames: dict[str, tuple[list[float], list[float], l
 
 def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
     """Rebuild 5m NAV from Yahoo chart API without importing rlbot (iCloud-safe)."""
-    rid = str(run_id).strip()
+    rid = _canonical_forward_run_id(str(run_id).strip())
     existing = _load_mark(rid) or {}
     stamp = _read_json(EXEC / "forward_live_stamp.json")
     stamp = stamp if isinstance(stamp, dict) else {}
@@ -1710,6 +1964,8 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
     for lab in ge_labs:
         symbols[lab.upper()] = str(lab).upper().replace(".", "-")
     symbols["SPY"] = "SPY"
+    for lab in ("TQQQ", "QQQ", "GLD", "TLT", "BIL"):
+        symbols.setdefault(lab, lab)
 
     raw = _fetch_yahoo_frames(symbols)
     spy_rows = raw.get("SPY") or []
@@ -1791,6 +2047,43 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
     nav_ew = _nav_from_ohlc(ew_ohlc, initial_cash)
     nav_spy = _nav_from_ohlc(spy_ohlc, initial_cash)
     nav_live = _nav_from_ohlc(live_ohlc, initial_cash)
+
+    ce_cash, ce_lots, ce_start = _paper_share_book("CORE_EQUITY")
+    ce_labs = [lab for lab in ce_lots if lab in aligned]
+    ce_w: dict[str, float] = _strategy_weights("CORE_EQUITY", {"CASH": 1.0})
+    ce_positions: list[dict[str, Any]] = []
+    if ce_labs:
+        o_ce, h_ce, l_ce, c_ce = _cols(ce_labs, aligned)
+        qty_ce = [float(ce_lots.get(lab, 0.0)) for lab in ce_labs]
+        ce_ohlc = _lots_ohlc(
+            o_ce,
+            h_ce,
+            l_ce,
+            c_ce,
+            clock,
+            cash=ce_cash,
+            quantities=qty_ce,
+            start=ce_start,
+            initial_cash=initial_cash,
+        )
+        last_ce = float(ce_ohlc[-1][3]) if ce_ohlc else float(initial_cash)
+        lot_ce: dict[str, float] = {"CASH": float(ce_cash)}
+        last_px_ce = c_ce[-1] if c_ce else []
+        for i, lab in enumerate(ce_labs):
+            px = float(last_px_ce[i]) if i < len(last_px_ce) else 0.0
+            lot_ce[lab] = qty_ce[i] * px
+        if last_ce > 1e-12:
+            ce_w = {k: v / last_ce for k, v in lot_ce.items()}
+        ce_price = {lab: float(last_px_ce[i]) for i, lab in enumerate(ce_labs) if i < len(last_px_ce)}
+        ce_positions = _positions_from_weights_lite(ce_w, nav=last_ce, price_by_ticker=ce_price)
+        nav_core = _nav_from_ohlc(ce_ohlc, initial_cash)
+        ce_candles = _candles_rows(clock, ce_ohlc)
+    else:
+        nav_core = [initial_cash] * len(clock)
+        ce_ohlc = [(initial_cash, initial_cash, initial_cash, initial_cash) for _ in clock]
+        ce_candles = _candles_rows(clock, ce_ohlc)
+        ce_positions = _positions_from_weights_lite(ce_w, nav=initial_cash)
+
     crypto_src = (existing.get("nav") or {}).get("crypto") if isinstance(existing.get("nav"), dict) else None
     if isinstance(crypto_src, list) and crypto_src:
         last_c = float(crypto_src[-1])
@@ -1812,6 +2105,7 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
         "spy": nav_spy,
         "equal_weight": nav_ew,
         "live_model": nav_live,
+        "core_equity": nav_core,
         "crypto": nav_crypto,
     }
     stats = {k: _series_tip_stats(v) for k, v in nav.items()}
@@ -1820,6 +2114,7 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
         "spy": _candles_rows(clock, spy_ohlc),
         "equal_weight": _candles_rows(clock, ew_ohlc),
         "live_model": _candles_rows(clock, live_ohlc),
+        "core_equity": ce_candles,
         "crypto": _candles_rows(
             clock,
             [(v, v, v, v) for v in nav_crypto],
@@ -1862,6 +2157,8 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
             "latest_weights": {ge_labels[i]: ge_vec[i] for i in range(len(ge_labels))},
             "asset_labels": ge_labels,
             "positions": positions,
+            "core_equity_weights": {str(k): float(v) for k, v in ce_w.items()},
+            "core_equity_positions": ce_positions,
             "companion_run_id": "RLModel",
             "companion_crypto_run_id": "CREST_DAY",
             "live": {
@@ -1879,6 +2176,7 @@ def _refresh_forward_prices_stdlib(run_id: str) -> dict[str, Any] | None:
             },
             "note": (
                 f"GENERAL_EQUITY1 share lots since {book_start[:10]}; "
+                "CoreEquity companion from its own QQQ/GLD/TLT/BIL lots; "
                 f"RLModel $100k from {live_start.date().isoformat()} then shadow books as recorded. "
                 "Prices from Yahoo 5m chart API (stdlib)."
             ),
@@ -2143,54 +2441,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/runs":
-            # Serve-only: never scan Runs/ on the request thread (UI uses static
-            # snapshots; background enrich keeps execution/api_*_cache.json warm).
-            rows = _run_rows()
             try:
                 offset = max(0, int((qs.get("offset") or ["0"])[0]))
                 limit = min(200, max(1, int((qs.get("limit") or ["50"])[0])))
             except ValueError:
                 offset, limit = 0, 50
-            prefix = (qs.get("prefix") or [""])[0]
-            search = (qs.get("search") or [""])[0].casefold()
-            status = (qs.get("status") or [""])[0]
-            filtered = rows
-            if prefix:
-                filtered = [r for r in filtered if str(r.get("run_id", "")).startswith(prefix)]
-            if search:
-                filtered = [
-                    r for r in filtered if search in str(r.get("run_id", "")).casefold()
-                ]
-            if status == "completed":
-                filtered = [r for r in filtered if r.get("training_status") == "completed"]
-            elif status == "interrupted":
-                filtered = [r for r in filtered if r.get("training_status") == "interrupted"]
-            elif status == "active":
-                filtered = [
-                    r
-                    for r in filtered
-                    if r.get("training_status") not in ("completed", "interrupted")
-                ]
-            counts = {
-                "all": len(rows),
-                "completed": sum(r.get("training_status") == "completed" for r in rows),
-                "active": sum(
-                    r.get("training_status") not in ("completed", "interrupted") for r in rows
-                ),
-                "interrupted": sum(r.get("training_status") == "interrupted" for r in rows),
-                "with_backtest": sum(bool(r.get("has_backtest")) for r in rows),
-            }
-            page = [_normalize_run_row(r) for r in filtered[offset : offset + limit]]
             self._json(
                 200,
-                {
-                    "generated_at_utc": _now(),
-                    "runs": page,
-                    "total": len(filtered),
-                    "offset": offset,
-                    "limit": limit,
-                    "counts": counts,
-                },
+                _runs_page(
+                    offset=offset,
+                    limit=limit,
+                    prefix=(qs.get("prefix") or [""])[0],
+                    search=(qs.get("search") or [""])[0],
+                    status=(qs.get("status") or [""])[0],
+                ),
             )
             return
 
@@ -2271,12 +2535,16 @@ class Handler(BaseHTTPRequestHandler):
                 mark = _sync_live_refresh(
                     rid, force=True, reset_book=True, timeout_s=90.0
                 ) or mark
-            elif live and (force or price_age is None or price_age > 300.0):
+            elif live and force:
+                # Clicking Refresh must wait for the rewrite so new sleeves
+                # (CoreEquity companion) land in this response, not the next poll.
+                mark = _sync_live_refresh(rid, force=True, timeout_s=90.0) or mark
+            elif live and (price_age is None or price_age > 300.0):
                 # Kick Yahoo in the background. Do not force=True just because
                 # prices are stale — that bypassed the 60s cooldown and hammered
                 # Yahoo after a failed pull. refresh_forward_mark_live already
                 # fetches when the stamp is older than 5 minutes.
-                _kick_live_refresh(rid, force=force)
+                _kick_live_refresh(rid, force=False)
             if mark is None:
                 self._json(
                     200,
@@ -2387,7 +2655,7 @@ def _maybe_paper_once(status: dict[str, Any]) -> dict[str, Any]:
         shadow = sleeves.get("RLModel") or sleeves.get(
             os.environ.get("MARKETTRAINER_LIVE_RUN_ID") or "RLModel"
         ) or {}
-        as_of = fresh.get("paper_ge1_date") or datetime.now().strftime("%Y-%m-%d")
+        as_of = fresh.get("paper_ge1_date") or fresh.get("paper_core_date") or datetime.now().strftime("%Y-%m-%d")
         return {
             "ok": True,
             "as_of": as_of,
@@ -2400,7 +2668,7 @@ def _maybe_paper_once(status: dict[str, Any]) -> dict[str, Any]:
 
 def collect_once(*, interval_s: int = 300, run_paper: bool = True) -> dict[str, Any]:
     """Stdlib Yahoo 5m rewrite + optional paper subprocess. Safe for LaunchAgents."""
-    rid = _active_run_id() or "GENERAL_EQUITY1"
+    rid = _canonical_forward_run_id(_active_run_id() or "GENERAL_EQUITY1")
     print(f"[lite-api] collect-once run_id={rid}", flush=True)
     mark = _sync_live_refresh(rid, force=True, timeout_s=90.0)
     mark = _stamp_collector_mark(rid, mark, interval_s=interval_s)
@@ -2420,6 +2688,7 @@ def collect_once(*, interval_s: int = 300, run_paper: bool = True) -> dict[str, 
         "mode": "lite",
         "paper_attempt_date": prior.get("paper_attempt_date"),
         "paper_ge1_date": prior.get("paper_ge1_date"),
+        "paper_core_date": prior.get("paper_core_date"),
         "sleeves": {"paper": {"ok": True, "skipped": "pending"}},
     }
     _write_loop_status(status)
@@ -2432,6 +2701,7 @@ def collect_once(*, interval_s: int = 300, run_paper: bool = True) -> dict[str, 
             fresh.get("rl_shadow_date") or (fresh.get("sleeves") or {}).get("RLModel")
         ):
             status["paper_ge1_date"] = fresh.get("paper_ge1_date") or paper.get("as_of")
+            status["paper_core_date"] = fresh.get("paper_core_date")
             status["paper_crest_date"] = fresh.get("paper_crest_date")
             status["rl_shadow_date"] = fresh.get("rl_shadow_date") or paper.get("rl_shadow_date")
             status["sleeves"] = fresh.get("sleeves") or {"paper": paper}

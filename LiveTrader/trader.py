@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""GeneralEquity1 live-trader CLI.
+"""CoreEquity live-trader CLI.
 
-Default is dry-run: compute the locked book on the live Yahoo panel, optionally
-read IBKR, never send an order. Paper/live submit are explicit subcommands.
+Default is dry-run: compute the locked CoreEquity book on the live IBKR daily panel
+(Yahoo only if TWS/historical fails), optionally size against the IB account, never
+send an order unless paper-submit / live-submit. The pack itself is not modified.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ if str(REPO) not in sys.path:
 
 from book import (  # noqa: E402
     CoolState,
+    SLEEVE_A,
     active_sleeve_symbols,
     assign_order_types,
     clamp_buys_to_cash,
@@ -32,14 +34,22 @@ from book import (  # noqa: E402
     merge_marks,
     orders_to_targets,
     park_sleeve_a,
+    round_to_whole_shares,
     session_rebalance_flags,
     spendable_cash,
-    update_cool_state,
     weight_drift,
 )
 from config import LiveConfig, load_config  # noqa: E402
-from data import cache_dir, load_live_panel, panel_to_px  # noqa: E402
-from ge1_strategy import BOOK_SYMBOLS, P, STRATEGY_ID, latest_targets, portfolio_weights  # noqa: E402
+from data import cache_dir, last_panel_source, load_live_panel, panel_to_px  # noqa: E402
+from ce_strategy import (  # noqa: E402
+    BOOK_SYMBOLS,
+    P,
+    STRATEGY_ID,
+    apply_sleeve_a_to_targets,
+    latest_targets,
+    portfolio_weights,
+    sleeve_a_live_state,
+)
 from ibkr_client import (  # noqa: E402
     AccountSnapshot,
     BrokerError,
@@ -106,6 +116,8 @@ def _journal_submitted(account: str, asof: str) -> bool:
             rec = json.loads(line)
             if not rec.get("submitted"):
                 continue
+            if rec.get("fills_ok") is False:
+                continue
             if str(rec.get("asof")) == str(asof) and str(rec.get("account") or "") == str(account or ""):
                 return True
     except (OSError, json.JSONDecodeError):
@@ -143,6 +155,18 @@ def _connect(cfg: LiveConfig):
     return broker
 
 
+def _connect_optional(cfg: LiveConfig, *, required: bool = False):
+    """Connect for IBKR data/orders. Yahoo fallback when not required."""
+    try:
+        return _connect(cfg)
+    except BrokerError:
+        if required:
+            raise
+        if str(cfg.data_source) == "ibkr" and not cfg.yahoo_fallback:
+            raise
+        return None
+
+
 def _offline_snapshot(aum: float) -> AccountSnapshot:
     return AccountSnapshot(
         account="OFFLINE",
@@ -161,17 +185,39 @@ def build_plan(
     snapshot: AccountSnapshot | None,
     force_refresh: bool = True,
     as_of: date | None = None,
+    broker: Any | None = None,
 ) -> dict[str, Any]:
-    dates, closes, ohlc = load_live_panel(force_refresh=force_refresh)
-    panel_dates, px, panel_ohlc, yahoo_marks = panel_to_px(dates, closes, ohlc, as_of=as_of)
-    targets_raw = latest_targets(panel_dates, px, panel_ohlc["TQQQ"], panel_ohlc["QQQ"], P)
+    dates, closes, ohlc = load_live_panel(
+        force_refresh=force_refresh, broker=broker, cfg=cfg
+    )
+    panel_dates, px, panel_ohlc, panel_marks = panel_to_px(dates, closes, ohlc, as_of=as_of)
+    data_source = last_panel_source()
+    hot = str(getattr(P, "eq_sym", "QQQ")).upper()
+    if hot not in panel_ohlc or "QQQ" not in panel_ohlc:
+        raise RuntimeError(f"live panel missing {hot}/QQQ OHLC")
+    targets_raw = latest_targets(panel_dates, px, panel_ohlc[hot], panel_ohlc["QQQ"], P)
+    sleeve = sleeve_a_live_state(panel_dates, px, panel_ohlc[hot], P)
+    targets_raw = apply_sleeve_a_to_targets(targets_raw, sleeve, P)
     weights = portfolio_weights(targets_raw, P)
-    day = panel_dates[-1]
-    wk, me = session_rebalance_flags(panel_dates, len(panel_dates) - 1)
+    if sleeve.flat:
+        weights = park_sleeve_a(weights, str(targets_raw.get("dual_asset") or "GLD"))
+    signal_asof = panel_dates[-1]
+    calendar_today = as_of or date.today()
+    wk, me = session_rebalance_flags(
+        panel_dates, len(panel_dates) - 1, calendar_today=calendar_today
+    )
+    trade_asof = signal_asof
+    if calendar_today > signal_asof and calendar_today.weekday() < 5:
+        lag = (calendar_today - signal_asof).days
+        if 0 < lag <= 3:
+            trade_asof = calendar_today
 
     ib_last = dict(snapshot.last_prices) if snapshot is not None else {}
-    marks = merge_marks(yahoo_marks, ib_last)
-    mark_source = "ib_last+yahoo" if ib_last else "yahoo"
+    marks = merge_marks(panel_marks, ib_last)
+    if ib_last:
+        mark_source = f"ib_last+{data_source}"
+    else:
+        mark_source = data_source
 
     aum = float(cfg.aum_override or 0.0)
     positions: dict[str, float] = {}
@@ -182,28 +228,27 @@ def build_plan(
     if aum <= 0:
         aum = 1000.0
 
-    cool = load_cool()
-    peak, flat, remaining = update_cool_state(
-        cool.peak_equity or aum, aum, cool.flat_a, cool.cool_remaining
-    )
+    stored = load_cool()
     cool = CoolState(
-        peak_equity=peak,
-        flat_a=flat,
-        cool_remaining=remaining,
-        last_trade_date=cool.last_trade_date,
+        peak_equity=sleeve.peak,
+        flat_a=sleeve.flat,
+        cool_remaining=sleeve.cool_remaining,
+        last_trade_date=stored.last_trade_date,
     )
-    if flat:
-        weights = park_sleeve_a(weights, str(targets_raw.get("dual_asset") or "GLD"))
+    es_park = bool(
+        sleeve.flat
+        and any(abs(float(positions.get(s, 0.0) or 0.0)) > 1e-8 for s in SLEEVE_A)
+    )
 
     book_empty = not any(
         abs(float(v)) > 1e-8 for k, v in positions.items() if str(k).upper() in set(BOOK_SYMBOLS)
     )
     seed = bool(cfg.seed_if_flat and book_empty)
-    already = str(cool.last_trade_date or "") == str(day)
+    already = str(cool.last_trade_date or "") == str(trade_asof)
     account = str((snapshot.account if snapshot else "") or cfg.account or "")
-    if (not already) and account and _journal_submitted(account, str(day)):
+    if (not already) and account and _journal_submitted(account, str(trade_asof)):
         already = True
-    due = bool(wk or me or seed)
+    due = bool(wk or me or seed or es_park)
     skip_reason = ""
     rebal = False
     if already:
@@ -215,7 +260,7 @@ def build_plan(
 
     allow = None
     if cfg.sleeve_split:
-        allow = active_sleeve_symbols(week_end=wk, month_end=me, seed=seed)
+        allow = active_sleeve_symbols(week_end=wk, month_end=me, seed=seed, es_park=es_park)
 
     orders = []
     if rebal:
@@ -232,6 +277,13 @@ def build_plan(
             whole_share_type=cfg.whole_share_order_type,
             fractional_type=cfg.fractional_order_type,
         )
+        if not cfg.allow_fractional:
+            orders = round_to_whole_shares(orders, min_notional=cfg.min_notional)
+            orders = assign_order_types(
+                orders,
+                whole_share_type=cfg.whole_share_order_type,
+                fractional_type=cfg.fractional_order_type,
+            )
         if cfg.cap_buys_to_cash and snapshot is not None:
             orders = clamp_buys_to_cash(
                 orders,
@@ -241,31 +293,35 @@ def build_plan(
 
     return {
         "strategy_id": STRATEGY_ID,
-        "asof": str(day),
-        "data_source": "yahoo",
+        "asof": str(trade_asof),
+        "signal_asof": str(signal_asof),
+        "data_source": data_source,
         "mark_source": mark_source,
         "account": account,
         "aum": aum,
         "week_end": wk,
         "month_end": me,
         "seed_if_flat": seed,
+        "es_park": es_park,
         "sleeve_symbols": sorted(allow) if allow is not None else sorted(BOOK_SYMBOLS),
         "rebalance": rebal,
         "skip_reason": skip_reason,
         "already_traded": already,
-        "flat_a": flat,
-        "cool_remaining": remaining,
-        "peak_equity": peak,
+        "flat_a": sleeve.flat,
+        "cool_remaining": sleeve.cool_remaining,
+        "peak_equity": sleeve.peak,
+        "sleeve_a_equity": sleeve.equity,
         "target_weights": weights,
         "targets": {k: v for k, v in targets_raw.items() if k != "params"},
         "positions": positions,
         "marks": marks,
         "orders": [o.as_dict() for o in orders],
         "n_orders": len(orders),
-        "journal_keys": [journal_key(account, str(day), o.symbol) for o in orders],
+        "journal_keys": [journal_key(account, str(trade_asof), o.symbol) for o in orders],
         "note": (
-            "weekly TQQQ+QQQ close + month-end dual; residual cash (not BIL); "
-            "fractional legs use MKT, whole shares use MOC"
+            "weekly QQQ close + month-end GLD/TLT dual; residual BIL; "
+            "sleeve-A ES parks to BIL immediately; "
+            "no 2x/3x ETFs; fractional legs use MKT, whole shares use MOC"
         ),
         "_orders": orders,
         "_cool": cool,
@@ -296,89 +352,103 @@ def _eval_for(cfg: LiveConfig, plan: dict[str, Any], snapshot: AccountSnapshot |
 
 
 def cmd_verify_data(args: argparse.Namespace) -> int:
-    dates, closes, ohlc = load_live_panel(force_refresh=_force_refresh(args))
-    panel_dates, px, panel_ohlc, marks = panel_to_px(dates, closes, ohlc)
-    live = latest_targets(panel_dates, px, panel_ohlc["TQQQ"], panel_ohlc["QQQ"], P)
-    live_w = portfolio_weights(live, P)
-    frozen_asof = None
-    frozen_w = None
+    cfg = load_config()
+    broker = None
     try:
-        from rlbot.pack_general_equity1 import latest_portfolio_weights, paper_plan
+        broker = _connect_optional(cfg)
+        dates, closes, ohlc = load_live_panel(
+            force_refresh=_force_refresh(args), broker=broker, cfg=cfg
+        )
+        panel_dates, px, panel_ohlc, marks = panel_to_px(dates, closes, ohlc)
+        hot = str(getattr(P, "eq_sym", "QQQ")).upper()
+        live = latest_targets(panel_dates, px, panel_ohlc[hot], panel_ohlc["QQQ"], P)
+        live_w = portfolio_weights(live, P)
+        source = last_panel_source()
+        frozen_asof = None
+        frozen_w = None
+        try:
+            from rlbot.pack_core_equity import latest_portfolio_weights, paper_plan
 
-        frozen = paper_plan(aum=1000.0)
-        frozen_asof = frozen.get("asof")
-        frozen_source = frozen.get("data_source")
-        frozen_w = latest_portfolio_weights(aum=1000.0)
-        live_via_pack = paper_plan(
-            aum=1000.0,
-            dates=panel_dates,
-            closes=px,
-            ohlc=panel_ohlc,
-        )
-        pack_live_w = latest_portfolio_weights(
-            aum=1000.0, dates=panel_dates, closes=px, ohlc=panel_ohlc
-        )
-    except Exception as exc:  # noqa: BLE001
-        frozen_source = f"unavailable: {exc}"
-        live_via_pack = {}
-        pack_live_w = {}
-    tqqq_r = float("nan")
-    qqq_r = float("nan")
-    if len(px["TQQQ"]) >= 2 and len(px["QQQ"]) >= 2:
-        tqqq_r = float(px["TQQQ"][-1] / px["TQQQ"][-2] - 1.0)
-        qqq_r = float(px["QQQ"][-1] / px["QQQ"][-2] - 1.0)
-    payload = {
-        "today": str(date.today()),
-        "live_yahoo_asof": live.get("asof"),
-        "live_source": "yahoo",
-        "live_weights": live_w,
-        "live_last_day_QQQ": qqq_r,
-        "live_last_day_TQQQ": tqqq_r,
-        "tqqq_vs_qqq_beta": (tqqq_r / qqq_r) if abs(qqq_r) > 1e-9 else None,
-        "frozen_pack_asof": frozen_asof,
-        "frozen_pack_source": frozen_source,
-        "frozen_pack_weights": frozen_w,
-        "pack_on_live_panel_asof": live_via_pack.get("asof"),
-        "pack_on_live_panel_source": live_via_pack.get("data_source"),
-        "copy_matches_pack_on_live": (
-            bool(pack_live_w)
-            and all(abs(live_w.get(k, 0.0) - float(v)) < 1e-9 for k, v in pack_live_w.items())
-            and set(live_w) == set(pack_live_w)
-        ),
-        "marks": {k: marks.get(k) for k in ("SPY", "QQQ", "TQQQ", "GLD", "TLT", "BIL")},
-    }
-    print(json.dumps(payload, indent=2, default=str))
-    if payload["live_yahoo_asof"] == payload["frozen_pack_asof"]:
-        print(
-            "[verify] WARNING: live asof still equals frozen pack asof — panel may be stale",
-            file=sys.stderr,
-        )
-        return 1
-    if payload["copy_matches_pack_on_live"] is False:
-        print("[verify] WARNING: LiveTrader copy diverged from pack on the live panel", file=sys.stderr)
-        return 1
-    return 0
+            frozen = paper_plan(aum=1000.0)
+            frozen_asof = frozen.get("asof")
+            frozen_source = frozen.get("data_source")
+            frozen_w = latest_portfolio_weights(aum=1000.0)
+            live_via_pack = paper_plan(
+                aum=1000.0,
+                dates=panel_dates,
+                closes=px,
+                ohlc=panel_ohlc,
+            )
+            pack_live_w = latest_portfolio_weights(
+                aum=1000.0, dates=panel_dates, closes=px, ohlc=panel_ohlc
+            )
+        except Exception as exc:  # noqa: BLE001
+            frozen_source = f"unavailable: {exc}"
+            live_via_pack = {}
+            pack_live_w = {}
+        qqq_r = float("nan")
+        if "QQQ" in px and len(px["QQQ"]) >= 2:
+            qqq_r = float(px["QQQ"][-1] / px["QQQ"][-2] - 1.0)
+        payload = {
+            "today": str(date.today()),
+            "strategy_id": STRATEGY_ID,
+            "live_asof": live.get("asof"),
+            "live_source": source,
+            "live_weights": live_w,
+            "live_last_day_QQQ": qqq_r,
+            "frozen_pack_asof": frozen_asof,
+            "frozen_pack_source": frozen_source,
+            "frozen_pack_weights": frozen_w,
+            "pack_on_live_panel_asof": live_via_pack.get("asof"),
+            "pack_on_live_panel_source": live_via_pack.get("data_source"),
+            "live_matches_pack_on_live": (
+                bool(pack_live_w)
+                and all(abs(live_w.get(k, 0.0) - float(v)) < 1e-9 for k, v in pack_live_w.items())
+                and set(live_w) == set(pack_live_w)
+            ),
+            "marks": {k: marks.get(k) for k in ("SPY", "QQQ", "GLD", "TLT", "BIL")},
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        if payload["live_asof"] == payload["frozen_pack_asof"]:
+            print(
+                "[verify] WARNING: live asof still equals frozen pack asof — panel may be stale",
+                file=sys.stderr,
+            )
+            return 1
+        if payload["live_matches_pack_on_live"] is False:
+            print(
+                "[verify] WARNING: LiveTrader weights diverged from pack on the live panel",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    finally:
+        if broker is not None:
+            broker.disconnect()
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
     cfg = load_config()
     snap = None
-    if args.connect:
-        broker = _connect(cfg)
-        try:
+    broker = None
+    try:
+        broker = _connect_optional(cfg, required=bool(args.connect) and not cfg.yahoo_fallback)
+        if broker is not None:
             snap = broker.snapshot()
-        finally:
+        elif cfg.aum_override:
+            snap = _offline_snapshot(float(cfg.aum_override))
+        plan = build_plan(
+            cfg=cfg,
+            snapshot=snap,
+            broker=broker,
+            force_refresh=_force_refresh(args),
+            as_of=_parse_date(args.as_of) if args.as_of else None,
+        )
+        print(json.dumps(_public_plan(plan), indent=2, default=str))
+        return 0
+    finally:
+        if broker is not None:
             broker.disconnect()
-    elif cfg.aum_override:
-        snap = _offline_snapshot(float(cfg.aum_override))
-    plan = build_plan(
-        cfg=cfg,
-        snapshot=snap,
-        force_refresh=_force_refresh(args),
-        as_of=_parse_date(args.as_of) if args.as_of else None,
-    )
-    print(json.dumps(_public_plan(plan), indent=2, default=str))
-    return 0
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -398,6 +468,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         plan = build_plan(
             cfg=cfg,
             snapshot=snap or _offline_snapshot(float(cfg.aum_override or 1000.0)),
+            broker=broker,
             force_refresh=_force_refresh(args),
         )
         checks = _eval_for(cfg, plan, snap, want_connect=connect, want_submit=False)
@@ -405,7 +476,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             checks.append(
                 Check(
                     "qualify_book",
-                    set(qualified) >= {"TQQQ", "QQQ", "GLD", "TLT", "BIL"},
+                    set(qualified) >= set(BOOK_SYMBOLS),
                     "qualified=" + ",".join(qualified) if qualified else "none",
                 )
             )
@@ -454,14 +525,16 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     snap = None
     broker = None
     try:
-        if args.connect:
-            broker = _connect(cfg)
-            snap = broker.snapshot()
+        if args.connect or cfg.data_source == "ibkr":
+            broker = _connect_optional(cfg, required=bool(args.connect) and not cfg.yahoo_fallback)
+            if broker is not None:
+                snap = broker.snapshot()
         elif cfg.aum_override:
             snap = _offline_snapshot(float(cfg.aum_override))
         plan = build_plan(
             cfg=cfg,
             snapshot=snap,
+            broker=broker,
             force_refresh=_force_refresh(args),
             as_of=_parse_date(args.as_of) if args.as_of else None,
         )
@@ -512,7 +585,9 @@ def _submit(args: argparse.Namespace, *, expected_mode: str, arm_live: bool = Fa
     broker = _connect(cfg)
     try:
         snap = broker.snapshot()
-        plan = build_plan(cfg=cfg, snapshot=snap, force_refresh=_force_refresh(args))
+        plan = build_plan(
+            cfg=cfg, snapshot=snap, broker=broker, force_refresh=_force_refresh(args)
+        )
         if getattr(args, "if_due", False) and not plan["rebalance"]:
             print(
                 json.dumps(
@@ -594,8 +669,11 @@ def _submit(args: argparse.Namespace, *, expected_mode: str, arm_live: bool = Fa
             },
         )
         cool = plan["_cool"]
-        cool.last_trade_date = str(plan["asof"])
-        save_cool(cool, extra={"last_trade_date": plan["asof"], "equity": plan["aum"]})
+        extra = {"equity": plan["aum"]}
+        if fills_ok:
+            cool.last_trade_date = str(plan["asof"])
+            extra["last_trade_date"] = plan["asof"]
+        save_cool(cool, extra=extra)
         print(json.dumps(rec, indent=2, default=str))
         return 0 if fills_ok else 1
     finally:
@@ -635,7 +713,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     broker = _connect(cfg)
     try:
         snap = broker.snapshot()
-        plan = build_plan(cfg=cfg, snapshot=snap, force_refresh=_force_refresh(args))
+        plan = build_plan(
+            cfg=cfg, snapshot=snap, broker=broker, force_refresh=_force_refresh(args)
+        )
         drift = weight_drift(
             float(snap.net_liquidation or plan["aum"]),
             snap.positions,
@@ -679,9 +759,11 @@ def cmd_flatten(args: argparse.Namespace) -> int:
     broker = _connect(cfg)
     try:
         snap = broker.snapshot()
-        dates, closes, ohlc = load_live_panel(force_refresh=_force_refresh(args))
-        _d, _px, _oh, yahoo = panel_to_px(dates, closes, ohlc)
-        marks = merge_marks(yahoo, snap.last_prices)
+        dates, closes, ohlc = load_live_panel(
+            force_refresh=_force_refresh(args), broker=broker, cfg=cfg
+        )
+        _d, _px, _oh, panel_marks = panel_to_px(dates, closes, ohlc)
+        marks = merge_marks(panel_marks, snap.last_prices)
         orders = flatten_intents(
             snap.positions,
             marks,
@@ -751,12 +833,12 @@ def _add_refresh_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--refresh-data",
         action="store_true",
-        help="Deprecated no-op; the Yahoo panel always refreshes",
+        help="Deprecated no-op; the live panel always refreshes",
     )
     p.add_argument(
         "--no-refresh-data",
         action="store_true",
-        help="Use the on-disk Yahoo cache instead of a fresh pull",
+        help="Use the on-disk IBKR/Yahoo cache instead of a fresh pull",
     )
 
 
@@ -769,7 +851,7 @@ def _add_submit_flags(p: argparse.ArgumentParser, *, live: bool = False) -> None
         p.add_argument(
             "--arm-live",
             action="store_true",
-            help="Required together with allow_live and LIVE_TRADER_CONFIRM=GE1",
+            help="Required together with allow_live and LIVE_TRADER_CONFIRM=CORE",
         )
 
 
@@ -778,11 +860,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_ver = sub.add_parser("verify-data", help="Live Yahoo asof vs frozen pack bars.db")
+    p_ver = sub.add_parser("verify-data", help="Live IBKR (or Yahoo fallback) asof vs frozen pack bars.db")
     _add_refresh_flags(p_ver)
 
     p_plan = sub.add_parser("plan", help="Print target weights + would-be orders")
-    p_plan.add_argument("--connect", action="store_true", help="Size against IB NLV/positions")
+    p_plan.add_argument("--connect", action="store_true", help="Require TWS (default already tries IBKR data)")
     _add_refresh_flags(p_plan)
     p_plan.add_argument("--as-of", default="")
 
@@ -811,9 +893,9 @@ def main() -> int:
     p_rec = sub.add_parser("reconcile", help="Compare IB positions to target weights")
     _add_refresh_flags(p_rec)
 
-    sub.add_parser("cancel-open", help="Cancel working GE1 orders at IBKR")
+    sub.add_parser("cancel-open", help="Cancel working CoreEquity orders at IBKR")
 
-    p_flat = sub.add_parser("flatten", help="Sell GE1 names (preview unless --confirm-flatten)")
+    p_flat = sub.add_parser("flatten", help="Sell CoreEquity names (preview unless --confirm-flatten)")
     _add_refresh_flags(p_flat)
     p_flat.add_argument("--include-foreign", action="store_true")
     p_flat.add_argument("--preview-only", action="store_true")

@@ -163,6 +163,7 @@ def build_forward_mark_payload(
     nav_live_model: np.ndarray | None = None,
     nav_crypto: np.ndarray | None = None,
     nav_durable: np.ndarray | None = None,
+    nav_core_equity: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Assemble a browser-friendly forward-mark payload (NAVs start at ``initial_cash``)."""
     model = np.asarray(nav_model, dtype=np.float64).reshape(-1)
@@ -183,6 +184,11 @@ def build_forward_mark_payload(
         if nav_durable is not None
         else None
     )
+    core_eq = (
+        np.asarray(nav_core_equity, dtype=np.float64).reshape(-1)
+        if nav_core_equity is not None
+        else None
+    )
     n = int(min(model.size, spy.size, ew.size, len(dates)))
     if live is not None:
         n = int(min(n, live.size))
@@ -190,6 +196,8 @@ def build_forward_mark_payload(
         n = int(min(n, crypto.size))
     if durable is not None:
         n = int(min(n, durable.size))
+    if core_eq is not None:
+        n = int(min(n, core_eq.size))
     if n < 1:
         raise ValueError("forward mark requires at least one NAV point")
 
@@ -201,6 +209,7 @@ def build_forward_mark_payload(
         live_s = live[:n].tolist() if live is not None else None
         crypto_s = crypto[:n].tolist() if crypto is not None else None
         durable_s = durable[:n].tolist() if durable is not None else None
+        core_eq_s = core_eq[:n].tolist() if core_eq is not None else None
     else:
         scale = float(initial_cash) / max(float(model[0]), 1e-12)
         model_s = (model[:n] * scale).tolist()
@@ -220,6 +229,11 @@ def build_forward_mark_payload(
         durable_s = (
             (durable[:n] / max(float(durable[0]), 1e-12) * float(initial_cash)).tolist()
             if durable is not None and durable.size
+            else None
+        )
+        core_eq_s = (
+            (core_eq[:n] / max(float(core_eq[0]), 1e-12) * float(initial_cash)).tolist()
+            if core_eq is not None and core_eq.size
             else None
         )
     if timestamps is not None and len(timestamps) >= n:
@@ -300,6 +314,11 @@ def build_forward_mark_payload(
         payload["nav"]["durable"] = durable_s
         payload["stats"]["durable"] = _series_stats(
             durable_s, bars_per_year=bars_per_year, timestamps=date_strs
+        )
+    if core_eq_s is not None:
+        payload["nav"]["core_equity"] = core_eq_s
+        payload["stats"]["core_equity"] = _series_stats(
+            core_eq_s, bars_per_year=bars_per_year, timestamps=date_strs
         )
     if bar_interval:
         payload["bar_interval"] = bar_interval
@@ -431,6 +450,7 @@ def resolve_active_forward_run_id(root: Path | None = None) -> str | None:
         # LIVE_* RL deploy marks, GeneralEquity1 / CrestDay, or legacy algo ids.
         if name.startswith("LIVE_") or name in {
             "RLModel",
+            "CORE_EQUITY",
             "GENERAL_EQUITY1",
             "GENERAL_EQUITY",
             "CREST_DAY",

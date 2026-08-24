@@ -32,6 +32,8 @@ LIVE_STAMP_NAME = "forward_live_stamp.json"
 RL_LIVE_RUN_ID = "RLModel"
 # Locked GeneralEquity1 pack paper book (TQQQ+QQQ hybrid weekly + GLD/TLT dual).
 ALGO_LIVE_RUN_ID = "GENERAL_EQUITY1"
+# Locked CoreEquity companion (QQQ weekly + GLD/TLT dual; no 2x/3x ETFs).
+CORE_EQUITY_LIVE_RUN_ID = "CORE_EQUITY"
 # Soft companion CrestDay series (pack NAV; never blocks equity forward).
 CRYPTO_LIVE_RUN_ID = "CREST_DAY"
 # Soft companion Durable.v1 (CDE FCM long/short; never blocks equity forward).
@@ -49,6 +51,14 @@ BARS_PER_TRADING_DAY = 78
 # that no longer overlaps the local NPZ cache.
 INTRADAY_LOOKBACK_DAYS = 59
 YAHOO_INTRADAY_RANGES: tuple[str, ...] = ("1mo", "5d")
+
+
+def canonical_forward_run_id(run_id: str | None) -> str:
+    """Primary /ops/forward mark is always GeneralEquity1 (packs are companions)."""
+    rid = str(run_id or "").strip()
+    if rid.upper() in {CORE_EQUITY_LIVE_RUN_ID, "GENERAL_EQUITY"}:
+        return ALGO_LIVE_RUN_ID
+    return rid
 
 
 def _session_date_today() -> str:
@@ -122,6 +132,7 @@ def seed_flat_forward_baseline(
     nav_live = flat.copy() if include_live_model else None
     if include_live_model:
         candles["live_model"] = _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc)
+    candles["core_equity"] = _candles_to_payload(pd.DatetimeIndex([ts]), flat_ohlc)
 
     latest_w = _latest_shadow_weights(rid) or {"Cash": 1.0}
     if not isinstance(latest_w, dict) or not latest_w:
@@ -151,7 +162,7 @@ def seed_flat_forward_baseline(
         note=(
             f"Flat baseline reset at {cash:,.0f} on {book_start} "
             f"(no session bars yet). Live 5m MTM resumes at the next cash open. "
-            f"GENERAL_EQUITY1 + CrestDay + RLModel companion."
+            f"GENERAL_EQUITY1 + CoreEquity + CrestDay + RLModel companion."
         ),
         bar_interval=BAR_INTERVAL,
         timestamps=[ts.isoformat(timespec="minutes")],
@@ -159,6 +170,7 @@ def seed_flat_forward_baseline(
         bars_per_year=float(BARS_PER_TRADING_DAY * 252),
         nav_live_model=nav_live,
         nav_crypto=flat,
+        nav_core_equity=flat,
     )
     payload["book_start"] = book_start
     payload["latest_weights"] = {
@@ -684,6 +696,8 @@ def _is_external_weight_book(
     rid = str(run_id).upper()
     if rid in {
         ALGO_LIVE_RUN_ID,
+        "CORE_EQUITY",
+        "GENERAL_EQUITY1",
         "GENERAL_EQUITY",
         "PROD_RETURN_ALPHA",
         "FINALMODEL",
@@ -935,12 +949,22 @@ def paper_lots_start_from_state(st: dict[str, Any] | None) -> pd.Timestamp | Non
     updated = str(st.get("updated_at_utc") or "").strip()
     rec: dict[str, Any] = {"trade_date": trade or None}
     if updated and trade and updated[:10] == trade[:10]:
-        rec["recorded_at_utc"] = updated
+        try:
+            ts = pd.Timestamp(updated)
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("America/New_York").tz_localize(None)
+            minutes = int(ts.hour) * 60 + int(ts.minute)
+            # After-hours same-day writes are bookkeeping, not the fill clock.
+            # Using them as lot-start flattens the whole session at $100k.
+            if (9 * 60 + 30) <= minutes < (16 * 60):
+                rec["recorded_at_utc"] = updated
+        except (TypeError, ValueError):
+            pass
     return ledger_effective_ts(rec)
 
 
 def load_paper_share_book(run_id: str) -> tuple[float, dict[str, float], pd.Timestamp | None]:
-    """Cash + share lots from the live paper state (GeneralEquity1 / CrestDay)."""
+    """Cash + share lots from the live paper state (CoreEquity / CrestDay)."""
     path = _PAPER_STATE_BY_RUN.get(str(run_id).upper())
     if path is None:
         return 0.0, {}, None
@@ -960,6 +984,67 @@ def load_paper_share_book(run_id: str) -> tuple[float, dict[str, float], pd.Time
             continue
         pos[str(key).strip().upper()] = qty
     return cash, pos, paper_lots_start_from_state(st)
+
+
+CORE_EQUITY_BOOK_SYMBOLS = ("QQQ", "GLD", "TLT", "BIL")
+
+
+def _mtm_paper_run_on_grid(
+    run_id: str,
+    *,
+    times: pd.DatetimeIndex,
+    o: np.ndarray,
+    h: np.ndarray,
+    l: np.ndarray,
+    c: np.ndarray,
+    lab_index: dict[str, int],
+    initial_cash: float,
+) -> tuple[np.ndarray, dict[str, float], list[dict[str, Any]]]:
+    """5m OHLC NAV + tip weights/positions from a paper share book."""
+    cash, lots, start = load_paper_share_book(run_id)
+    labs = [lab for lab in lots if lab in lab_index]
+    t_bars = int(len(times))
+    if t_bars < 1:
+        flat = np.zeros((0, 4), dtype=np.float64)
+        return flat, {"CASH": 1.0}, []
+    if not labs:
+        ohlc = np.full((t_bars, 4), float(initial_cash), dtype=np.float64)
+        return ohlc, {"CASH": 1.0}, _positions_snapshot(
+            {"CASH": 1.0},
+            nav=float(initial_cash),
+            labels=["Cash"],
+            last_closes=None,
+            tickers=[],
+        )
+    idx = [lab_index[lab] for lab in labs]
+    qty = np.asarray([float(lots.get(lab, 0.0)) for lab in labs], dtype=np.float64)
+    ohlc = lots_ohlc_candles(
+        o[:, idx],
+        h[:, idx],
+        l[:, idx],
+        c[:, idx],
+        cash=cash,
+        quantities=qty,
+        times=times,
+        start=start,
+        initial_cash=initial_cash,
+    )
+    last_nav = float(ohlc[-1, 3]) if len(ohlc) else float(initial_cash)
+    last_px = c[-1, idx] if c.shape[0] else np.zeros(len(labs))
+    lot_w: dict[str, float] = {"CASH": float(cash)}
+    for i, lab in enumerate(labs):
+        lot_w[lab] = float(qty[i]) * float(last_px[i]) if i < last_px.shape[0] else 0.0
+    if last_nav > 1e-12:
+        lot_w = {k: v / last_nav for k, v in lot_w.items()}
+    labels = ["Cash"] + labs
+    positions = _positions_snapshot(
+        lot_w,
+        nav=last_nav,
+        labels=labels,
+        last_closes=last_px,
+        tickers=labs,
+    )
+    return ohlc, lot_w, positions
 
 
 def mtm_ohlc_from_start(
@@ -1095,12 +1180,15 @@ def _positions_snapshot(
 # Forward allocation panels (nav key → UI label + paper/shadow run id).
 _ALLOCATION_BOOKS: tuple[tuple[str, str, str], ...] = (
     ("model", "GeneralEquity1", ALGO_LIVE_RUN_ID),
+    ("core_equity", "CoreEquity", CORE_EQUITY_LIVE_RUN_ID),
     ("live_model", "RLModel", RL_LIVE_RUN_ID),
     ("crypto", "CrestDay", CRYPTO_LIVE_RUN_ID),
 )
 
 _PAPER_STATE_BY_RUN: dict[str, Path] = {
     ALGO_LIVE_RUN_ID: PROJECT_ROOT / "execution" / "paper_general_equity1" / "state.json",
+    CORE_EQUITY_LIVE_RUN_ID: PROJECT_ROOT / "execution" / "paper_core_equity" / "state.json",
+    "GENERAL_EQUITY1": PROJECT_ROOT / "execution" / "paper_general_equity1" / "state.json",
     CRYPTO_LIVE_RUN_ID: PROJECT_ROOT / "execution" / "paper_crest_day" / "state.json",
 }
 
@@ -1309,6 +1397,12 @@ def _build_allocations_payload(
             positions = model_positions
             price_source = model_price_source
             weights = mark.get("latest_weights") if isinstance(mark.get("latest_weights"), dict) else {}
+        elif key == "core_equity" and isinstance(mark.get("core_equity_positions"), list) and mark.get("core_equity_positions"):
+            positions = mark["core_equity_positions"]
+            price_source = "yahoo"
+            weights = mark.get("core_equity_weights") if isinstance(mark.get("core_equity_weights"), dict) else {}
+            if not weights:
+                weights = _resolve_strategy_weights(run_id, aum=nav)
         else:
             weights = _resolve_strategy_weights(run_id, aum=nav)
             if key == "crypto":
@@ -1426,7 +1520,7 @@ def _extend_payload_clock_24_7(mark: dict[str, Any]) -> dict[str, Any]:
     mark["n_bars"] = int(len(iso))
 
     nav = dict(mark.get("nav") or {})
-    for key in ("model", "spy", "equal_weight", "live_model", "crypto"):
+    for key in ("model", "spy", "equal_weight", "live_model", "crypto", "core_equity"):
         if key in nav and isinstance(nav[key], list) and nav[key]:
             nav[key] = _extend_nav_series(nav[key], n_add)
     # Drop retired Durable.v1 series so 24/7 extension does not keep them alive.
@@ -1522,6 +1616,33 @@ def _attach_soft_companions_to_mark(payload: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001
         pass
+
+    if "core_equity" not in nav or not isinstance(nav.get("core_equity"), list) or not nav.get("core_equity"):
+        try:
+            st = _read_json_file(_PAPER_STATE_BY_RUN.get(CORE_EQUITY_LIVE_RUN_ID, Path()))
+            _cash, _lots, start = load_paper_share_book(CORE_EQUITY_LIVE_RUN_ID)
+            del _cash, _lots
+            equity = float(st.get("equity") or initial_cash) if st else float(initial_cash)
+            series = np.full(len(times), float(initial_cash), dtype=np.float64)
+            if start is not None:
+                start_t = pd.Timestamp(start).tz_localize(None)
+                series[times >= start_t] = equity
+            else:
+                series[:] = equity
+            _attach(
+                "core_equity",
+                series,
+                "companion_core_equity_run_id",
+                CORE_EQUITY_LIVE_RUN_ID,
+            )
+        except Exception:  # noqa: BLE001
+            series = np.full(len(times), float(initial_cash), dtype=np.float64)
+            _attach(
+                "core_equity",
+                series,
+                "companion_core_equity_run_id",
+                CORE_EQUITY_LIVE_RUN_ID,
+            )
 
     payload["nav"] = nav
     payload["stats"] = stats
@@ -1763,7 +1884,9 @@ def refresh_forward_mark_live(
     - ``reset_book=True`` wipes the price cache and restarts all sleeves at
       ``initial_cash`` from today's US session.
     """
-    rid = (run_id or "").strip() or (resolve_active_forward_run_id(root) or "")
+    rid = canonical_forward_run_id(
+        (run_id or "").strip() or (resolve_active_forward_run_id(root) or "")
+    )
     if not rid:
         return None
 
@@ -1863,11 +1986,19 @@ def refresh_forward_mark_live(
             )
         for lab in paper_lots:
             merged_w.setdefault(lab, 1.0)
+        ce_cash, ce_lots, _ce_start = load_paper_share_book(CORE_EQUITY_LIVE_RUN_ID)
+        del ce_cash
+        for lab in ce_lots:
+            merged_w.setdefault(lab, 1.0)
         stock_symbols = _stock_symbols_from_weights(merged_w)
         if not stock_symbols:
             stock_symbols = {"SPY": "SPY"}
         tickers = list(stock_symbols.keys())
         labels = ["Cash"] + list(stock_symbols.keys())
+        # Pull CoreEquity 1x names for the companion sleeve without putting
+        # them on the GeneralEquity1 label list (no TQQQ bleed the other way).
+        for lab in CORE_EQUITY_BOOK_SYMBOLS:
+            stock_symbols.setdefault(lab, lab)
         # Equity paper book: no cash yield (cash account, idle cash = 0).
         cash_yield_bar = 0.0
     else:
@@ -2230,7 +2361,7 @@ def refresh_forward_mark_live(
     if ge_W.shape[0]:
         live_vec = ge_W[-1]
     if stock_book:
-        book_labs = list(stock_symbols.keys())
+        book_labs = labels[1:]
         o_book, h_book, l_book, c_book = _cols(book_labs)
         if paper_lots and c_book.shape[1]:
             qty = np.asarray([float(paper_lots.get(lab, 0.0)) for lab in book_labs], dtype=np.float64)
@@ -2293,12 +2424,32 @@ def refresh_forward_mark_live(
             cash_yield_per_bar=rl_cash_yield_bar,
         )
 
+    core_equity_ohlc = None
+    core_equity_weights: dict[str, float] = {}
+    core_equity_positions: list[dict[str, Any]] = []
+    if stock_book:
+        core_equity_ohlc, core_equity_weights, core_equity_positions = _mtm_paper_run_on_grid(
+            CORE_EQUITY_LIVE_RUN_ID,
+            times=times,
+            o=o,
+            h=h,
+            l=l,
+            c=c,
+            lab_index=lab_index,
+            initial_cash=initial_cash,
+        )
+
     nav_model = _nav_series_from_ohlc(model_ohlc, initial_cash=initial_cash)
     nav_ew = _nav_series_from_ohlc(ew_ohlc, initial_cash=initial_cash)
     nav_spy = _nav_series_from_ohlc(spy_ohlc, initial_cash=initial_cash)
     nav_live = (
         _nav_series_from_ohlc(live_model_ohlc, initial_cash=initial_cash)
         if live_model_ohlc is not None
+        else None
+    )
+    nav_core = (
+        _nav_series_from_ohlc(core_equity_ohlc, initial_cash=initial_cash)
+        if core_equity_ohlc is not None
         else None
     )
 
@@ -2310,10 +2461,13 @@ def refresh_forward_mark_live(
     }
     if live_model_ohlc is not None:
         candles_payload["live_model"] = _candles_to_payload(times, live_model_ohlc)
+    if core_equity_ohlc is not None:
+        candles_payload["core_equity"] = _candles_to_payload(times, core_equity_ohlc)
 
     note = (
-        f"GENERAL_EQUITY1 (GeneralEquity1) since {book_start} marked from paper share lots "
+        f"GENERAL_EQUITY1 share lots since {book_start} "
         f"(last trade {lots_start.date() if lots_start is not None else 'n/a'}); "
+        f"CoreEquity companion from its own QQQ/GLD/TLT/BIL lots; "
         f"RLModel from {live_model_start.date()} at $100k, then shadow-ledger books as recorded. "
         "Equal-weight is the original 10-asset research universe (not algo ETF weights). "
         if stock_book
@@ -2346,6 +2500,7 @@ def refresh_forward_mark_live(
         candles=candles_payload,
         bars_per_year=BARS_PER_TRADING_DAY * 252,
         nav_live_model=nav_live,
+        nav_core_equity=nav_core,
     )
     payload["book_start"] = str(book_start)
     payload["live_model_start"] = pd.Timestamp(live_model_start).isoformat(timespec="minutes")
@@ -2357,6 +2512,12 @@ def refresh_forward_mark_live(
         tickers=tickers,
     )
     payload["positions"] = positions
+    if core_equity_positions:
+        payload["core_equity_positions"] = core_equity_positions
+    if core_equity_weights:
+        payload["core_equity_weights"] = {
+            str(k): float(v) for k, v in core_equity_weights.items()
+        }
     payload["companion_run_id"] = RL_LIVE_RUN_ID if nav_live is not None else None
     last_bar_iso = pd.Timestamp(times[-1]).isoformat(timespec="minutes")
     payload["live"] = {

@@ -47,7 +47,7 @@ export default defineConfig({
       ],
     },
     proxy: {
-      // Optional: preflight / force-forward only. Page data comes from /data/*.json.
+      // Runs/detail/forward prefer live :8787; snapshots are the fallback.
       '/api': {
         target: 'http://127.0.0.1:8787',
         changeOrigin: true,

@@ -1,6 +1,7 @@
 # Frozen 809 / 720-plus live default (cohort 809).
 # LSTM 64, inactivity 0.35/0.15, fee_ramp_fraction 0.45, residual_actions false.
-# Train 816 residual via specs/residual_816.yaml (one-change patch on this recipe).
+# Train 816 residual via specs/residual_816.yaml; 817 via specs/residual_817.yaml
+# (fully-invested residual); 818 via specs/residual_818.yaml (817 tilts × exposure).
 # Copied from config/config.yaml at freeze time — keep the two in sync.
 #
 # RLBot centralized configuration — version control this file with training runs.
@@ -47,10 +48,14 @@ environment:
   # so the policy has an explicit gross-exposure head instead of burying cash in a
   # joint softmax (726 stayed ~fully invested OOS on W2–W5).
   two_head_actions: true
-  # Residual policy (cohort 816 only): lock EW core, learn ±clip tilts. Off for 809.
+  # Residual policy (cohorts 816/817): lock EW core, learn ±clip tilts. Off for 809.
   residual_actions: false
   residual_clip: 0.08
   residual_core: equal_weight  # equal_weight | reward_benchmark
+  # 816 leaky mapper (leftover underweights → cash). 817 sets this true in-spec.
+  residual_fully_invested: false
+  # 818: 817 sleeve × two-head sigmoid on action[0]. Off for 809 / 816 / 817.
+  residual_keep_exposure: false
   # Cohort 809 / 806_720_plus: no mechanical crash floor (807–808 parked cash).
   dd_exposure_taper: false
   dd_exposure_taper_start: 0.04

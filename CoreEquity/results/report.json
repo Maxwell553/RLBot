@@ -1,0 +1,62 @@
+{
+  "pack": "CoreEquity",
+  "asof_backtest": "2026-08-20",
+  "aum": 100000.0,
+  "ann_one_way_turnover": 4.085116560922578,
+  "retail": {
+    "train": {
+      "total_return": 1.8217716775945063,
+      "sharpe_ratio": 1.1556973939819257,
+      "max_drawdown": -0.14260756830545274
+    },
+    "mid": {
+      "total_return": 1.458207573981836,
+      "sharpe_ratio": 1.1063305386419355,
+      "max_drawdown": -0.11839522087321241
+    },
+    "hold": {
+      "total_return": 0.8249899321378764,
+      "sharpe_ratio": 1.5337707739514144,
+      "max_drawdown": -0.13078288740666189
+    },
+    "full": {
+      "total_return": 11.589424869835156,
+      "sharpe_ratio": 1.1938757334196797,
+      "max_drawdown": -0.14260756830545274
+    }
+  },
+  "spy": {
+    "train": {
+      "total_return": 1.7699422778726288
+    },
+    "mid": {
+      "total_return": 0.955426779189692
+    },
+    "hold": {
+      "total_return": 0.5898982996237709
+    },
+    "full": {
+      "total_return": 7.624653184639435
+    }
+  },
+  "gates": {
+    "frozen_select": true,
+    "raised_select": true,
+    "raised_holdout": true,
+    "stress_1_5": true,
+    "stress_2_0": true,
+    "cap5": true,
+    "plateau": 0.625
+  },
+  "prod_viable_research": true,
+  "production_ready": true,
+  "vs_GeneralEquity": {
+    "mid_sharpe_gt_ge": true,
+    "full_sharpe_gt_ge": true,
+    "dd_better_than_ge": false,
+    "cagr_excess_gt_ge": true,
+    "cagr_excess": 0.026305950812605783
+  },
+  "beats_both_GeneralEquity_and_prior_CoreEquity": false,
+  "note": "raised GE gates cleared with QQQ 12m-abs OR SMA(42) and q_cap 1.4. Holdout one-shot. Not a better-than-both claim vs GE DD or the prior analog's DD/full Sharpe."
+}

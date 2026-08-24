@@ -170,7 +170,8 @@ def portfolio_weights_from_action(
     When ``environment.residual_actions`` is enabled, delegates to
     :func:`rlbot.residual_actions.portfolio_weights_residual` (locked core + clipped
     tilts). That mapping takes precedence over two-head / softmax-over-cash so PPO
-    only learns allocation tilts.
+    only learns allocation tilts. With ``residual_keep_exposure``, action[0] is
+    still the two-head gross logit and only the risky sleeve is residual.
 
     When ``environment.two_head_actions`` is enabled (and residual is off), delegates
     to :func:`rlbot.two_head_actions.portfolio_weights_two_head` (exposure head +

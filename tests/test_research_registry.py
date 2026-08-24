@@ -106,6 +106,43 @@ def test_residual_816_spec_is_one_change_on_809() -> None:
     assert "W5_816" in ids and "W6_816" not in ids
 
 
+def test_residual_817_spec_is_fully_invested_on_809() -> None:
+    path = PROJECT_ROOT / "specs" / "residual_817.yaml"
+    spec = load_spec(path)
+    assert spec.id == "817"
+    assert spec.evaluation_tier == 3  # train + eval only; do not burn holdouts yet
+    assert spec.patch == {
+        "environment.residual_actions": True,
+        "environment.residual_fully_invested": True,
+        "environment.residual_clip": 0.08,
+        "environment.residual_core": "equal_weight",
+    }
+    variants = resolve_variants(spec)
+    assert len(variants) == 10  # W1–W5 × seeds 0, 42
+    ids = [v.variant_id for v in variants]
+    assert "W1_817" in ids and "W1_817_s42" in ids
+    assert "W5_817" in ids and "W6_817" not in ids
+
+
+def test_residual_818_spec_keeps_exposure_on_809() -> None:
+    path = PROJECT_ROOT / "specs" / "residual_818.yaml"
+    spec = load_spec(path)
+    assert spec.id == "818"
+    assert spec.evaluation_tier == 3  # train + eval only; do not burn holdouts yet
+    assert spec.patch == {
+        "environment.residual_actions": True,
+        "environment.residual_fully_invested": True,
+        "environment.residual_keep_exposure": True,
+        "environment.residual_clip": 0.08,
+        "environment.residual_core": "equal_weight",
+    }
+    variants = resolve_variants(spec)
+    assert len(variants) == 10  # W1–W5 × seeds 0, 42
+    ids = [v.variant_id for v in variants]
+    assert "W1_818" in ids and "W1_818_s42" in ids
+    assert "W5_818" in ids and "W6_818" not in ids
+
+
 def test_canonical_run_ids_are_window_cohort() -> None:
     spec = ExperimentSpec(
         id="w3_dd_coupling_811",

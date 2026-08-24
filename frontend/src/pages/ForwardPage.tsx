@@ -14,6 +14,7 @@ import { useAutoRefresh } from '../lib/use-auto-refresh'
 
 const SERIES = [
   { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
+  { key: 'core_equity' as const, label: 'CoreEquity', color: '#2a9d8f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
   { key: 'equal_weight' as const, label: 'Equal-weight 10', color: '#5c6b7a' },
   { key: 'spy' as const, label: 'S&P (SPY)', color: '#c45c3e' },
@@ -189,6 +190,7 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
     rows?.length ? rows.slice(i0) : []
 
   const modelCandles = sliceCandleSeries(mark.candles?.model)
+  const coreEquityCandles = sliceCandleSeries(mark.candles?.core_equity)
   const liveCandles = sliceCandleSeries(mark.candles?.live_model)
   const cryptoCandles = sliceCandleSeries(mark.candles?.crypto)
   const spyCandles = sliceCandleSeries(mark.candles?.spy)
@@ -202,6 +204,7 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
     return candles.map((c) => c.c)
   }
   const model = navOrCloses(mark.nav?.model, modelCandles)
+  const core_equity = navOrCloses(mark.nav?.core_equity, coreEquityCandles)
   const live_model = navOrCloses(mark.nav?.live_model, liveCandles)
   const crypto = navOrCloses(mark.nav?.crypto, cryptoCandles)
   const spy = navOrCloses(mark.nav?.spy, spyCandles)
@@ -217,6 +220,7 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
       model,
       spy,
       equal_weight,
+      ...(core_equity.length ? { core_equity } : {}),
       ...(live_model.length ? { live_model } : {}),
       ...(crypto.length ? { crypto } : {}),
     },
@@ -224,12 +228,14 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
       modelCandles.length ||
       spyCandles.length ||
       ewCandles.length ||
+      coreEquityCandles.length ||
       liveCandles.length ||
       cryptoCandles.length
         ? {
             model: modelCandles,
             spy: spyCandles,
             equal_weight: ewCandles,
+            ...(coreEquityCandles.length ? { core_equity: coreEquityCandles } : {}),
             ...(liveCandles.length ? { live_model: liveCandles } : {}),
             ...(cryptoCandles.length ? { crypto: cryptoCandles } : {}),
           }
@@ -238,6 +244,9 @@ function sliceMark(mark: ApiForwardMark, range: RangeId): {
       model: windowStats(model, barsPerYear, windowStamps),
       spy: windowStats(spy, barsPerYear, windowStamps),
       equal_weight: windowStats(equal_weight, barsPerYear, windowStamps),
+      ...(core_equity.length
+        ? { core_equity: windowStats(core_equity, barsPerYear, windowStamps) }
+        : {}),
       ...(live_model.length
         ? { live_model: windowStats(live_model, barsPerYear, windowStamps) }
         : {}),
@@ -386,6 +395,7 @@ type HoverPoint = {
   index: number
   date: string
   model: number | null
+  core_equity: number | null
   live_model: number | null
   equal_weight: number | null
   spy: number | null
@@ -472,6 +482,7 @@ function NavChart({ mark }: { mark: ApiForwardMark }) {
       index: idx,
       date: plot.stamps[idx] ?? `bar ${idx + 1}`,
       model: at('model'),
+      core_equity: at('core_equity'),
       live_model: at('live_model'),
       equal_weight: at('equal_weight'),
       spy: at('spy'),
@@ -719,6 +730,7 @@ function StatsCard({
 
 const ALLOCATION_TABS = [
   { key: 'model' as const, label: 'GeneralEquity1', color: '#0b6e4f' },
+  { key: 'core_equity' as const, label: 'CoreEquity', color: '#2a9d8f' },
   { key: 'live_model' as const, label: 'RLModel', color: '#2f6fed' },
 ]
 
@@ -1005,10 +1017,11 @@ export function ForwardPage() {
           <p className="font-mono text-[11px] uppercase tracking-[.2em] text-ink/55">Forward test</p>
           <h1 className="mt-2 font-display text-3xl text-ink">Live book vs benchmarks</h1>
           <p className="mt-2 max-w-2xl text-sm text-ink/60">
-            Five-minute NAV marks from the live paper book (GENERAL_EQUITY1 / GeneralEquity1
-            or a LIVE_* RL deploy) vs equal-weight and SPY. A backend collector writes
-            prices and trades to execution/ even when this page is closed. Refresh still
-            forces a Yahoo rewrite.
+            Five-minute NAV marks from the live paper books (GENERAL_EQUITY1 /
+            GeneralEquity1 plus CoreEquity companion, or a LIVE_* RL deploy) vs
+            equal-weight and SPY. A backend collector writes prices and trades to
+            execution/ even when this page is closed. Refresh still forces a Yahoo
+            rewrite.
           </p>
           {state.kind === 'live' && refreshing && (
             <p className="mt-2 text-[11px] text-ink/55">Refreshing forward mark…</p>
@@ -1045,6 +1058,9 @@ bash scripts/install_live_forward_launchd.sh
 
 # Locked GeneralEquity1 pack (TQQQ+QQQ hybrid + GLD/TLT dual)
 python scripts/paper_prod_return_alpha.py run-day --refresh-data
+
+# Companion CoreEquity pack (QQQ weekly + GLD/TLT dual; no 2x/3x ETFs)
+python scripts/paper_core_equity.py run-day --refresh-data
 
 # Companion RL LIVE deploy mark:
 python scripts/forward_mark.py --run-id RLModel --refresh-data`}

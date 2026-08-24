@@ -113,6 +113,10 @@ def test_tick_writes_status_and_skips_network(tmp_path: Path, monkeypatch) -> No
         lambda **kwargs: {"ok": True, "as_of": "2026-08-17", "actions": ["hold"]},
     )
     monkeypatch.setattr(
+        "rlbot.forward_loop._soft_paper_core",
+        lambda **kwargs: {"ok": True, "as_of": "2026-08-17", "actions": ["hold"]},
+    )
+    monkeypatch.setattr(
         "rlbot.forward_loop._soft_paper_crest",
         lambda **kwargs: {"ok": True, "skipped": "pack_missing"},
     )
@@ -131,34 +135,41 @@ def test_tick_writes_status_and_skips_network(tmp_path: Path, monkeypatch) -> No
     assert status["run_id"] == "GENERAL_EQUITY1"
     assert status["n_bars"] == 3
     assert status["paper_ge1_date"] == "2026-08-17"
+    assert status["paper_core_date"] == "2026-08-17"
     assert (tmp_path / "execution" / "forward_loop_status.json").is_file()
     assert captured["run_id"] == "GENERAL_EQUITY1"
     assert captured["root"] == tmp_path
     assert "GENERAL_EQUITY1" in writes
     assert (status.get("sleeves") or {}).get("GENERAL_EQUITY1", {}).get("ok") is True
+    assert (status.get("sleeves") or {}).get("CORE_EQUITY", {}).get("ok") is True
 
 
 def test_second_tick_skips_ge1_paper_same_session(tmp_path: Path, monkeypatch) -> None:
-    calls = {"ge1": 0}
+    calls = {"ge1": 0, "core": 0}
 
     def _ge1(**kwargs):  # noqa: ANN001
         calls["ge1"] += 1
+        return {"ok": True, "as_of": "2026-08-17", "actions": ["rebalance"]}
+
+    def _core(**kwargs):  # noqa: ANN001
+        calls["core"] += 1
         return {"ok": True, "as_of": "2026-08-17", "actions": ["rebalance"]}
 
     monkeypatch.setattr("rlbot.forward_loop.refresh_forward_mark_live", lambda *a, **k: {"run_id": "GENERAL_EQUITY1", "n_bars": 1, "live": {}})
     monkeypatch.setattr("rlbot.forward_loop.write_forward_mark", lambda payload: None)
     monkeypatch.setattr("rlbot.forward_loop.publish_public_forward", lambda *a, **k: None)
     monkeypatch.setattr("rlbot.forward_loop._soft_paper_ge1", _ge1)
+    monkeypatch.setattr("rlbot.forward_loop._soft_paper_core", _core)
     monkeypatch.setattr("rlbot.forward_loop._soft_paper_crest", lambda **kwargs: {"ok": True, "skipped": "pack_missing"})
     monkeypatch.setattr("rlbot.forward_loop._soft_rl_shadow", lambda **kwargs: {"ok": True, "skipped": "not_due"})
 
     now = pd.Timestamp("2026-08-17 11:00", tz="America/New_York")
     tick(run_id="GENERAL_EQUITY1", root=tmp_path, now=now)
-    # Simulate the real skip path: status already recorded today's paper date.
     from rlbot.forward_loop import paper_day_due, read_status
 
     st = read_status(tmp_path)
     assert not paper_day_due(st.get("paper_ge1_date"), session="2026-08-17")
+    assert not paper_day_due(st.get("paper_core_date"), session="2026-08-17")
 
     def _ge1_skip(**kwargs):  # noqa: ANN001
         calls["ge1"] += 1
@@ -168,12 +179,154 @@ def test_second_tick_skips_ge1_paper_same_session(tmp_path: Path, monkeypatch) -
             return {"ok": True, "skipped": "already_today", "as_of": kwargs.get("last_date")}
         return {"ok": True, "as_of": "2026-08-17"}
 
+    def _core_skip(**kwargs):  # noqa: ANN001
+        calls["core"] += 1
+        from rlbot.forward_loop import paper_day_due as due
+
+        if not due(kwargs.get("last_date"), session=kwargs.get("session")):
+            return {"ok": True, "skipped": "already_today", "as_of": kwargs.get("last_date")}
+        return {"ok": True, "as_of": "2026-08-17"}
+
     monkeypatch.setattr("rlbot.forward_loop._soft_paper_ge1", _ge1_skip)
+    monkeypatch.setattr("rlbot.forward_loop._soft_paper_core", _core_skip)
     tick(run_id="GENERAL_EQUITY1", root=tmp_path, now=now)
-    assert calls["ge1"] == 2  # second call still enters helper…
-    # …but helper reports skip rather than a new as_of trade.
+    assert calls["ge1"] == 2
+    assert calls["core"] == 2
     st2 = read_status(tmp_path)
     assert st2["sleeves"]["GENERAL_EQUITY1"]["skipped"] == "already_today"
+    assert st2["sleeves"]["CORE_EQUITY"]["skipped"] == "already_today"
+
+
+def test_tick_remaps_core_equity_pointer_to_ge1(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_refresh(run_id, **kwargs):  # noqa: ANN001
+        captured["run_id"] = run_id
+        return {"run_id": run_id, "n_bars": 1, "live": {}}
+
+    monkeypatch.setattr("rlbot.forward_loop.refresh_forward_mark_live", _fake_refresh)
+    monkeypatch.setattr("rlbot.forward_loop.write_forward_mark", lambda payload: None)
+    monkeypatch.setattr("rlbot.forward_loop.publish_public_forward", lambda *a, **k: None)
+    monkeypatch.setattr("rlbot.forward_loop._soft_paper_ge1", lambda **kwargs: {"ok": True, "skipped": "already_today"})
+    monkeypatch.setattr("rlbot.forward_loop._soft_paper_core", lambda **kwargs: {"ok": True, "skipped": "already_today"})
+    monkeypatch.setattr("rlbot.forward_loop._soft_paper_crest", lambda **kwargs: {"ok": True, "skipped": "pack_missing"})
+    monkeypatch.setattr("rlbot.forward_loop._soft_rl_shadow", lambda **kwargs: {"ok": True, "skipped": "not_due"})
+
+    status = tick(
+        run_id="CORE_EQUITY",
+        root=tmp_path,
+        now=pd.Timestamp("2026-08-17 10:32", tz="America/New_York"),
+        run_paper=True,
+        run_rl_shadow=False,
+    )
+    assert status["run_id"] == "GENERAL_EQUITY1"
+    assert captured["run_id"] == "GENERAL_EQUITY1"
+
+
+def test_canonical_forward_run_id() -> None:
+    from rlbot.forward_live import canonical_forward_run_id
+
+    assert canonical_forward_run_id("CORE_EQUITY") == "GENERAL_EQUITY1"
+    assert canonical_forward_run_id("GENERAL_EQUITY1") == "GENERAL_EQUITY1"
+    assert canonical_forward_run_id("RLModel") == "RLModel"
+
+
+def test_paper_core_needs_reopen_empty_prior_session(tmp_path: Path) -> None:
+    from rlbot.forward_loop import _paper_core_needs_reopen
+
+    paper = tmp_path / "execution" / "paper_core_equity"
+    paper.mkdir(parents=True)
+    (paper / "state.json").write_text(
+        '{"positions": {}, "last_trade_date": "2026-08-20", "target_weights": {"CASH": 1.0}}',
+        encoding="utf-8",
+    )
+    assert _paper_core_needs_reopen(session="2026-08-21", root=tmp_path) is True
+    assert _paper_core_needs_reopen(session="2026-08-20", root=tmp_path) is False
+
+
+def test_soft_paper_core_reopens_flat_book_same_session(tmp_path: Path, monkeypatch) -> None:
+    paper = tmp_path / "execution" / "paper_core_equity"
+    paper.mkdir(parents=True)
+    (paper / "state.json").write_text(
+        '{"positions": {}, "last_trade_date": "2026-08-20", "target_weights": {"CASH": 1.0}}',
+        encoding="utf-8",
+    )
+    called = {"n": 0}
+
+    def _run_day(**kwargs):  # noqa: ANN001
+        del kwargs
+        called["n"] += 1
+        (paper / "state.json").write_text(
+            '{"positions": {"QQQ": 12.0}, "last_trade_date": "2026-08-21"}',
+            encoding="utf-8",
+        )
+        return {
+            "as_of": "2026-08-21",
+            "bar_date": "2026-08-20",
+            "actions": ["rebalance", "seed"],
+            "orders": [{"symbol": "QQQ"}],
+            "n_positions": 1,
+        }
+
+    monkeypatch.setattr("rlbot.pack_core_equity.PACK_DIR", tmp_path)
+    monkeypatch.setattr("rlbot.forward_loop.call_with_timeout", lambda fn, timeout, **kw: _run_day(**kw))
+    from rlbot.forward_loop import _soft_paper_core
+
+    out = _soft_paper_core(
+        session="2026-08-21",
+        last_date="2026-08-21",
+        root=tmp_path,
+    )
+    assert called["n"] == 1
+    assert out.get("force_reopen") is True
+    assert out.get("n_positions") == 1
+    assert "skipped" not in out
+
+
+def test_tick_does_not_stamp_core_date_on_empty_leftover(tmp_path: Path, monkeypatch) -> None:
+    paper = tmp_path / "execution" / "paper_core_equity"
+    paper.mkdir(parents=True)
+    (paper / "state.json").write_text(
+        '{"positions": {}, "last_trade_date": "2026-08-20"}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "rlbot.forward_loop.refresh_forward_mark_live",
+        lambda *a, **k: {"run_id": "GENERAL_EQUITY1", "n_bars": 1, "live": {}},
+    )
+    monkeypatch.setattr("rlbot.forward_loop.write_forward_mark", lambda payload: None)
+    monkeypatch.setattr("rlbot.forward_loop.publish_public_forward", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "rlbot.forward_loop._soft_paper_ge1",
+        lambda **kwargs: {"ok": True, "skipped": "already_today"},
+    )
+    monkeypatch.setattr(
+        "rlbot.forward_loop._soft_paper_core",
+        lambda **kwargs: {
+            "ok": True,
+            "as_of": "2026-08-21",
+            "actions": ["already_traded", "hold"],
+            "n_positions": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "rlbot.forward_loop._soft_paper_crest",
+        lambda **kwargs: {"ok": True, "skipped": "pack_missing"},
+    )
+    monkeypatch.setattr(
+        "rlbot.forward_loop._soft_rl_shadow",
+        lambda **kwargs: {"ok": True, "skipped": "not_due"},
+    )
+
+    status = tick(
+        run_id="GENERAL_EQUITY1",
+        root=tmp_path,
+        now=pd.Timestamp("2026-08-21 10:32", tz="America/New_York"),
+        run_paper=True,
+        run_rl_shadow=False,
+    )
+    assert status.get("paper_core_date") in (None, "")
 
 
 def test_loop_lock_exclusive(tmp_path: Path) -> None:

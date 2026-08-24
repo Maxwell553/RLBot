@@ -106,6 +106,14 @@ class EnvironmentConfig:
     residual_actions: bool = False
     residual_clip: float = 0.08
     residual_core: str = "equal_weight"  # equal_weight | reward_benchmark
+    # When True with residual_actions: demean tilts (sum-zero) and renormalize
+    # the live sleeve so leftover mass cannot sit in cash (cohort 817). Parser
+    # default False preserves 816's leaky mapper.
+    residual_fully_invested: bool = False
+    # When True with residual_actions: scale the residual sleeve by the two-head
+    # sigmoid on action[0] (cohort 818). Parser default False preserves 816/817
+    # (action[0] ignored).
+    residual_keep_exposure: bool = False
 
 
 @dataclass(frozen=True)
@@ -664,6 +672,8 @@ def _parse_config(data: dict[str, Any], path: Path) -> RLConfig:
             residual_actions=bool(env.get("residual_actions", False)),
             residual_clip=_residual_clip(env),
             residual_core=_residual_core(env),
+            residual_fully_invested=bool(env.get("residual_fully_invested", False)),
+            residual_keep_exposure=bool(env.get("residual_keep_exposure", False)),
         ),
         reward=RewardConfig(
             reward_scale=float(_req(rew, "reward_scale", "reward")),

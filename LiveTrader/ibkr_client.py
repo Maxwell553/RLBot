@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 from book import OrderIntent
 from config import LiveConfig
-from ge1_strategy import BOOK_SYMBOLS
+from ce_strategy import BOOK_SYMBOLS
 
 
 DONE_STATUSES = frozenset(
@@ -18,6 +20,29 @@ ACCEPTED_STATUSES = frozenset(
     {"Submitted", "PreSubmitted", "Filled", "PendingSubmit", "ApiPending"}
 )
 REJECT_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
+
+
+def _ib_bar_date(raw: Any) -> date | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if hasattr(raw, "date") and callable(raw.date):
+        try:
+            d = raw.date()
+            if isinstance(d, date):
+                return d
+        except Exception:  # noqa: BLE001
+            pass
+    s = str(raw).strip().replace(".", "-").replace("/", "-")
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        if len(s) >= 8 and s[:8].isdigit():
+            return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+        return None
 
 
 @dataclass
@@ -222,6 +247,16 @@ class FakeBroker:
         had = list(self._snap.open_order_symbols)
         self._snap.open_order_symbols = []
         return had
+
+    def historical_daily_ohlc(
+        self,
+        symbols: list[str],
+        *,
+        start: date,
+        end: date,
+    ) -> dict[str, dict[date, tuple[float, float, float, float]]]:
+        del start, end, symbols
+        return {}
 
 
 class IBKRBroker:
@@ -490,3 +525,60 @@ class IBKRBroker:
         if cancelled:
             ib.sleep(0.5)
         return cancelled
+
+    def historical_daily_ohlc(
+        self,
+        symbols: list[str],
+        *,
+        start: date,
+        end: date,
+    ) -> dict[str, dict[date, tuple[float, float, float, float]]]:
+        """Dividend-adjusted daily OHLC (ADJUSTED_LAST, then TRADES)."""
+        ib = self._require()
+        out: dict[str, dict[date, tuple[float, float, float, float]]] = {}
+        end_s = f"{end.strftime('%Y%m%d')} 23:59:59"
+        for i, sym in enumerate(symbols):
+            su = str(sym).upper()
+            try:
+                contract = self._stock(su)
+            except BrokerError:
+                continue
+            bars = []
+            for what in ("ADJUSTED_LAST", "TRADES"):
+                # ADJUSTED_LAST rejects a non-empty endDateTime (IB error 321).
+                end_dt = "" if what == "ADJUSTED_LAST" else end_s
+                try:
+                    bars = ib.reqHistoricalData(
+                        contract,
+                        endDateTime=end_dt,
+                        durationStr="20 Y",
+                        barSizeSetting="1 day",
+                        whatToShow=what,
+                        useRTH=True,
+                        formatDate=1,
+                        keepUpToDate=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    bars = []
+                if bars:
+                    break
+            if not bars:
+                continue
+            block: dict[date, tuple[float, float, float, float]] = {}
+            for bar in bars:
+                d = _ib_bar_date(getattr(bar, "date", None))
+                if d is None or d < start or d > end:
+                    continue
+                o = float(getattr(bar, "open", 0.0) or 0.0)
+                h = float(getattr(bar, "high", 0.0) or 0.0)
+                l = float(getattr(bar, "low", 0.0) or 0.0)
+                c = float(getattr(bar, "close", 0.0) or 0.0)
+                if c > 0 and math.isfinite(c):
+                    block[d] = (o, h, l, c)
+            if block:
+                out[su] = block
+            if i + 1 < len(symbols):
+                ib.sleep(0.25)
+        if "SPY" not in out:
+            raise BrokerError("IBKR historical returned no SPY bars")
+        return out

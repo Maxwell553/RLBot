@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless forward collector — 5m marks + paper/shadow logs without the UI.
 
-Yahoo 5m MTM, GeneralEquity1 / CrestDay paper state, and the RLModel shadow
+Yahoo 5m MTM, CoreEquity / CrestDay paper state, and the RLModel shadow
 ledger used to refresh only when ``/ops/forward`` was open. This process writes
 the same ``execution/`` caches on a timer.
 
@@ -50,7 +50,7 @@ def main() -> int:
     parser.add_argument(
         "--no-paper",
         action="store_true",
-        help="Skip GeneralEquity1 / CrestDay paper-day ticks",
+        help="Skip CoreEquity / CrestDay paper-day ticks",
     )
     parser.add_argument(
         "--no-shadow",

@@ -3,46 +3,49 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
-from ge1_strategy import BOOK_SYMBOLS, P, ProdParams
+from ce_strategy import BOOK_SYMBOLS, P, ProdParams
+from rlbot.pack_core_equity import live_session_rebalance_flags
 
 
 PAPER_PORTS = frozenset({7497, 4002})
 LIVE_PORTS = frozenset({7496, 4001})
-SLEEVE_A = frozenset({"TQQQ", "QQQ"})
 SLEEVE_B = frozenset({"GLD", "TLT", "BIL"})
+SLEEVE_A = frozenset(s for s in BOOK_SYMBOLS if s not in SLEEVE_B)
 CURRENCY = frozenset({"CASH", "USD", "EUR", "GBP", "JPY"})
 
 
-def session_rebalance_flags(dates: list[date], i: int) -> tuple[bool, bool]:
+def session_rebalance_flags(
+    dates: list[date],
+    i: int,
+    *,
+    calendar_today: date | None = None,
+) -> tuple[bool, bool]:
     """Live week-end / month-end. Does not force the series tip True."""
-    n = len(dates)
-    if i < 0 or i >= n:
-        return False, False
-    d = dates[i]
-    if i + 1 < n:
-        week_end = dates[i].isocalendar()[1] != dates[i + 1].isocalendar()[1]
-        month_end = dates[i].month != dates[i + 1].month
-        return bool(week_end), bool(month_end)
-    week_end = d.weekday() == 4
-    nxt = d + timedelta(days=1)
-    while nxt.weekday() >= 5:
-        nxt += timedelta(days=1)
-    month_end = nxt.month != d.month
-    return week_end, month_end
+    return live_session_rebalance_flags(dates, i, calendar_today=calendar_today)
 
 
-def active_sleeve_symbols(*, week_end: bool, month_end: bool, seed: bool) -> frozenset[str]:
-    """Locked book: weekly A, month-end B, first seed both."""
+def active_sleeve_symbols(
+    *,
+    week_end: bool,
+    month_end: bool,
+    seed: bool,
+    es_park: bool = False,
+) -> frozenset[str]:
+    """Locked book: weekly A, month-end B, first seed both; ES flatten is immediate."""
     if seed:
         return SLEEVE_A | SLEEVE_B
     allow: set[str] = set()
     if week_end:
         allow |= set(SLEEVE_A)
+        allow.add("BIL")  # pack residual parks in BIL
     if month_end:
         allow |= set(SLEEVE_B)
+    if es_park:
+        allow |= set(SLEEVE_A)
+        allow.add("BIL")
     return frozenset(allow)
 
 
@@ -88,6 +91,34 @@ def is_whole_share(qty: float) -> bool:
 
 def needs_fractional(orders: list[OrderIntent]) -> list[str]:
     return [o.symbol for o in orders if not is_whole_share(o.qty)]
+
+
+def round_to_whole_shares(
+    orders: list[OrderIntent],
+    *,
+    min_notional: float = 1.0,
+) -> list[OrderIntent]:
+    """Floor qty to whole shares. Drop legs that cannot buy/sell 1 share.
+
+    IBKR TWS API rejects fractional stock/ETF orders (error 10243); those
+    fills are desktop/Client Portal/mobile only.
+    """
+    out: list[OrderIntent] = []
+    for o in orders:
+        q = float(o.qty)
+        if is_whole_share(q):
+            out.append(o)
+            continue
+        whole = int(q)
+        if whole <= 0:
+            continue
+        notional = float(whole) * float(o.mark)
+        if notional < float(min_notional):
+            continue
+        o.qty = float(whole)
+        o.notional = notional
+        out.append(o)
+    return out
 
 
 def assign_order_types(
@@ -238,11 +269,12 @@ def merge_marks(yahoo: dict[str, float], ib_last: dict[str, float] | None) -> di
 
 
 def spendable_cash(cash: float, buying_power: float) -> float:
+    """IB buying power is the live constraint so cash-financed QQQ can exceed cash."""
     c = max(0.0, float(cash or 0.0))
     bp = max(0.0, float(buying_power or 0.0))
-    if c > 0 and bp > 0:
-        return min(c, bp)
-    return c or bp
+    if bp > 0:
+        return bp
+    return c
 
 
 def update_cool_state(
@@ -251,7 +283,14 @@ def update_cool_state(
     flat_a: bool,
     cool_remaining: int,
     p: ProdParams = P,
+    *,
+    ok_now: bool = True,
+    asof: str | None = None,
+    last_asof: str | None = None,
 ) -> tuple[float, bool, int]:
+    """Incremental sleeve-A ES. LiveTrader prefers ``sleeve_a_live_state`` replay."""
+    if asof is not None and last_asof is not None and str(asof) == str(last_asof):
+        return float(peak_equity or equity), bool(flat_a), int(cool_remaining or 0)
     peak = float(peak_equity or equity)
     if equity > peak:
         peak = equity
@@ -262,22 +301,25 @@ def update_cool_state(
     if flat:
         if cool > 0:
             return peak, True, cool - 1
-        return float(equity), False, 0
+        if ok_now:
+            return float(equity), False, 0
+        return peak, True, 0
     return peak, False, cool
 
 
 def park_sleeve_a(targets: dict[str, float], dual_asset: str) -> dict[str, float]:
-    dual = {str(dual_asset).upper()}
+    """Move sleeve A into BIL (run_prod idle return), keep dual / BIL."""
+    dual = {str(dual_asset).upper(), "BIL"}
     parked: dict[str, float] = {}
     for k, v in targets.items():
         ku = str(k).upper()
         if ku in dual or ku == "CASH":
             parked[ku] = parked.get(ku, 0.0) + float(v)
         else:
-            parked["CASH"] = parked.get("CASH", 0.0) + float(v)
+            parked["BIL"] = parked.get("BIL", 0.0) + float(v)
     s = sum(parked.values())
     if s <= 1e-12:
-        return {"CASH": 1.0}
+        return {"BIL": 1.0}
     return {k: v / s for k, v in parked.items()}
 
 

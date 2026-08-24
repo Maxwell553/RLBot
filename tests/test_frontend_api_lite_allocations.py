@@ -119,9 +119,53 @@ def test_attach_live_allocations_keeps_ge1_lot_weights() -> None:
     }
     out = mod._attach_live_allocations(payload)
     book = out["allocations"]["model"]
+    assert book["label"] == "GeneralEquity1"
+    assert book["run_id"] == "GENERAL_EQUITY1"
     assert abs(float(book["latest_weights"]["GLD"]) - 0.29) < 1e-9
     assert abs(float(book["nav"]) - 101_500.0) < 1e-6
     assert book["positions"][1]["ticker"] == "GLD"
+
+
+def test_attach_live_allocations_core_equity_does_not_reuse_ge1_lots() -> None:
+    mod = _load_lite()
+    payload = {
+        "initial_cash": 100_000.0,
+        "stats": {
+            "model": {"nav": 101_500.0},
+            "core_equity": {"nav": 100_800.0},
+            "live_model": {"nav": 100_000.0},
+        },
+        "nav": {
+            "model": [100_000.0, 101_500.0],
+            "core_equity": [100_000.0, 100_800.0],
+            "live_model": [100_000.0, 100_000.0],
+        },
+        "latest_weights": {"Cash": 0.47, "GLD": 0.29, "QQQ": 0.05, "TQQQ": 0.19},
+        "positions": [
+            {"label": "Cash", "ticker": "CASH", "weight": 0.47, "value_usd": 47_705.0, "price": 1.0},
+            {"label": "TQQQ", "ticker": "TQQQ", "weight": 0.19, "value_usd": 19_285.0, "price": 70.0},
+        ],
+        "core_equity_weights": {"CASH": 0.42, "QQQ": 0.38, "GLD": 0.12, "TLT": 0.08},
+        "core_equity_positions": [
+            {"label": "Cash", "ticker": "CASH", "weight": 0.42, "value_usd": 42_336.0, "price": 1.0},
+            {"label": "QQQ", "ticker": "QQQ", "weight": 0.38, "value_usd": 38_304.0, "price": 510.0},
+            {"label": "GLD", "ticker": "GLD", "weight": 0.12, "value_usd": 12_096.0, "price": 385.0},
+            {"label": "TLT", "ticker": "TLT", "weight": 0.08, "value_usd": 8_064.0, "price": 90.0},
+        ],
+        "live": {"as_of_utc": "2026-08-18T20:00:00Z"},
+    }
+    out = mod._attach_live_allocations(payload)
+    ge1 = out["allocations"]["model"]
+    ce = out["allocations"]["core_equity"]
+    assert ge1["run_id"] == "GENERAL_EQUITY1"
+    assert any(str(p.get("ticker")).upper() == "TQQQ" for p in ge1["positions"])
+    assert ce["label"] == "CoreEquity"
+    assert ce["run_id"] == "CORE_EQUITY"
+    assert abs(float(ce["nav"]) - 100_800.0) < 1e-6
+    tickers = {str(p.get("ticker")).upper() for p in ce["positions"]}
+    assert "TQQQ" not in tickers
+    assert "QQQ" in tickers
+    assert "TLT" in tickers
 
 
 def test_paper_share_book_ignores_later_mark_timestamp(tmp_path: Path) -> None:
@@ -146,3 +190,75 @@ def test_paper_share_book_ignores_later_mark_timestamp(tmp_path: Path) -> None:
     assert start is not None
     assert start.date().isoformat() == "2026-08-03"
     assert start.hour == 9 and start.minute == 30
+
+
+def test_paper_share_book_same_day_after_hours_uses_session_open(tmp_path: Path) -> None:
+    exec_dir = tmp_path / "execution"
+    paper = exec_dir / "paper_core_equity"
+    paper.mkdir(parents=True)
+    (paper / "state.json").write_text(
+        """{
+          "cash": 100.0,
+          "positions": {"QQQ": 10.0, "GLD": 5.0, "BIL": 3.0},
+          "last_trade_date": "2026-08-20",
+          "updated_at_utc": "2026-08-20T21:24:00+00:00"
+        }
+        """,
+        encoding="utf-8",
+    )
+    mod = _load_lite()
+    mod.EXEC = exec_dir
+    cash, lots, start = mod._paper_share_book("CORE_EQUITY")
+    assert abs(cash - 100.0) < 1e-6
+    assert lots["QQQ"] == 10.0
+    assert start is not None
+    assert start.date().isoformat() == "2026-08-20"
+    assert start.hour == 9 and start.minute == 30
+
+
+def test_ensure_core_equity_nav_fills_missing_series() -> None:
+    mod = _load_lite()
+    payload = {
+        "initial_cash": 100_000.0,
+        "nav": {
+            "model": [100_000.0, 101_000.0, 102_000.0],
+            "spy": [100_000.0, 100_500.0, 101_000.0],
+        },
+        "timestamps": [
+            "2026-08-18T09:30",
+            "2026-08-18T09:35",
+            "2026-08-18T09:40",
+        ],
+        "stats": {"model": {"nav": 102_000.0}},
+        "positions": [
+            {"label": "QQQ", "ticker": "QQQ", "weight": 0.5, "price": 500.0},
+        ],
+    }
+    out = mod._ensure_core_equity_nav(payload)
+    series = out["nav"]["core_equity"]
+    assert len(series) == 3
+    assert all(abs(v - 100_000.0) < 1e-6 for v in series)
+    assert out["stats"]["core_equity"]["nav"] == 100_000.0
+    assert len(out["candles"]["core_equity"]) == 3
+    again = mod._ensure_core_equity_nav(out)
+    assert again["nav"]["core_equity"] is series
+
+
+def test_attach_live_allocations_injects_core_equity_nav() -> None:
+    mod = _load_lite()
+    payload = {
+        "initial_cash": 100_000.0,
+        "nav": {"model": [100_000.0, 101_500.0], "live_model": [100_000.0, 100_000.0]},
+        "timestamps": ["2026-08-18T09:30", "2026-08-18T15:55"],
+        "stats": {"model": {"nav": 101_500.0}, "live_model": {"nav": 100_000.0}},
+        "latest_weights": {"Cash": 0.47, "GLD": 0.29, "QQQ": 0.05, "TQQQ": 0.19},
+        "positions": [
+            {"label": "Cash", "ticker": "CASH", "weight": 0.47, "value_usd": 47_705.0, "price": 1.0},
+            {"label": "TQQQ", "ticker": "TQQQ", "weight": 0.19, "value_usd": 19_285.0, "price": 70.0},
+        ],
+        "live": {"as_of_utc": "2026-08-18T20:00:00Z"},
+    }
+    out = mod._attach_live_allocations(payload)
+    assert len(out["nav"]["core_equity"]) == 2
+    assert out["allocations"]["core_equity"]["run_id"] == "CORE_EQUITY"
+    assert out["allocations"]["model"]["run_id"] == "GENERAL_EQUITY1"

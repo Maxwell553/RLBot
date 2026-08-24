@@ -6,6 +6,7 @@ and ledgers keep moving when the browser is closed.
 
 Per-strategy caches:
   - GeneralEquity1 — ``execution/paper_general_equity1/`` + ``shadow_ledger_GENERAL_EQUITY1.jsonl``
+  - CoreEquity — ``execution/paper_core_equity/`` + ``shadow_ledger_CORE_EQUITY.jsonl``
   - CrestDay — ``execution/paper_crest_day/`` + ``shadow_ledger_CREST_DAY.jsonl``
   - RLModel — ``execution/shadow_ledger_RLModel.jsonl`` (daily after the cash
     close; immediately if the ledger is still a cash-reset stub)
@@ -28,9 +29,11 @@ import pandas as pd
 
 from rlbot.forward_live import (
     ALGO_LIVE_RUN_ID,
+    CORE_EQUITY_LIVE_RUN_ID,
     CRYPTO_LIVE_RUN_ID,
     DEFAULT_MIN_REFRESH_SECONDS,
     RL_LIVE_RUN_ID,
+    canonical_forward_run_id,
     refresh_forward_mark_live,
 )
 from rlbot.forward_mark import (
@@ -273,6 +276,46 @@ def _soft_paper_ge1(*, session: str, last_date: str | None) -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _paper_core_needs_reopen(*, session: str, root: Path | None = None) -> bool:
+    """True when CoreEquity is still a cash stub from an earlier session."""
+    from rlbot.paper_core_equity import paper_book_needs_reopen
+
+    st = _read_json(_exec_dir(root) / "paper_core_equity" / "state.json")
+    return paper_book_needs_reopen(st, session=session)
+
+
+def _soft_paper_core(
+    *,
+    session: str,
+    last_date: str | None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    force = _paper_core_needs_reopen(session=session, root=root)
+    if not paper_day_due(last_date, session=session) and not force:
+        return {"ok": True, "skipped": "already_today", "as_of": last_date}
+    try:
+        from rlbot.pack_core_equity import PACK_DIR
+        from rlbot.paper_core_equity import run_paper_day
+
+        if not PACK_DIR.is_dir():
+            return {"ok": True, "skipped": "pack_missing"}
+        result = call_with_timeout(
+            run_paper_day, 180.0, set_active=False, force_refresh=False
+        )
+        return {
+            "ok": True,
+            "as_of": result.get("as_of"),
+            "bar_date": result.get("bar_date"),
+            "actions": result.get("actions"),
+            "n_orders": len(result.get("orders") or []),
+            "n_positions": result.get("n_positions"),
+            "run_id": CORE_EQUITY_LIVE_RUN_ID,
+            "force_reopen": force,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _soft_paper_crest(*, session: str, last_date: str | None) -> dict[str, Any]:
     # Crypto is 24/7; still skip a second pass on the same calendar date unless
     # the pack as-of changed (handled inside run_paper_day ledger dedupe).
@@ -364,7 +407,9 @@ def tick(
     ts = now if now is not None else now_et()
     session = session_date(ts)
     prior = read_status(root)
-    rid = (run_id or "").strip() or (resolve_active_forward_run_id(root) or ALGO_LIVE_RUN_ID)
+    rid = canonical_forward_run_id(
+        (run_id or "").strip() or (resolve_active_forward_run_id(root) or ALGO_LIVE_RUN_ID)
+    )
     sleeves: dict[str, Any] = {}
 
     mark: dict[str, Any] | None = None
@@ -391,6 +436,11 @@ def tick(
             session=session,
             last_date=str(prior.get("paper_ge1_date") or "") or None,
         )
+        sleeves[CORE_EQUITY_LIVE_RUN_ID] = _soft_paper_core(
+            session=session,
+            last_date=str(prior.get("paper_core_date") or "") or None,
+            root=root,
+        )
         sleeves[CRYPTO_LIVE_RUN_ID] = _soft_paper_crest(
             session=session,
             last_date=str(prior.get("paper_crest_date") or "") or None,
@@ -410,12 +460,23 @@ def tick(
     sleeves[shadow_id] = shadow
 
     ge1 = sleeves.get(ALGO_LIVE_RUN_ID) or {}
+    core = sleeves.get(CORE_EQUITY_LIVE_RUN_ID) or {}
     crest = sleeves.get(CRYPTO_LIVE_RUN_ID) or {}
     paper_ge1_date = str(prior.get("paper_ge1_date") or "")
+    paper_core_date = str(prior.get("paper_core_date") or "")
     # Calendar session, not the pack bar date — weekend ticks would otherwise
     # see Friday's as_of and re-enter paper_day every 5 minutes.
     if ge1.get("ok") and not ge1.get("skipped"):
         paper_ge1_date = session
+    if core.get("ok") and not core.get("skipped"):
+        leftover = _paper_core_needs_reopen(session=session, root=root)
+        n_pos = core.get("n_positions")
+        if leftover and n_pos is not None and int(n_pos) == 0:
+            # Cash-reset leftover: do not mark the session done so the next
+            # 5m tick retries after Yahoo publishes today's bar / session flags.
+            pass
+        else:
+            paper_core_date = session
     paper_crest_date = str(crest.get("as_of") or prior.get("paper_crest_date") or "")
     rl_shadow_date = str(prior.get("rl_shadow_date") or "")
     if shadow.get("recorded") and shadow.get("as_of"):
@@ -435,6 +496,7 @@ def tick(
         "prices_stale": (live or {}).get("prices_stale") if isinstance(live, dict) else None,
         "price_error": price_error,
         "paper_ge1_date": paper_ge1_date or None,
+        "paper_core_date": paper_core_date or None,
         "paper_crest_date": paper_crest_date or None,
         "rl_shadow_date": rl_shadow_date or None,
         "sleeves": sleeves,

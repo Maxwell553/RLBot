@@ -62,3 +62,6 @@ def test_session_rebalance_flags_live_tip() -> None:
     assert session_rebalance_flags(days, 3) == (False, False)
     friday_month_end = [date(2026, 7, 30), date(2026, 7, 31)]
     assert session_rebalance_flags(friday_month_end, 1) == (True, True)
+    thu = [date(2026, 8, 12), date(2026, 8, 13)]
+    assert session_rebalance_flags(thu, 1) == (False, False)
+    assert session_rebalance_flags(thu, 1, calendar_today=date(2026, 8, 14)) == (True, False)

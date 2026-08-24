@@ -57,21 +57,31 @@ def evaluate(
             f"asof={asof} n_bars={len(dates)}",
         )
     )
-    tqqq = px.get("TQQQ")
-    last252 = tqqq[-252:] if tqqq is not None and len(tqqq) >= 252 else tqqq
-    tqqq_ok = last252 is not None and int(np.isfinite(last252).sum()) == len(last252)
+    qqq = px.get("QQQ")
+    last252 = qqq[-252:] if qqq is not None and len(qqq) >= 252 else qqq
+    qqq_ok = last252 is not None and int(np.isfinite(last252).sum()) == len(last252)
     checks.append(
         Check(
-            "tqqq_recent_finite",
-            bool(tqqq_ok),
-            "last 252 TQQQ closes are finite" if tqqq_ok else "TQQQ recent bars have NaNs",
+            "qqq_recent_finite",
+            bool(qqq_ok),
+            "last 252 QQQ closes are finite" if qqq_ok else "QQQ recent bars have NaNs",
         )
     )
     wsum = float(sum(weights.values())) if weights else 0.0
+    leveraged = wsum > 1.0 + 1e-6
+    simplex_ok = abs(wsum - 1.0) < 1e-6 or (wsum > 0.0 and wsum <= 1.6 and not any(float(v) < -1e-9 for v in weights.values()))
     checks.append(
-        Check("weights_simplex", abs(wsum - 1.0) < 1e-6, f"sum={wsum:.8f}"),
+        Check(
+            "weights_simplex",
+            simplex_ok,
+            f"sum={wsum:.8f}" + (" (cash-financed QQQ)" if leveraged else ""),
+        )
     )
-    wk, me = session_rebalance_flags(dates, len(dates) - 1) if dates else (False, False)
+    wk, me = (
+        session_rebalance_flags(dates, len(dates) - 1, calendar_today=date.today())
+        if dates
+        else (False, False)
+    )
     checks.append(
         Check(
             "rebalance_calendar",
@@ -207,7 +217,7 @@ def evaluate(
             Check(
                 "foreign_positions",
                 False,
-                "flatten these before GE1 can own the book: " + ", ".join(foreign),
+                "flatten these before CoreEquity can own the book: " + ", ".join(foreign),
             )
         )
     else:
@@ -247,12 +257,12 @@ def evaluate(
         )
     else:
         checks.append(
-            Check(
-                "fractional",
-                True,
-                "allow_fractional=true"
-                + (f"; sub-share qty on {', '.join(frac_needed)}" if frac_needed else ""),
-            )
+        Check(
+            "fractional",
+            True,
+            f"allow_fractional={str(cfg.allow_fractional).lower()}"
+            + (f"; sub-share qty on {', '.join(frac_needed)}" if frac_needed else ""),
+        )
         )
 
     if nlv > 0 and nlv < 2000:

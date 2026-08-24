@@ -1,7 +1,11 @@
-# LiveTrader — GeneralEquity1 vs Interactive Brokers
+# LiveTrader — CoreEquity vs Interactive Brokers
 # Default is dry-run. This file cannot arm live capital by itself.
 
 aum_override: null   # null = use IB NetLiquidation when connected
+
+data:
+  source: ibkr          # ibkr | yahoo (IBKR daily ADJUSTED_LAST is the live default)
+  yahoo_fallback: true  # if TWS is down / historical request fails
 
 ibkr:
   host: 127.0.0.1
@@ -17,15 +21,15 @@ execution:
   order_type: MOC     # whole shares only (IBKR rejects fractional MOC)
   fractional_order_type: MKT
   tif: DAY
-  allow_fractional: true
+  allow_fractional: false  # IBKR API error 10243; fractionals are TWS desktop only
   min_notional: 1.0
   allow_foreign_positions: false
   seed_if_flat: true  # first fill when the IB book is empty (even mid-week)
-  sleeve_split: true  # Friday → TQQQ/QQQ; month-end → GLD/TLT; seed → both
+  sleeve_split: true  # Friday → QQQ; month-end → GLD/TLT/BIL; seed → both
   cap_buys_to_cash: true
   require_account: true
   fill_timeout_s: 120
-  allow_live: true    # still needs CLI --arm-live AND env LIVE_TRADER_CONFIRM=GE1
+  allow_live: true    # still needs CLI --arm-live AND env LIVE_TRADER_CONFIRM=CORE
 
 safety:
-  confirm_phrase: GE1
+  confirm_phrase: CORE
